@@ -1,0 +1,5 @@
+{
+  "name": "Aurum Manager - Almacén oro",
+  "description": "Módulo de Almacén del sistema Aurum Manager. Gestión de inventario, fundición y exportación de metales preciosos.",
+  "requestFramePermissions": []
+}
