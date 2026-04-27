@@ -38,13 +38,16 @@ import {
   Image as ImageIcon,
   LockOpen,
   Lock,
-  Eye
+  Eye,
+  Truck,
+  ArrowRightLeft,
+  Save
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { motion, AnimatePresence } from 'motion/react';
-import { Material, MaterialType, MaterialStatus, SmeltingOperation, ExportOperation, User as SystemUser, UserRole, Branch, SourceMaterialInfo, CompanySettings, Client, GoldPurchase, GoldPurchaseItem, Referrer, ReferrerPayout } from './types';
+import { Material, MaterialType, MaterialStatus, SmeltingOperation, ExportOperation, User as SystemUser, UserRole, Branch, SourceMaterialInfo, CompanySettings, Client, GoldPurchase, GoldPurchaseItem, Referrer, ReferrerPayout, GoldTransfer } from './types';
 
 // --- Error Handling ---
 
@@ -936,6 +939,16 @@ export default function App() {
   const [referrers, setReferrers] = useState<Referrer[]>([]);
   const [goldPurchases, setGoldPurchases] = useState<GoldPurchase[]>([]);
   const [referrerPayouts, setReferrerPayouts] = useState<ReferrerPayout[]>([]);
+  const [goldTransfers, setGoldTransfers] = useState<GoldTransfer[]>([]);
+  const [showTransferModal, setShowTransferModal] = useState(false);
+  const [selectedTransferMaterials, setSelectedTransferMaterials] = useState<string[]>([]);
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [showTransferHistoryModal, setShowTransferHistoryModal] = useState(false);
+  const [showTransferItemsModal, setShowTransferItemsModal] = useState(false);
+  const [selectedTransferForItems, setSelectedTransferForItems] = useState<GoldTransfer | null>(null);
+  const [selectedItemToVerify, setSelectedItemToVerify] = useState<any | null>(null);
+  const [showVerifyItemModal, setShowVerifyItemModal] = useState(false);
+  const [isVerifyingItem, setIsVerifyingItem] = useState(false);
   const [selectedPurchasesForPayout, setSelectedPurchasesForPayout] = useState<string[]>([]);
   const [payoutNotes, setPayoutNotes] = useState('');
   const [showPayoutModal, setShowPayoutModal] = useState(false);
@@ -1048,6 +1061,15 @@ export default function App() {
   const PURCHASE_HISTORY_PER_PAGE = 10;
   const [expandedPurchases, setExpandedPurchases] = useState<string[]>([]);
   const [revaluationItem, setRevaluationItem] = useState<GoldPurchaseItem | null>(null);
+  const [revalOtherWeight, setRevalOtherWeight] = useState<number>(0);
+  const [revalOtherPurity, setRevalOtherPurity] = useState<number>(0);
+
+  useEffect(() => {
+    if (revaluationItem) {
+      setRevalOtherWeight(revaluationItem.otherWeight || 0);
+      setRevalOtherPurity(revaluationItem.otherPurity || 0);
+    }
+  }, [revaluationItem]);
 
   useEffect(() => {
     setPurchaseHistoryPage(1);
@@ -1080,18 +1102,19 @@ export default function App() {
     total: 0,
     usdToBs: 6.96,
     loss: 0,
-    lossPercentage: 0
+    lossPercentage: 0,
+    material100: 0
   });
 
   const [purchaseCart, setPurchaseCart] = useState<any[]>([]);
 
   useEffect(() => {
-    const { finalWeight, marketPrice, purity, usdToBs, pricePerGram: currentPrice, total: currentTotal } = purchaseItem;
+    const { finalWeight, marketPrice, purity, usdToBs, pricePerGram: currentPrice, total: currentTotal, material100: currentMaterial100 } = purchaseItem;
     // Calculate if we have the necessary market values
     if (marketPrice > 0 && purity > 0 && usdToBs > 0) {
       const val1 = marketPrice * (purity / 100);
       const val2 = val1 / 31.1035;
-      const val3 = val2 * usdToBs;
+      const val3 = val2 * usdToBs; // Price per gram at 100%
       
       // Applying requested logic: 90% for 'abierto', 100% for 'cerrado'
       const factor = purchaseHeader.type === 'abierto' ? 0.90 : 1.0;
@@ -1099,13 +1122,15 @@ export default function App() {
       
       const nextPrice = parseFloat(val4.toFixed(2));
       const nextTotal = parseFloat((nextPrice * finalWeight).toFixed(2));
+      const nextTotal100 = parseFloat((val3 * finalWeight).toFixed(2)); // Total BS at 100% factor
 
       // Only update if changes are significant (avoiding float jitter and infinite loops)
-      if (Math.abs(nextPrice - currentPrice) > 0.001 || Math.abs(nextTotal - currentTotal) > 0.001) {
+      if (Math.abs(nextPrice - currentPrice) > 0.001 || Math.abs(nextTotal - currentTotal) > 0.001 || Math.abs(nextTotal100 - (currentMaterial100 || 0)) > 0.001) {
         setPurchaseItem(prev => ({
           ...prev,
           pricePerGram: nextPrice,
-          total: nextTotal
+          total: nextTotal,
+          material100: nextTotal100
         }));
       }
     }
@@ -1152,7 +1177,7 @@ export default function App() {
   // Auto-fill advancePayment for "abierto" purchases
   useEffect(() => {
     if (!isManuallyEditingAdvance && purchaseHeader.type === 'abierto') {
-      const netTotal = purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - (purchaseHeader.commission || 0);
+      const netTotal = purchaseCart.reduce((acc, curr) => acc + curr.total, 0);
       setPurchaseHeader(prev => ({
         ...prev,
         advancePayment: netTotal > 0 ? parseFloat(netTotal.toFixed(2)) : 0
@@ -1292,6 +1317,9 @@ export default function App() {
       
       const payoutsData = await apiFetch('/api/referrer-payouts');
       setReferrerPayouts(payoutsData);
+
+      const transfersData = await apiFetch('/api/gold-transfers');
+      setGoldTransfers(transfersData);
     } catch (error) {
       handleApiError(error, OperationType.LIST, 'all');
     } finally {
@@ -1584,7 +1612,8 @@ export default function App() {
       pricePerGram: 0,
       total: 0,
       loss: 0,
-      lossPercentage: 0
+      lossPercentage: 0,
+      material100: 0
     });
 
     // Auto focus back to initial weight field for fast entry
@@ -1801,8 +1830,8 @@ export default function App() {
     }
   };
 
-  const handlePrintAdvanceReceipt = (purchase: GoldPurchase) => {
-    if (!purchase.advancePayment || purchase.advancePayment <= 0) return;
+  const handlePrintAdvanceReceipt = (purchase: GoldPurchase | null) => {
+    if (!purchase || !purchase.advancePayment || purchase.advancePayment <= 0) return;
     
     const doc = new jsPDF({
       orientation: 'portrait',
@@ -1949,7 +1978,8 @@ export default function App() {
     doc.save(`Recibo_Anticipo_${purchase.receiptNumber}.pdf`);
   };
 
-  const handlePrintPurchaseReceipt = (purchase: GoldPurchase, mode: 'abierto' | 'cerrado' | 'combined' | 'cierre' = 'combined') => {
+  const handlePrintPurchaseReceipt = (purchase: GoldPurchase | null, mode: 'abierto' | 'cerrado' | 'combined' | 'cierre' = 'combined') => {
+    if (!purchase) return;
     const doc = new jsPDF({
       orientation: 'portrait',
       unit: 'mm',
@@ -2056,42 +2086,48 @@ export default function App() {
       autoTable(doc, {
         startY: 78,
         margin: { left: margin, right: margin },
-        head: [['Tipo', 'P. Inicial', 'P. Final', 'Merma (%)', 'Ley (%)', 'T.C. (BS)', 'Mkt (USD)', 'P. Gramo', 'Total (BS)']],
-        body: purchase.items?.map(item => [
+        head: [['#', 'Tipo', 'Peso Inicial', 'Peso Final', 'Merma (%)', 'Cotización', 'Ley (%)', 'Dólar (BS)', 'Precio x Gramo', 'Total (100%) BS', 'Total (BS)']],
+        body: purchase.items?.map((item, idx) => [
+          idx + 1,
           item.type || 'pieza',
           `${formatNumber(item.initialWeight)}g`,
           `${formatNumber(item.finalWeight)}g`,
           `${formatNumber(item.lossPercentage, 1)}%`,
+          formatNumber(item.marketPrice),
           `${formatNumber(item.purity)}%`,
           formatNumber(item.usdToBs),
-          formatNumber(item.marketPrice),
           formatNumber(item.pricePerGram),
+          `${formatNumber(item.material100 || 0)} BS`,
           `${formatNumber(item.total)} BS`
         ]) || [],
         theme: 'grid',
-        headStyles: { fillColor: [60, 60, 60], textColor: 255, fontStyle: 'bold', fontSize: 7, halign: 'center' },
-        styles: { fontSize: 7, cellPadding: 2, font: 'helvetica' },
-        columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'center' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' }, 8: { halign: 'right', fontStyle: 'bold' } }
+        headStyles: { fillColor: [60, 60, 60], textColor: 255, fontStyle: 'bold', fontSize: 6.5, halign: 'center' },
+        styles: { fontSize: 6.5, cellPadding: 1.5, font: 'helvetica' },
+        columnStyles: { 0: { halign: 'center', cellWidth: 8 }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'center' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right', fontStyle: 'bold' } }
       });
     } else if (isPrintingClosedPart) {
       // Only Liquidation Table
       autoTable(doc, {
         startY: 85,
         margin: { left: margin, right: margin },
-        head: [['Tipo', 'Peso Liq.', 'Ley (%)', 'T.C. Cierre', 'Mkt Cierre', 'P. Gramo Cierre', 'TOTAL BS']],
-        body: purchase.items?.map(item => [
+        head: [['#', 'Tipo', 'Peso Inicial', 'Peso Final', 'Merma (%)', 'Cotización', 'Ley (%)', 'Dólar (BS)', 'Precio x Gramo', 'Total (100%) BS', 'Total de Cierre']],
+        body: purchase.items?.map((item, idx) => [
+          idx + 1,
           item.type || 'pieza',
+          `${formatNumber(item.initialWeight)}g`,
           `${formatNumber(item.finalWeight)}g`,
+          `${formatNumber(item.lossPercentage, 1)}%`,
+          formatNumber(item.closeMarketPrice || item.marketPrice),
           `${formatNumber(item.purity)}%`,
-          formatNumber(item.closeUsdToBs || 0),
-          formatNumber(item.closeMarketPrice || 0),
-          formatNumber(item.closePricePerGram || 0),
+          formatNumber(item.closeUsdToBs || item.usdToBs),
+          formatNumber(item.closePricePerGram || item.pricePerGram),
+          `${formatNumber(item.material100 || 0)} BS`,
           `${formatNumber(item.closeTotal || 0)} BS`
         ]) || [],
         theme: 'grid',
-        headStyles: { fillColor: [0, 100, 0], textColor: 255, fontStyle: 'bold', fontSize: 7, halign: 'center' },
-        styles: { fontSize: 7, cellPadding: 2, font: 'helvetica' },
-        columnStyles: { 1: { halign: 'right' }, 2: { halign: 'center' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right', fontStyle: 'bold' } }
+        headStyles: { fillColor: [0, 100, 0], textColor: 255, fontStyle: 'bold', fontSize: 6.5, halign: 'center' },
+        styles: { fontSize: 6.5, cellPadding: 1.5, font: 'helvetica' },
+        columnStyles: { 0: { halign: 'center', cellWidth: 8 }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'center' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right', fontStyle: 'bold' } }
       });
     } else {
       // Combined Detail (Two tables)
@@ -2100,21 +2136,24 @@ export default function App() {
       autoTable(doc, {
         startY: 96,
         margin: { left: margin, right: margin },
-        head: [['Tipo', 'P. Inicial', 'P. Final', 'Merma (%)', 'Ley (%)', 'T.C. Orig', 'Mkt Orig', 'Subtotal Orig']],
-        body: purchase.items?.map(item => [
+        head: [['#', 'Tipo', 'Peso Inicial', 'Peso Final', 'Merma (%)', 'Cotización', 'Ley (%)', 'Dólar (BS)', 'Precio x Gramo', 'Total (100%) BS', 'Subtotal (Origen)']],
+        body: purchase.items?.map((item, idx) => [
+          idx + 1,
           item.type || 'pieza',
           `${formatNumber(item.initialWeight)}g`,
           `${formatNumber(item.finalWeight)}g`,
           `${formatNumber(item.lossPercentage, 1)}%`,
+          formatNumber(item.marketPrice),
           `${formatNumber(item.purity)}%`,
           formatNumber(item.usdToBs),
-          formatNumber(item.marketPrice),
+          formatNumber(item.pricePerGram),
+          `${formatNumber(item.material100 || 0)} BS`,
           `${formatNumber(item.total)} BS`
         ]) || [],
         theme: 'grid',
-        headStyles: { fillColor: [80, 80, 80], textColor: 255, fontStyle: 'bold', fontSize: 7, halign: 'center' },
-        styles: { fontSize: 7, cellPadding: 2, font: 'helvetica' },
-        columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'center' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } }
+        headStyles: { fillColor: [80, 80, 80], textColor: 255, fontStyle: 'bold', fontSize: 6.5, halign: 'center' },
+        styles: { fontSize: 6.5, cellPadding: 1.5, font: 'helvetica' },
+        columnStyles: { 0: { halign: 'center', cellWidth: 8 }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'center' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right', fontStyle: 'bold' } }
       });
 
       let nextY = (doc as any).lastAutoTable.finalY + 10;
@@ -2125,20 +2164,24 @@ export default function App() {
       autoTable(doc, {
         startY: nextY + 4,
         margin: { left: margin, right: margin },
-        head: [['Tipo', 'Peso Liq. (P. Final)', 'Ley (%)', 'T.C. Cierre', 'Mkt Cierre', 'P. Gramo Cierre', 'TOTAL CIERRE']],
-        body: purchase.items?.map(item => [
+        head: [['#', 'Tipo', 'Peso Inicial', 'Peso Final', 'Merma (%)', 'Cotización', 'Ley (%)', 'Dólar (BS)', 'Precio x Gramo', 'Total (100%) BS', 'Subtotal de Cierre']],
+        body: purchase.items?.map((item, idx) => [
+          idx + 1,
           item.type || 'pieza',
+          `${formatNumber(item.initialWeight)}g`,
           `${formatNumber(item.finalWeight)}g`,
+          `${formatNumber(item.lossPercentage, 1)}%`,
+          formatNumber(item.closeMarketPrice || item.marketPrice),
           `${formatNumber(item.purity)}%`,
-          formatNumber(item.closeUsdToBs || 0),
-          formatNumber(item.closeMarketPrice || 0),
-          formatNumber(item.closePricePerGram || 0),
+          formatNumber(item.closeUsdToBs || item.usdToBs),
+          formatNumber(item.closePricePerGram || item.pricePerGram),
+          `${formatNumber(item.material100 || 0)} BS`,
           `${formatNumber(item.closeTotal || 0)} BS`
         ]) || [],
         theme: 'grid',
-        headStyles: { fillColor: [0, 100, 0], textColor: 255, fontStyle: 'bold', fontSize: 7, halign: 'center' },
-        styles: { fontSize: 7, cellPadding: 2, font: 'helvetica' },
-        columnStyles: { 1: { halign: 'right' }, 2: { halign: 'center' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right', fontStyle: 'bold' } }
+        headStyles: { fillColor: [0, 100, 0], textColor: 255, fontStyle: 'bold', fontSize: 6.5, halign: 'center' },
+        styles: { fontSize: 6.5, cellPadding: 1.5, font: 'helvetica' },
+        columnStyles: { 0: { halign: 'center', cellWidth: 8 }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'center' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right', fontStyle: 'bold' } }
       });
     }
 
@@ -2157,7 +2200,7 @@ export default function App() {
 
     const summaryBoxHeight = (isActuallyClosed && isPrintingCombined) ? 40 : 30;
     doc.setFillColor(240, 240, 240);
-    doc.rect(totalsX - 5, currentY - 5, totalsWidth + 5, summaryBoxHeight + (purchase.advancePayment > 0 ? 5 : 0) + (purchase.commission > 0 ? 5 : 0), 'F');
+    doc.rect(totalsX - 5, currentY - 5, totalsWidth + 5, summaryBoxHeight + (purchase.advancePayment > 0 ? 5 : 0), 'F');
 
     doc.setFontSize(9);
     doc.setFont('helvetica', 'bold');
@@ -2168,6 +2211,13 @@ export default function App() {
     doc.setFontSize(8);
     doc.setFont('helvetica', 'normal');
     
+    const totalMat100 = (purchase.items || []).reduce((acc, curr) => acc + (curr.material100 || 0), 0);
+    doc.setFont('helvetica', 'bold');
+    doc.text('SUBTOTAL COMPRA (100%):', totalsX, currentY);
+    doc.text(`${formatNumber(totalMat100)} BS`, pageWidth - margin, currentY, { align: 'right' });
+    doc.setFont('helvetica', 'normal');
+    currentY += 6;
+
     if (isActuallyClosed && isPrintingCombined) {
       doc.text('TOTAL ORIGINAL (Abierto):', totalsX, currentY);
       doc.text(`${formatNumber(originalTotal)} BS`, pageWidth - margin, currentY, { align: 'right' });
@@ -2178,7 +2228,7 @@ export default function App() {
       doc.text(`${formatNumber(finalTotal)} BS`, pageWidth - margin, currentY, { align: 'right' });
       doc.setFont('helvetica', 'normal');
     } else {
-      doc.text(isPrintingClosedPart ? 'TOTAL CIERRE:' : 'SUBTOTAL COMPRA:', totalsX, currentY);
+      doc.text(isPrintingClosedPart ? 'TOTAL CIERRE:' : 'SUBTOTAL COMPRA (90%):', totalsX, currentY);
       doc.text(`${formatNumber(finalTotal)} BS`, pageWidth - margin, currentY, { align: 'right' });
     }
     currentY += 5;
@@ -2189,12 +2239,6 @@ export default function App() {
       currentY += 5;
     }
     
-    if (purchase.commission > 0) {
-      doc.text('(-) COMISIÓN:', totalsX, currentY);
-      doc.text(`${formatNumber(purchase.commission)} BS`, pageWidth - margin, currentY, { align: 'right' });
-      currentY += 5;
-    }
-
     doc.setLineWidth(0.3);
     doc.setDrawColor(0, 0, 0);
     doc.line(totalsX, currentY - 2, pageWidth - margin, currentY - 2);
@@ -2203,7 +2247,7 @@ export default function App() {
     doc.setFontSize(10);
     doc.setFont('helvetica', 'bold');
     doc.setTextColor(0, 100, 0); 
-    const balance = finalTotal - (purchase.advancePayment || 0) - (purchase.commission || 0);
+    const balance = finalTotal - (purchase.advancePayment || 0);
     doc.text((isActuallyClosed && !isPrintingOpenPart) ? 'SALDO FINAL A PAGAR:' : 'LÍQUIDO A PAGAR:', totalsX, currentY);
     doc.text(`${formatNumber(balance)} BS`, pageWidth - margin, currentY, { align: 'right' });
 
@@ -2247,8 +2291,8 @@ export default function App() {
     handleAddToCart(e);
   };
 
-  const handleClosePurchase = async (p: GoldPurchase) => {
-    if (!user) return;
+  const handleClosePurchase = async (p: GoldPurchase | null) => {
+    if (!user || !p) return;
     
     // Recalculate items for closure
     const recalculatedItems = p.items?.map(item => {
@@ -2256,6 +2300,7 @@ export default function App() {
       const total = item.finalWeight * pricePerGram;
       return {
         ...item,
+        material100: item.finalWeight * (closeMarketPrice / 31.1035) * (item.purity / 100) * closeUsdToBs,
         closeMarketPrice,
         closeUsdToBs,
         closePricePerGram: pricePerGram,
@@ -2285,6 +2330,90 @@ export default function App() {
       }
     } catch (error) {
       handleApiError(error, OperationType.UPDATE, `gold-purchases/${p.id}/close`);
+    }
+  };
+
+  const handleReceiveTransfer = async (transfer: GoldTransfer) => {
+    if (!user) return;
+    if (!confirm('¿Marcar este material como recibido en almacén central?')) return;
+
+    try {
+      await apiFetch(`/api/gold-transfers/${transfer.id}/receive`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receivedBy: user.name })
+      });
+      
+      // Update local state immediately to show the items modal
+      setSelectedTransferForItems({ ...transfer, status: 'recibido' });
+      setShowTransferItemsModal(true);
+      
+      await fetchData();
+      alert('Transferencia recibida. Ahora debe verificar cada ítem para el inventario central.');
+    } catch (error) {
+      handleApiError(error, OperationType.UPDATE, `gold-transfers/${transfer.id}/receive`);
+    }
+  };
+
+  const handleVerifyItem = async (itemId: string, validatedData: any) => {
+    if (!user) return;
+    
+    setIsVerifyingItem(true);
+    try {
+      await apiFetch('/api/gold-transfers/verify-item', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          itemId,
+          validatedData,
+          verifiedBy: user.name
+        })
+      });
+      setShowVerifyItemModal(false);
+      setSelectedItemToVerify(null);
+      fetchData();
+      alert('Material verificado y registrado en inventario central exitosamente.');
+    } catch (error) {
+      handleApiError(error, OperationType.CREATE, 'gold-transfers/verify-item');
+    } finally {
+      setIsVerifyingItem(false);
+    }
+  };
+
+  const handleTransfer = async () => {
+    if (!user || !branchMode || selectedTransferMaterials.length === 0) return;
+    
+    setIsTransferring(true);
+    try {
+      const selectedItems = goldPurchases
+        .filter(p => p.branchId === branchMode)
+        .flatMap(p => p.items || [])
+        .filter(item => selectedTransferMaterials.includes(item.id!));
+      
+      const totalWeight = selectedItems.reduce((acc, item) => acc + (item.finalWeight || 0), 0);
+      const totalGrams100 = selectedItems.reduce((acc, item) => acc + (item.finalWeight * (item.purity / 100)), 0);
+
+      await apiFetch('/api/gold-transfers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          branchId: branchMode,
+          materialIds: selectedTransferMaterials,
+          totalWeight,
+          totalGrams100,
+          sentBy: user.name,
+          notes: ''
+        })
+      });
+      
+      setShowTransferModal(false);
+      setSelectedTransferMaterials([]);
+      fetchData();
+      alert('Transferencia iniciada correctamente. Los materiales están ahora en tránsito.');
+    } catch (error) {
+      handleApiError(error, OperationType.CREATE, 'gold-transfers');
+    } finally {
+      setIsTransferring(false);
     }
   };
 
@@ -2731,6 +2860,12 @@ export default function App() {
                   className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === 'history' ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20' : 'text-zinc-500 hover:bg-zinc-800'}`}
                 >
                   <History className="w-4 h-4" /> Historial
+                </button>
+                <button 
+                  onClick={() => setShowTransferHistoryModal(true)}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap text-zinc-500 hover:bg-zinc-800`}
+                >
+                  <Truck className="w-4 h-4" /> Transitos
                 </button>
               </>
             ) : (
@@ -3766,13 +3901,31 @@ export default function App() {
                       <TrendingUp className="w-6 h-6" />
                     </div>
                     <div>
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold">Total Comprado (g)</p>
-                      <p className="text-2xl font-bold text-zinc-100">
-                        {formatNumber(goldPurchases.filter(p => p.branchId === branchMode).reduce((acc, curr) => acc + (curr.items?.reduce((iAcc, item) => iAcc + item.finalWeight, 0) || 0), 0))}g
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold">Inventario en Sucursal (g)</p>
+                      <p className="text-2xl font-bold text-zinc-100 italic">
+                        {formatNumber(goldPurchases.filter(p => p.branchId === branchMode).reduce((acc, curr) => acc + (curr.items?.filter(item => !item.isTransferred).reduce((iAcc, item) => iAcc + item.finalWeight, 0) || 0), 0))}g
                       </p>
                     </div>
                   </div>
-                  <div className="text-[10px] text-zinc-500 font-bold uppercase">Rendimiento Sucursal</div>
+                  <div className="text-[10px] text-zinc-500 font-bold uppercase underline decoration-amber-500/10 underline-offset-4">Material Pendiente de Envío</div>
+                </div>
+
+                <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 shadow-sm">
+                  <div className="flex items-center gap-4 mb-4">
+                    <div className="p-3 bg-blue-500/10 rounded-2xl text-blue-500">
+                      <Truck className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold">Transferir Material</p>
+                      <p className="text-2xl font-bold text-zinc-100 italic">Central</p>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => setShowTransferModal(true)}
+                    className="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2"
+                  >
+                    <ArrowRightLeft className="w-4 h-4" /> Enviar a Central
+                  </button>
                 </div>
               </div>
 
@@ -4150,7 +4303,6 @@ export default function App() {
                       <th className="px-6 py-4 text-left">Cliente</th>
                       <th className="px-6 py-4 text-left">Items</th>
                       <th className="px-6 py-4 text-left">Tipo</th>
-                      <th className="px-6 py-4 text-left">Comisión</th>
                       <th className="px-6 py-4 text-left">Anticipo</th>
                       <th className="px-6 py-4 text-left">Total BS</th>
                       <th className="px-6 py-4 text-left">Fecha</th>
@@ -4202,6 +4354,14 @@ export default function App() {
                                 <span className="text-[10px] text-zinc-500 font-bold">
                                   {formatNumber(p.items?.reduce((acc: number, curr: any) => acc + curr.finalWeight, 0) || 0)}g total
                                 </span>
+                                <span className="text-[10px] text-blue-500/70 font-mono font-bold">
+                                  {formatNumber(p.items?.reduce((acc: number, curr: any) => acc + (curr.material100 || 0), 0) || 0, 3)}g fino
+                                </span>
+                                {p.items?.some((i: any) => i.isTransferred) && (
+                                  <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded text-[8px] font-bold uppercase flex items-center gap-1">
+                                    <Truck className="w-2 h-2" /> Transferido
+                                  </span>
+                                )}
                               </div>
                             </td>
                             <td className="px-6 py-4">
@@ -4227,9 +4387,6 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <p className="text-sm font-mono font-bold text-blue-400">{formatNumber(p.type === 'cerrado' && p.closedAt ? 0 : (p.commission || 0))} BS</p>
                             </td>
                             <td className="px-6 py-4">
                               <p className="text-sm font-mono font-bold text-amber-500">{formatNumber(p.type === 'cerrado' && p.closedAt ? 0 : (p.advancePayment || 0))} BS</p>
@@ -4341,14 +4498,10 @@ export default function App() {
                                       </button>
                                     </div>
 
-                                    <div className="grid grid-cols-6 gap-4">
+                                    <div className="grid grid-cols-5 gap-4">
                                       <div className="bg-zinc-900/50 p-3 rounded-xl border border-white/5">
                                         <p className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Monto Abierto</p>
                                         <p className="text-sm font-mono font-bold text-zinc-100">{formatNumber(p.total)} BS</p>
-                                      </div>
-                                      <div className="bg-zinc-900/50 p-3 rounded-xl border border-white/5">
-                                        <p className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Comisión Pactada</p>
-                                        <p className="text-sm font-mono font-bold text-blue-400">{formatNumber(p.commission || 0)} BS</p>
                                       </div>
                                       <div className="bg-zinc-900/50 p-3 rounded-xl border border-white/5">
                                         <p className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Anticipo Pagado</p>
@@ -5149,12 +5302,13 @@ export default function App() {
                           <th className="px-6 py-4 text-left">Tipo</th>
                           <th className="px-6 py-4 text-left">Peso Inicial</th>
                           <th className="px-6 py-4 text-left">Peso Final</th>
-                          <th className="px-6 py-4 text-left">Merma (%)</th>
+                          <th className="px-6 py-4 text-left text-red-500">Merma (%)</th>
                           <th className="px-6 py-4 text-left">Cotización</th>
-                          <th className="px-6 py-4 text-left">Ley (%)</th>
+                          <th className="px-6 py-4 text-left text-amber-500">Ley (%)</th>
                           <th className="px-6 py-4 text-left">Dólar (BS)</th>
                           <th className="px-6 py-4 text-left">Precio x Gramo</th>
-                          <th className="px-6 py-4 text-left">Total (BS)</th>
+                          <th className="px-6 py-4 text-left text-blue-500">Total (100%) BS</th>
+                          <th className="px-6 py-4 text-left text-emerald-500">Total (BS)</th>
                           <th className="px-6 py-4 text-right">Acciones</th>
                         </tr>
                       </thead>
@@ -5175,33 +5329,34 @@ export default function App() {
                                   {item.type || 'pieza'}
                                 </span>
                               </td>
-                      <td className="px-6 py-4 text-xs font-mono text-zinc-300">{formatNumber(item.initialWeight)}g</td>
+                              <td className="px-6 py-4 text-xs font-mono text-zinc-300">{formatNumber(item.initialWeight)}g</td>
                               <td className="px-6 py-4 text-xs font-mono font-bold text-zinc-100">{formatNumber(item.finalWeight)}g</td>
                               <td className="px-6 py-4 text-xs font-mono text-red-400">
                                 {item.lossPercentage > 0 ? '-' : ''}{formatNumber(Math.abs(item.lossPercentage), 1)}% ({formatNumber(Math.abs(item.loss))}g)
                               </td>
                               <td className="px-6 py-4 text-xs font-mono text-zinc-300">{formatNumber(item.marketPrice)}</td>
                               <td className="px-6 py-4 text-xs font-mono text-amber-500">{formatNumber(item.purity)}%</td>
-                               <td className="px-6 py-4 text-xs font-mono text-zinc-300">{formatNumber(item.usdToBs)}</td>
-                               <td className="px-6 py-4">
-                                 <input 
-                                   type="number"
-                                   step="0.01"
-                                   value={item.pricePerGram}
-                                   onChange={e => handleUpdateCartItem(item.id, { pricePerGram: parseFloat(e.target.value) || 0 })}
-                                   className="w-20 p-1 bg-zinc-900 border border-white/10 rounded text-[10px] font-mono text-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500/50"
-                                 />
-                               </td>
-                               <td className="px-6 py-4">
-                                 <input 
-                                   readOnly={!!branchMode}
-                                   type="number"
-                                   step="0.01"
-                                   value={item.total}
-                                   onChange={e => handleUpdateCartItem(item.id, { total: parseFloat(e.target.value) || 0 })}
-                                   className={`w-24 p-1 bg-zinc-900 border border-white/10 rounded text-[10px] font-mono text-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 ${branchMode ? 'cursor-not-allowed opacity-70' : ''}`}
-                                 />
-                               </td>
+                              <td className="px-6 py-4 text-xs font-mono text-zinc-300">{formatNumber(item.usdToBs)}</td>
+                              <td className="px-6 py-4">
+                                <input 
+                                  type="number"
+                                  step="0.01"
+                                  value={item.pricePerGram}
+                                  onChange={e => handleUpdateCartItem(item.id, { pricePerGram: parseFloat(e.target.value) || 0 })}
+                                  className="w-20 p-1 bg-zinc-900 border border-white/10 rounded text-[10px] font-mono text-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500/50"
+                                />
+                              </td>
+                              <td className="px-6 py-4 text-xs font-mono font-bold text-blue-400">{formatCurrency(item.material100 || 0)}</td>
+                              <td className="px-6 py-4">
+                                <input 
+                                  readOnly={!!branchMode}
+                                  type="number"
+                                  step="0.01"
+                                  value={item.total}
+                                  onChange={e => handleUpdateCartItem(item.id, { total: parseFloat(e.target.value) || 0 })}
+                                  className={`w-24 p-1 bg-zinc-900 border border-white/10 rounded text-[10px] font-mono text-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 ${branchMode ? 'cursor-not-allowed opacity-70' : ''}`}
+                                />
+                              </td>
                               <td className="px-6 py-4 text-right">
                                 <div className="flex justify-end gap-2">
                                   <button 
@@ -5226,7 +5381,10 @@ export default function App() {
                       {purchaseCart.length > 0 && (
                         <tfoot>
                           <tr className="bg-zinc-900/50 border-t border-white/10">
-                            <td colSpan={2} className="px-6 py-4 text-[10px] font-bold uppercase text-zinc-500">Totales</td>
+                            <td colSpan={2} className="px-6 py-4 text-[10px] font-bold uppercase text-zinc-500 text-center">Totales</td>
+                            <td className="px-6 py-4 text-xs font-mono font-bold text-zinc-100">
+                              {formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.initialWeight, 0))}g
+                            </td>
                             <td className="px-6 py-4 text-xs font-mono font-bold text-zinc-100">
                               {formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.finalWeight, 0))}g
                             </td>
@@ -5239,6 +5397,9 @@ export default function App() {
                               })()}
                             </td>
                             <td colSpan={4}></td>
+                            <td className="px-6 py-4 text-xs font-mono font-bold text-blue-400">
+                              {formatCurrency(purchaseCart.reduce((acc, curr) => acc + (curr.material100 || 0), 0))}
+                            </td>
                             <td className="px-6 py-4 text-sm font-mono font-bold text-emerald-500">
                               {formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0))} BS
                             </td>
@@ -5276,12 +5437,15 @@ export default function App() {
                           const val = parseFloat(e.target.value) || 0;
                           const loss = (purchaseItem.lossPercentage / 100) * val;
                           const finalWeight = val - loss;
+                          const pricePerGram100 = (purchaseItem.marketPrice / 31.1035) * (purchaseItem.purity / 100) * purchaseItem.usdToBs;
+                          const total100 = (finalWeight > 0 ? finalWeight : 0) * pricePerGram100;
                           const total = (finalWeight > 0 ? finalWeight : 0) * purchaseItem.pricePerGram;
                           setPurchaseItem({
                             ...purchaseItem, 
                             initialWeight: val, 
                             loss: loss > 0 ? loss : 0,
                             finalWeight: finalWeight > 0 ? finalWeight : 0,
+                            material100: parseFloat(total100.toFixed(2)),
                             total: parseFloat(total.toFixed(2))
                           });
                         }}
@@ -5299,12 +5463,15 @@ export default function App() {
                           const val = parseFloat(e.target.value) || 0;
                           const loss = purchaseItem.initialWeight - val;
                           const percentage = purchaseItem.initialWeight > 0 ? Math.max(0, (loss * 100) / purchaseItem.initialWeight) : 0;
+                          const pricePerGram100 = (purchaseItem.marketPrice / 31.1035) * (purchaseItem.purity / 100) * purchaseItem.usdToBs;
+                          const total100 = val * pricePerGram100;
                           const total = val * purchaseItem.pricePerGram;
                           setPurchaseItem({
                             ...purchaseItem, 
                             finalWeight: val, 
                             loss: loss > 0 ? loss : 0,
                             lossPercentage: parseFloat(percentage.toFixed(2)),
+                            material100: parseFloat(total100.toFixed(2)),
                             total: parseFloat(total.toFixed(2))
                           });
                         }}
@@ -5322,9 +5489,13 @@ export default function App() {
                           const purity = parseFloat(e.target.value) || 0;
                           const pricePerGram = (purchaseItem.marketPrice / 31.1035) * (purity / 100) * purchaseItem.usdToBs;
                           const total = purchaseItem.finalWeight * pricePerGram;
+  const pricePerGram100 = (purchaseItem.marketPrice / 31.1035) * (purity / 100) * purchaseItem.usdToBs;
+                          const total100 = (purchaseItem.finalWeight * pricePerGram100);
+
                           setPurchaseItem({
                             ...purchaseItem,
                             purity,
+                            material100: parseFloat(total100.toFixed(2)),
                             pricePerGram: parseFloat(pricePerGram.toFixed(2)),
                             total: parseFloat(total.toFixed(2))
                           });
@@ -5335,6 +5506,7 @@ export default function App() {
                     <div className="flex-1 min-w-[100px] space-y-1">
                       <label className="text-[10px] font-bold uppercase text-zinc-500">Cotización</label>
                       <input 
+                        disabled={purchaseCart.length > 0}
                         required
                         type="number" 
                         step="0.01"
@@ -5350,12 +5522,13 @@ export default function App() {
                             total: parseFloat(total.toFixed(2))
                           });
                         }}
-                        className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        className={`w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 ${purchaseCart.length > 0 ? 'opacity-50 cursor-not-allowed bg-zinc-950' : ''}`}
                       />
                     </div>
                     <div className="flex-1 min-w-[90px] space-y-1">
                       <label className="text-[10px] font-bold uppercase text-zinc-500">Dólar (BS)</label>
                       <input 
+                        disabled={purchaseCart.length > 0}
                         required
                         type="number" 
                         step="0.01"
@@ -5371,7 +5544,7 @@ export default function App() {
                             total: parseFloat(total.toFixed(2))
                           });
                         }}
-                        className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        className={`w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 ${purchaseCart.length > 0 ? 'opacity-50 cursor-not-allowed bg-zinc-950' : ''}`}
                       />
                     </div>
                     <div className="flex-1 min-w-[110px] space-y-1">
@@ -5413,6 +5586,16 @@ export default function App() {
                           });
                         }}
                         className={`w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 ${branchMode ? 'cursor-not-allowed opacity-70' : ''}`}
+                      />
+                    </div>
+                    <div className="flex-1 min-w-[110px] space-y-1">
+                      <label className="text-[10px] font-bold uppercase text-blue-500">Material 100% (BS)</label>
+                      <input 
+                        readOnly
+                        type="number" 
+                        step="0.01"
+                        value={purchaseItem.material100 || ''}
+                        className="w-full p-2.5 bg-zinc-900/50 rounded-xl border border-blue-500/20 text-xs text-blue-400 focus:outline-none font-bold cursor-not-allowed"
                       />
                     </div>
                     <div className="flex-1 min-w-[110px] space-y-1">
@@ -5519,14 +5702,18 @@ export default function App() {
                         <span className="text-[10px] font-bold uppercase text-zinc-500">Total Material</span>
                         <span className="text-2xl font-mono font-bold text-zinc-100">{formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0))} BS</span>
                       </div>
+                      <div className="flex flex-col border-r border-white/10 pr-8">
+                        <span className="text-[10px] font-bold uppercase text-blue-500">Total Material (100%)</span>
+                        <span className="text-2xl font-mono font-bold text-blue-400">{formatCurrency(purchaseCart.reduce((acc, curr) => acc + (curr.material100 || 0), 0))}</span>
+                      </div>
                       <div className="flex flex-col">
                         <span className="text-[10px] font-bold uppercase text-zinc-500">
-                          {purchaseHeader.advancePayment > 0 ? (purchaseHeader.advancePayment === (purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - (purchaseHeader.commission || 0)) ? 'Pago Total Hoy' : 'A Pagar Hoy (Anticipo)') : 'Neto a Pagar'}
+                          {purchaseHeader.advancePayment > 0 ? (purchaseHeader.advancePayment === (purchaseCart.reduce((acc, curr) => acc + curr.total, 0)) ? 'Pago Total Hoy' : 'A Pagar Hoy (Anticipo)') : 'Neto a Pagar'}
                         </span>
                         <span className="text-2xl font-mono font-bold text-emerald-500">
                           {purchaseHeader.advancePayment > 0 
                             ? formatNumber(purchaseHeader.advancePayment) 
-                            : formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - (purchaseHeader.commission || 0))
+                            : formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0))
                           } BS
                         </span>
                       </div>
@@ -5543,18 +5730,12 @@ export default function App() {
                         <span className="text-[10px] font-bold uppercase text-zinc-500">Peso Total</span>
                         <span className="text-xl font-bold text-zinc-100">{formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.finalWeight, 0))}g</span>
                       </div>
-                      {purchaseHeader.advancePayment > 0 && purchaseHeader.advancePayment < (purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - (purchaseHeader.commission || 0)) && (
+                      {purchaseHeader.advancePayment > 0 && purchaseHeader.advancePayment < (purchaseCart.reduce((acc, curr) => acc + curr.total, 0)) && (
                         <div className="flex flex-col">
                           <span className="text-[10px] font-bold uppercase text-amber-500">Saldo Pendiente</span>
                           <span className="text-xl font-mono font-bold text-amber-500">
-                            {formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - (purchaseHeader.commission || 0) - purchaseHeader.advancePayment)} BS
+                            {formatNumber(purchaseCart.reduce((acc, curr) => acc + curr.total, 0) - purchaseHeader.advancePayment)} BS
                           </span>
-                        </div>
-                      )}
-                      {purchaseHeader.commission > 0 && (
-                        <div className="flex flex-col">
-                          <span className="text-[10px] font-bold uppercase text-blue-400">Comisión (-)</span>
-                          <span className="text-xl font-mono font-bold text-blue-400">-{formatNumber(purchaseHeader.commission)} BS</span>
                         </div>
                       )}
                     </div>
@@ -5640,12 +5821,13 @@ export default function App() {
                       <p className="text-lg font-bold text-blue-400 italic">{viewingPurchase.referrerName}</p>
                     </div>
                   )}
-                  {viewingPurchase.commission !== undefined && viewingPurchase.commission > 0 && (
+                  {/* Commission hidden from details as per user request */}
+                  {/* {viewingPurchase.commission !== undefined && viewingPurchase.commission > 0 && (
                     <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5">
                       <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Comisión pagada</p>
                       <p className="text-lg font-mono font-bold text-blue-400">{formatNumber(viewingPurchase.commission)} BS</p>
                     </div>
-                  )}
+                  )} */}
                   <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5">
                     <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Peso Total</p>
                     <p className="text-2xl font-mono font-bold text-amber-500">
@@ -5676,7 +5858,7 @@ export default function App() {
                     <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5">
                       <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Saldo Final</p>
                       <p className="text-2xl font-mono font-bold text-zinc-100">
-                        {formatNumber(viewingPurchase.total - (viewingPurchase.commission || 0) - viewingPurchase.advancePayment)} BS
+                        {formatNumber(viewingPurchase.total - viewingPurchase.advancePayment)} BS
                       </p>
                     </div>
                   )}
@@ -5692,7 +5874,11 @@ export default function App() {
                         <th className="px-6 py-3 text-left">Peso Final</th>
                         <th className="px-6 py-3 text-left">Merma (%)</th>
                         <th className="px-6 py-3 text-left">Ley</th>
+                        <th className="px-6 py-3 text-left text-blue-500">Total (100%) BS</th>
+                        <th className="px-6 py-3 text-left">Peso Otros</th>
+                        <th className="px-6 py-3 text-left">Ley Otros</th>
                         <th className="px-6 py-3 text-left">Precio/g</th>
+                        <th className="px-6 py-3 text-left">Transferido</th>
                         <th className="px-6 py-3 text-right">Subtotal</th>
                       </tr>
                     </thead>
@@ -5710,6 +5896,13 @@ export default function App() {
                             {item.lossPercentage ? `${formatNumber(item.lossPercentage)}%` : `${formatNumber((item.loss / item.initialWeight) * 100)}%`} ({formatNumber(item.loss)}g)
                           </td>
                           <td className="px-6 py-4 text-amber-500 font-bold">{formatNumber(item.purity)}%</td>
+                          <td className="px-6 py-4 text-blue-400 font-bold">{formatCurrency(item.material100 || 0)}</td>
+                          <td className="px-6 py-4 text-zinc-400">
+                            {item.otherWeight ? `${formatNumber(item.otherWeight)}g` : '-'}
+                          </td>
+                          <td className="px-6 py-4 text-zinc-400">
+                            {item.otherPurity ? `${formatNumber(item.otherPurity)}%` : '-'}
+                          </td>
                           <td className="px-6 py-4">
                             <div className="flex flex-col">
                               <span className={`font-bold ${viewingPurchase.type === 'cerrado' ? 'text-emerald-500' : 'text-zinc-400'}`}>
@@ -5719,6 +5912,22 @@ export default function App() {
                                 <span className="text-[8px] text-zinc-600 line-through">Estm: {formatNumber(item.pricePerGram)} BS</span>
                               )}
                             </div>
+                          </td>
+                          <td className="px-6 py-4">
+                            {item.isTransferred ? (
+                              <div className="flex flex-col gap-0.5">
+                                <span className="px-2 py-0.5 bg-blue-600 text-white rounded-md text-[8px] font-bold uppercase flex items-center gap-1 w-fit">
+                                  <Truck className="w-2.5 h-2.5" /> SÍ
+                                </span>
+                                {item.transferId && (
+                                  <span className="text-[7px] text-zinc-500 font-mono">ID: {item.transferId.slice(0, 8)}</span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="px-2 py-0.5 bg-zinc-800 text-zinc-500 rounded-md text-[8px] font-bold uppercase w-fit">
+                                NO
+                              </span>
+                            )}
                           </td>
                           <td className="px-6 py-4 text-right">
                             <div className="flex flex-col items-end">
@@ -5738,21 +5947,28 @@ export default function App() {
                         <tr className="bg-zinc-900/50 border-t border-white/10">
                           <td className="px-6 py-4 text-[10px] font-bold uppercase text-zinc-500">Totales</td>
                           <td className="px-6 py-4 text-sm font-mono font-bold text-zinc-100">
-                            {formatNumber(viewingPurchase.items.reduce((acc, curr) => acc + curr.finalWeight, 0))}g
+                            {formatNumber(viewingPurchase.items?.reduce((acc: number, curr: any) => acc + curr.initialWeight, 0) || 0)}g
+                          </td>
+                          <td className="px-6 py-4 text-sm font-mono font-bold text-zinc-100">
+                            {formatNumber(viewingPurchase.items?.reduce((acc: number, curr: any) => acc + curr.finalWeight, 0) || 0)}g
                           </td>
                           <td className="px-6 py-4 text-sm font-mono text-red-400">
                             {(() => {
-                              const totalInitial = viewingPurchase.items.reduce((acc, curr) => acc + curr.initialWeight, 0);
-                              const totalLoss = viewingPurchase.items.reduce((acc, curr) => acc + curr.loss, 0);
-                              const totalPercentage = totalInitial > 0 ? (totalLoss / totalInitial) * 100 : 0;
+                              const totalInitial = viewingPurchase.items?.reduce((acc: number, curr: any) => acc + curr.initialWeight, 0) || 0;
+                              const totalLoss = viewingPurchase.items?.reduce((acc: number, curr: any) => acc + curr.loss, 0) || 0;
+                              const totalPercentage = totalInitial > 0 ? (totalLoss * 100) / totalInitial : 0;
                               return `${totalPercentage > 0 ? '-' : ''}${formatNumber(Math.abs(totalPercentage), 1)}% (${totalLoss > 0 ? '-' : ''}${formatNumber(Math.abs(totalLoss))}g)`;
                             })()}
+                          </td>
+                          <td colSpan={1}></td>
+                          <td className="px-6 py-4 text-sm font-mono font-bold text-blue-400">
+                            {formatCurrency(viewingPurchase.items?.reduce((acc: number, curr: any) => acc + (curr.material100 || 0), 0) || 0)}
                           </td>
                           <td colSpan={2}></td>
                           <td className="px-6 py-4 text-right text-sm font-mono font-bold">
                             <div className="flex flex-col items-end">
                               <span className="text-emerald-500">
-                                {formatNumber(viewingPurchase.items.reduce((acc, curr) => acc + (viewingPurchase.type === 'cerrado' ? (curr.closeTotal || curr.total) : curr.total), 0))} BS
+                                {formatNumber(viewingPurchase.items?.reduce((acc: number, curr: any) => acc + (viewingPurchase.type === 'cerrado' ? (curr.closeTotal || curr.total) : curr.total), 0) || 0)} BS
                               </span>
                               {viewingPurchase.type === 'cerrado' && (
                                 <span className="text-[8px] text-zinc-600 line-through">Estm Original: {formatNumber(viewingPurchase.total)} BS</span>
@@ -5925,7 +6141,7 @@ export default function App() {
                         return { ...item, closeTotal: total };
                       });
                       const newTotal = recalculatedItems.reduce((acc, curr) => acc + curr.closeTotal, 0);
-                      const balance = newTotal - (closingPurchase.advancePayment || 0) - (closingPurchase.commission || 0);
+                      const balance = newTotal - (closingPurchase.advancePayment || 0);
 
                       return (
                         <div className="h-full flex flex-col gap-4">
@@ -5955,14 +6171,6 @@ export default function App() {
                                     <div className="w-1 h-1 bg-amber-500 rounded-full" /> (+) Anticipo
                                   </span>
                                   <span className="text-xs font-mono font-bold text-amber-500">-{formatNumber(closingPurchase.advancePayment)} <span className="text-[9px]">BS</span></span>
-                                </div>
-                              )}
-                              {closingPurchase.commission > 0 && (
-                                <div className="flex justify-between items-center group">
-                                  <span className="text-[10px] uppercase font-bold text-zinc-500 flex items-center gap-2">
-                                    <div className="w-1 h-1 bg-blue-500 rounded-full" /> (+) Comisión
-                                  </span>
-                                  <span className="text-xs font-mono font-bold text-blue-400">-{formatNumber(closingPurchase.commission)} <span className="text-[9px]">BS</span></span>
                                 </div>
                               )}
                             </div>
@@ -6001,7 +6209,10 @@ export default function App() {
                           <tr className="text-[9px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
                             <th className="px-6 py-5 text-left text-amber-500/80">Material</th>
                             <th className="px-6 py-5 text-left">Peso Base (g)</th>
+                            <th className="px-6 py-5 text-left text-blue-500 font-bold">Total (100%) BS</th>
                             <th className="px-6 py-5 text-left">Ley (%)</th>
+                            <th className="px-6 py-5 text-left text-zinc-500 font-mono">P. Otros</th>
+                            <th className="px-6 py-5 text-left text-zinc-500 font-mono">L. Otros</th>
                             <th className="px-6 py-5 text-left">P.Gramo Orig.</th>
                             <th className="px-6 py-5 text-left bg-emerald-500/5 text-emerald-400 border-x border-emerald-500/10">P.Gramo Cierre</th>
                             <th className="px-6 py-5 text-right">Subtotal Orig.</th>
@@ -6022,8 +6233,15 @@ export default function App() {
                                   </div>
                                 </td>
                                 <td className="px-6 py-5 text-sm font-mono text-zinc-400">{formatNumber(item.finalWeight)}g</td>
+                                <td className="px-6 py-5 text-sm font-mono text-blue-400 font-bold">{formatCurrency(item.material100 || 0)}</td>
                                 <td className="px-6 py-5">
                                   <span className="px-2 py-0.5 bg-amber-500/10 text-amber-500 rounded text-[10px] font-mono font-bold border border-amber-500/20">{formatNumber(item.purity)}%</span>
+                                </td>
+                                <td className="px-6 py-5 text-xs font-mono text-zinc-500">
+                                  {item.otherWeight ? `${formatNumber(item.otherWeight)}g` : '-'}
+                                </td>
+                                <td className="px-6 py-5 text-xs font-mono text-zinc-500">
+                                  {item.otherPurity ? `${formatNumber(item.otherPurity)}%` : '-'}
                                 </td>
                                 <td className="px-6 py-5 text-sm font-mono text-zinc-500">{formatNumber(item.pricePerGram)} BS</td>
                                 <td className="px-6 py-5 bg-emerald-500/[0.02] border-x border-emerald-500/5">
@@ -6157,6 +6375,551 @@ export default function App() {
                   {editingReferrer ? 'Guardar Cambios' : 'Registrar Referido'}
                 </button>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Transfer Modal - Only for Branches */}
+      <AnimatePresence>
+        {showTransferModal && branchMode && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => {
+                setShowTransferModal(false);
+                setSelectedTransferMaterials([]);
+              }}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
+                <div>
+                  <h3 className="text-2xl font-bold text-zinc-100 flex items-center gap-3 italic">
+                    <Truck className="w-6 h-6 text-blue-500" /> Transferir a Almacén Central
+                  </h3>
+                  <p className="text-zinc-500 text-sm mt-1">Seleccione los materiales para enviar al inventario central</p>
+                </div>
+                <button 
+                  onClick={() => {
+                    setShowTransferModal(false);
+                    setSelectedTransferMaterials([]);
+                  }} 
+                  className="text-zinc-500 hover:text-zinc-300"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-hidden flex flex-col">
+                <div className="p-8 overflow-y-auto custom-scrollbar">
+                  <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
+                          <th className="px-6 py-4">Seleccionar</th>
+                          <th className="px-6 py-4">Índice</th>
+                          <th className="px-6 py-4">Recibo</th>
+                          <th className="px-6 py-4">Tipo</th>
+                          <th className="px-6 py-4">Cliente</th>
+                          <th className="px-6 py-4">Peso Final</th>
+                          <th className="px-6 py-4">Ley (%)</th>
+                          <th className="px-6 py-4 text-right">Total BS</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/5">
+                        {(() => {
+                          const available = goldPurchases
+                            .filter(p => p.branchId === branchMode)
+                            .flatMap(p => (p.items || []).map(i => ({...i, receiptNumber: p.receiptNumber, clientId: p.clientId})))
+                            .filter(item => !item.isTransferred);
+                          
+                          if (available.length === 0) return (
+                            <tr>
+                              <td colSpan={8} className="px-6 py-12 text-center text-zinc-600 italic">
+                                No hay materiales disponibles para transferencia.
+                              </td>
+                            </tr>
+                          );
+                          
+                          return available.map((item, idx) => (
+                            <tr key={item.id} className="hover:bg-white/[0.02] transition-colors group">
+                              <td className="px-6 py-4">
+                                <input 
+                                  type="checkbox"
+                                  checked={selectedTransferMaterials.includes(item.id!)}
+                                  onChange={() => {
+                                    setSelectedTransferMaterials(prev => 
+                                      prev.includes(item.id!) ? prev.filter(id => id !== item.id) : [...prev, item.id!]
+                                    );
+                                  }}
+                                  className="w-5 h-5 rounded-lg border-zinc-700 bg-zinc-900 text-blue-500 focus:ring-blue-500/20 cursor-pointer"
+                                />
+                              </td>
+                              <td className="px-6 py-4 text-xs font-bold text-zinc-500">{idx + 1}</td>
+                              <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">#{item.receiptNumber}</td>
+                              <td className="px-6 py-4">
+                                <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${item.type === 'barra' ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-500'}`}>
+                                  {item.type || 'pieza'}
+                                </span>
+                              </td>
+                              <td className="px-6 py-4 text-sm text-zinc-100">{clients.find(c => c.id === item.clientId)?.name}</td>
+                              <td className="px-6 py-4 text-sm font-mono font-bold text-zinc-300">{formatNumber(item.finalWeight)}g</td>
+                              <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">{formatNumber(item.purity)}%</td>
+                              <td className="px-6 py-4 text-right text-sm font-mono font-bold text-zinc-100">{formatNumber(item.total)} BS</td>
+                            </tr>
+                          ));
+                        })()}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="p-8 bg-zinc-950 border-t border-white/5 flex justify-between items-center">
+                  <div className="flex gap-8">
+                    <div>
+                      <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Items Seleccionados</p>
+                      <p className="text-2xl font-bold text-zinc-100">{selectedTransferMaterials.length}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Peso Total (g)</p>
+                      <p className="text-2xl font-mono font-bold text-blue-500">
+                        {formatNumber(
+                          goldPurchases
+                            .filter(p => p.branchId === branchMode)
+                            .flatMap(p => p.items || [])
+                            .filter(item => selectedTransferMaterials.includes(item.id!))
+                            .reduce((acc, item) => acc + item.finalWeight, 0)
+                        )}g
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex gap-4">
+                    <button 
+                      onClick={() => {
+                        setShowTransferModal(false);
+                        setSelectedTransferMaterials([]);
+                      }}
+                      className="px-8 py-3 bg-zinc-800 text-zinc-300 rounded-2xl font-bold hover:bg-zinc-700 transition-all"
+                    >
+                      Cancelar
+                    </button>
+                    <button 
+                      disabled={selectedTransferMaterials.length === 0 || isTransferring}
+                      onClick={handleTransfer}
+                      className="px-12 py-3 bg-blue-600 text-white rounded-2xl font-bold shadow-xl shadow-blue-600/20 hover:bg-blue-500 disabled:opacity-50 transition-all flex items-center gap-2"
+                    >
+                      {isTransferring ? (
+                        <RefreshCw className="w-5 h-5 animate-spin" />
+                      ) : (
+                        <Truck className="w-5 h-5" />
+                      )}
+                      Iniciar Transferencia
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Transfer History Modal - Warehouse / Global */}
+      <AnimatePresence>
+        {showTransferHistoryModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowTransferHistoryModal(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-6xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
+                <div>
+                  <h3 className="text-2xl font-bold text-zinc-100 flex items-center gap-3 italic">
+                    <Truck className="w-6 h-6 text-amber-500" /> Historial de Transferencias y Tránsitos
+                  </h3>
+                  <p className="text-zinc-500 text-sm mt-1">Gestation de envíos entre sucursales y recepción en central</p>
+                </div>
+                <button onClick={() => setShowTransferHistoryModal(false)} className="text-zinc-500 hover:text-zinc-300">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-x-auto p-8 custom-scrollbar">
+                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden">
+                  <table className="w-full text-left">
+                    <thead>
+                      <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
+                        <th className="px-6 py-4">Sucursal Origen</th>
+                        <th className="px-6 py-4">Fecha Envío</th>
+                        <th className="px-6 py-4">Enviado Por</th>
+                        <th className="px-6 py-4">Items</th>
+                        <th className="px-6 py-4">Peso Total</th>
+                        <th className="px-6 py-4">Gramos 100%</th>
+                        <th className="px-6 py-4">Estado</th>
+                        <th className="px-6 py-4 text-right">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {goldTransfers.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="px-6 py-12 text-center text-zinc-600 italic">
+                            No hay registros de transferencias.
+                          </td>
+                        </tr>
+                      ) : (
+                        goldTransfers
+                          .sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime())
+                          .map(t => (
+                          <tr key={t.id} className="hover:bg-white/[0.02] transition-colors group">
+                            <td className="px-6 py-4">
+                              <span className="text-sm font-bold text-zinc-100">{branches.find(b => b.id === t.branchId)?.name || 'Sucursal'}</span>
+                            </td>
+                            <td className="px-6 py-4 text-xs font-mono text-zinc-400">{new Date(t.sentAt).toLocaleString()}</td>
+                            <td className="px-6 py-4 text-xs font-bold text-zinc-300 uppercase italic">{t.sentBy}</td>
+                            <td className="px-6 py-4">
+                              <span className="px-2 py-1 bg-zinc-800 text-zinc-400 rounded-lg text-[10px] font-bold">
+                                {t.materialIds.length} materiales
+                              </span>
+                            </td>
+                            <td className="px-6 py-4 text-sm font-mono font-bold text-blue-400">{formatNumber(t.totalWeight)}g</td>
+                            <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">{formatNumber(t.totalGrams100)}g</td>
+                            <td className="px-6 py-4">
+                              <span className={`px-3 py-1 rounded-full text-[9px] font-bold uppercase flex items-center gap-1.5 w-fit ${t.status === 'en_transito' ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20' : 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20'}`}>
+                                {t.status === 'en_transito' ? (
+                                  <>
+                                    <div className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse" />
+                                    EN TRÁNSITO
+                                  </>
+                                ) : (
+                                  <>
+                                    <CheckCircle2 className="w-1.5 h-1.5" />
+                                    RECIBIDO
+                                  </>
+                                )}
+                              </span>
+                              {t.status === 'recibido' && (
+                                <div className="mt-1 flex flex-col gap-0.5">
+                                  <p className="text-[8px] text-zinc-500 uppercase font-bold tracking-tight">Recibido por: {t.receivedBy}</p>
+                                  <p className="text-[8px] text-zinc-600 font-mono italic">{new Date(t.receivedAt!).toLocaleString()}</p>
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-6 py-4 text-right">
+                              <div className="flex justify-end gap-2">
+                                {t.status === 'en_transito' && !branchMode && (
+                                  <button 
+                                    onClick={() => handleReceiveTransfer(t)}
+                                    className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-500 transition-all shadow-lg shadow-emerald-600/20 flex items-center gap-2"
+                                  >
+                                    <CheckCircle2 className="w-4 h-4" /> Recibir en Central
+                                  </button>
+                                )}
+                                {t.status === 'recibido' && !branchMode && (
+                                  <button 
+                                    onClick={() => {
+                                      setSelectedTransferForItems(t);
+                                      setShowTransferItemsModal(true);
+                                    }}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-500 transition-all shadow-lg shadow-blue-600/20 flex items-center gap-2"
+                                  >
+                                    <Eye className="w-4 h-4" /> Verificar Items
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Transfer Items Verification Modal */}
+      <AnimatePresence>
+        {showTransferItemsModal && selectedTransferForItems && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowTransferItemsModal(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
+                <div>
+                  <h3 className="text-2xl font-bold text-zinc-100 flex items-center gap-3 italic">
+                    <Truck className="w-6 h-6 text-amber-500" /> Verificar Materiales de Transferencia
+                  </h3>
+                  <p className="text-zinc-500 text-sm mt-1">Sucursal: {branches.find(b => b.id === selectedTransferForItems.branchId)?.name}</p>
+                </div>
+                <button onClick={() => setShowTransferItemsModal(false)} className="text-zinc-500 hover:text-zinc-300">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden">
+                  <table className="w-full text-left">
+                    <thead>
+                      <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
+                        <th className="px-6 py-4">Recibo</th>
+                        <th className="px-6 py-4">Cliente</th>
+                        <th className="px-6 py-4">Peso</th>
+                        <th className="px-6 py-4">Ley</th>
+                        <th className="px-6 py-4">Cotización</th>
+                        <th className="px-6 py-4">Precio/g</th>
+                        <th className="px-6 py-4">Total BS</th>
+                        <th className="px-6 py-4">Estado</th>
+                        <th className="px-6 py-4 text-right">Acción</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {goldPurchases
+                        .flatMap(p => (p.items || []).map(i => ({...i, receiptNumber: p.receiptNumber, clientId: p.clientId, clientName: clients.find(c => c.id === p.clientId)?.name})))
+                        .filter(item => selectedTransferForItems.materialIds.includes(item.id!))
+                        .map((item) => (
+                        <tr key={item.id} className="hover:bg-white/[0.02] transition-colors">
+                          <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">#{item.receiptNumber}</td>
+                          <td className="px-6 py-4 text-xs text-zinc-400 uppercase font-bold">{item.type}</td>
+                          <td className="px-6 py-4 text-sm text-zinc-100">{item.clientName}</td>
+                          <td className="px-6 py-4 text-sm font-mono text-zinc-300">{formatNumber(item.finalWeight)}g</td>
+                          <td className="px-6 py-4 text-sm font-mono text-amber-500">{formatNumber(item.purity)}%</td>
+                          <td className="px-6 py-4 text-sm font-mono text-zinc-100">{formatNumber(item.total)} BS</td>
+                          <td className="px-6 py-4">
+                            {item.isVerifiedInCentral ? (
+                              <span className="px-2 py-1 bg-emerald-500/10 text-emerald-500 rounded text-[9px] font-bold uppercase">Verificado</span>
+                            ) : (
+                              <span className="px-2 py-1 bg-amber-500/10 text-amber-500 rounded text-[9px] font-bold uppercase">Pendiente</span>
+                            )}
+                          </td>
+                          <td className="px-6 py-4 text-right">
+                            {!item.isVerifiedInCentral && (
+                              <button 
+                                onClick={() => {
+                                  setSelectedItemToVerify({
+                                    ...item,
+                                    usdToBs: goldPurchases.find(p => p.items?.some(i => i.id === item.id))?.usdToBs || 0
+                                  });
+                                  setShowVerifyItemModal(true);
+                                }}
+                                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold transition-all"
+                              >
+                                Verificar y Registrar
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Item Verification Detail Modal */}
+      <AnimatePresence>
+        {showVerifyItemModal && selectedItemToVerify && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowVerifyItemModal(false)}
+              className="absolute inset-0 bg-black/90 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-lg bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
+            >
+              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-center">
+                <h3 className="text-xl font-bold text-zinc-100 italic flex items-center gap-2">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-500" /> Confirmar Datos Material
+                </h3>
+                <button onClick={() => setShowVerifyItemModal(false)} className="text-zinc-500 hover:text-zinc-300">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="p-8 space-y-6">
+                <div className="bg-zinc-950/50 p-4 rounded-2xl border border-white/5">
+                  <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Cliente Origen</p>
+                  <p className="text-zinc-100 font-bold">{selectedItemToVerify.clientName}</p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Recibo</label>
+                    <input 
+                      type="text" 
+                      defaultValue={selectedItemToVerify.receiptNumber}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, receiptNumber: e.target.value})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Tipo</label>
+                    <input 
+                      type="text" 
+                      defaultValue={selectedItemToVerify.type}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, type: e.target.value})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Peso Inicial</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.initialWeight}
+                      onBlur={(e) => {
+                        const initial = parseFloat(e.target.value);
+                        const final = selectedItemToVerify.finalWeight;
+                        const loss = initial - final;
+                        const lossPct = initial > 0 ? (loss / initial) * 100 : 0;
+                        setSelectedItemToVerify({
+                          ...selectedItemToVerify, 
+                          initialWeight: initial,
+                          loss: loss,
+                          lossPercentage: lossPct
+                        });
+                      }}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Peso Final</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.finalWeight}
+                      onBlur={(e) => {
+                        const final = parseFloat(e.target.value);
+                        const initial = selectedItemToVerify.initialWeight;
+                        const loss = initial - final;
+                        const lossPct = initial > 0 ? (loss / initial) * 100 : 0;
+                        setSelectedItemToVerify({
+                          ...selectedItemToVerify, 
+                          finalWeight: final,
+                          loss: loss,
+                          lossPercentage: lossPct
+                        });
+                      }}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Merma (g)</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      value={formatNumber(selectedItemToVerify.loss || 0)}
+                      disabled
+                      className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-sm text-zinc-500 outline-none cursor-not-allowed"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Merma (%)</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      value={formatNumber(selectedItemToVerify.lossPercentage || 0)}
+                      disabled
+                      className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-sm text-zinc-500 outline-none cursor-not-allowed"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Ley (%)</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.purity}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, purity: parseFloat(e.target.value)})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Cotización</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.marketPrice}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, marketPrice: parseFloat(e.target.value)})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Dolar (Bs)</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.usdToBs}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, usdToBs: parseFloat(e.target.value)})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Precio/g</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.pricePerGram}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, pricePerGram: parseFloat(e.target.value)})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                  <div className="col-span-2 space-y-1">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">Total BS</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      defaultValue={selectedItemToVerify.total}
+                      onBlur={(e) => setSelectedItemToVerify({...selectedItemToVerify, total: parseFloat(e.target.value)})}
+                      className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                    />
+                  </div>
+                </div>
+                
+                <button 
+                  disabled={isVerifyingItem}
+                  onClick={() => handleVerifyItem(selectedItemToVerify.id, selectedItemToVerify)}
+                  className="w-full py-4 bg-emerald-600 text-white rounded-2xl font-bold hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 shadow-xl shadow-emerald-900/20"
+                >
+                  {isVerifyingItem ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Save className="w-5 h-5" />}
+                  Confirmar y Registrar en Inventario
+                </button>
+              </div>
             </motion.div>
           </div>
         )}
@@ -6535,11 +7298,8 @@ export default function App() {
                     type="number"
                     step="0.01"
                     placeholder="Ingrese peso..."
-                    defaultValue={revaluationItem.otherWeight || ''}
-                    onChange={(e) => {
-                      const val = parseFloat(e.target.value) || 0;
-                      revaluationItem.otherWeight = val;
-                    }}
+                    value={revalOtherWeight || ''}
+                    onChange={(e) => setRevalOtherWeight(parseFloat(e.target.value) || 0)}
                     className="w-full p-4 bg-zinc-950 rounded-2xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
                   />
                 </div>
@@ -6549,16 +7309,13 @@ export default function App() {
                     type="number"
                     step="0.01"
                     placeholder="Ingrese ley..."
-                    defaultValue={revaluationItem.otherPurity || ''}
-                    onChange={(e) => {
-                      const val = parseFloat(e.target.value) || 0;
-                      revaluationItem.otherPurity = val;
-                    }}
+                    value={revalOtherPurity || ''}
+                    onChange={(e) => setRevalOtherPurity(parseFloat(e.target.value) || 0)}
                     className="w-full p-4 bg-zinc-950 rounded-2xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
                   />
                 </div>
               </div>
-
+ 
               <div className="pt-4 flex gap-3">
                 <button 
                   onClick={() => setRevaluationItem(null)}
@@ -6567,7 +7324,7 @@ export default function App() {
                   Cancelar
                 </button>
                 <button 
-                  onClick={() => handleUpdateRevaluation(revaluationItem.id, revaluationItem.otherWeight || 0, revaluationItem.otherPurity || 0)}
+                  onClick={() => handleUpdateRevaluation(revaluationItem.id, revalOtherWeight, revalOtherPurity)}
                   className="flex-1 py-4 bg-amber-500 text-amber-950 rounded-2xl font-bold hover:brightness-110 transition-all shadow-[0_0_20px_rgba(245,158,11,0.2)]"
                 >
                   Guardar

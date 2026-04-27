@@ -137,40 +137,69 @@ try {
 }
 
 // Migration: Ensure all clients columns exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS referrerPayouts (
-    id TEXT PRIMARY KEY,
-    referrerId TEXT NOT NULL,
-    referrerName TEXT NOT NULL,
-    purchaseIds TEXT NOT NULL,
-    purchaseReceipts TEXT NOT NULL,
-    totalAmount REAL NOT NULL,
-    paidAt TEXT NOT NULL,
-    paidBy TEXT NOT NULL,
-    branchId TEXT NOT NULL,
-    notes TEXT,
-    FOREIGN KEY (referrerId) REFERENCES referrers(id)
-  );
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS referrerPayouts (
+      id TEXT PRIMARY KEY,
+      referrerId TEXT NOT NULL,
+      referrerName TEXT NOT NULL,
+      purchaseIds TEXT NOT NULL,
+      purchaseReceipts TEXT NOT NULL,
+      totalAmount REAL NOT NULL,
+      paidAt TEXT NOT NULL,
+      paidBy TEXT NOT NULL,
+      branchId TEXT NOT NULL,
+      notes TEXT,
+      FOREIGN KEY (referrerId) REFERENCES referrers(id)
+    );
 
-  CREATE TABLE IF NOT EXISTS goldPurchases (
-    id TEXT PRIMARY KEY,
-    receiptNumber TEXT NOT NULL,
-    branchId TEXT NOT NULL,
-    clientId TEXT NOT NULL,
-    total REAL NOT NULL,
-    type TEXT NOT NULL, -- 'abierto' | 'cerrado'
-    referrerName TEXT,
-    commission REAL DEFAULT 0,
-    advancePayment REAL DEFAULT 0,
-    createdBy TEXT NOT NULL,
-    createdAt TEXT NOT NULL,
-    closedAt TEXT,
-    closedBy TEXT,
-    closeMarketPrice REAL,
-    closeUsdToBs REAL,
-    closeTotal REAL
-  );
+    CREATE TABLE IF NOT EXISTS goldPurchases (
+      id TEXT PRIMARY KEY,
+      receiptNumber TEXT NOT NULL,
+      branchId TEXT NOT NULL,
+      clientId TEXT NOT NULL,
+      total REAL NOT NULL,
+      type TEXT NOT NULL, -- 'abierto' | 'cerrado'
+      referrerName TEXT,
+      commission REAL DEFAULT 0,
+      advancePayment REAL DEFAULT 0,
+      createdBy TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      closedAt TEXT,
+      closedBy TEXT,
+      closeMarketPrice REAL,
+      closeUsdToBs REAL,
+      closeTotal REAL
+    );
 
+    CREATE TABLE IF NOT EXISTS goldTransfers (
+      id TEXT PRIMARY KEY,
+      branchId TEXT NOT NULL,
+      materialIds TEXT NOT NULL,
+      totalWeight REAL NOT NULL,
+      totalGrams100 REAL,
+      sentBy TEXT NOT NULL,
+      sentAt TEXT NOT NULL,
+      status TEXT NOT NULL,
+      receivedBy TEXT,
+      receivedAt TEXT,
+      FOREIGN KEY (branchId) REFERENCES branches(id)
+    );
+  `);
+
+  const transferColNames = db.prepare("PRAGMA table_info(goldTransfers)").all().map((c: any) => c.name);
+  if (!transferColNames.includes('totalGrams100')) {
+    console.log("Adding totalGrams100 to goldTransfers...");
+    db.exec("ALTER TABLE goldTransfers ADD COLUMN totalGrams100 REAL");
+  }
+
+  // Migrate status 'en_camino' to 'en_transito'
+  try {
+    db.prepare("UPDATE goldTransfers SET status = 'en_transito' WHERE status = 'en_camino'").run();
+  } catch (e) {
+    console.log("Migration failed, maybe table was fresh:", e);
+  }
+
+  db.exec(`
   CREATE TABLE IF NOT EXISTS goldPurchaseItems (
     id TEXT PRIMARY KEY,
     purchaseId TEXT NOT NULL,
@@ -189,9 +218,29 @@ db.exec(`
     closeUsdToBs REAL,
     closePricePerGram REAL,
     closeTotal REAL,
+    otherWeight REAL,
+    otherPurity REAL,
+    material100 REAL,
+    isTransferred INTEGER DEFAULT 0,
+    isVerifiedInCentral INTEGER DEFAULT 0,
+    transferId TEXT,
     FOREIGN KEY (purchaseId) REFERENCES goldPurchases(id) ON DELETE CASCADE
   );
 `);
+
+// Migration for goldPurchaseItems other fields
+const pItemColsFinal = db.prepare("PRAGMA table_info(goldPurchaseItems)").all();
+const pItemColNamesFinal = pItemColsFinal.map((c: any) => c.name);
+if (!pItemColNamesFinal.includes('otherWeight')) {
+  console.log("Migrating goldPurchaseItems table for otherWeight and otherPurity...");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN otherWeight REAL");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN otherPurity REAL");
+}
+
+if (!pItemColNamesFinal.includes('material100')) {
+  console.log("Migrating goldPurchaseItems table for material100...");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN material100 REAL");
+}
 
 // Migration: Ensure all clients columns exist
 const clientColumns = db.prepare("PRAGMA table_info(clients)").all();
@@ -417,54 +466,73 @@ if (!pItemColNamesReview.includes('closeMarketPrice')) {
   db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN closeTotal REAL");
 }
 
+if (!pItemColNamesReview.includes('isTransferred')) {
+  console.log("Migrating goldPurchaseItems table for transfer fields...");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN isTransferred INTEGER DEFAULT 0");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN transferId TEXT");
+}
+
+if (!pItemColNamesReview.includes('isVerifiedInCentral')) {
+  console.log("Adding isVerifiedInCentral to goldPurchaseItems...");
+  db.exec("ALTER TABLE goldPurchaseItems ADD COLUMN isVerifiedInCentral INTEGER DEFAULT 0");
+}
+
 // Bootstrap default admin if not exists
-const adminUsername = "admin";
-const adminEmail = "llaqtasystem@gmail.com";
+try {
+  const adminUsername = "admin";
+  const adminEmail = "llaqtasystem@gmail.com";
 
-// Check if a user with the admin username or email already exists
-const existingByUsername = db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)").get(adminUsername) as any;
-const existingByEmail = db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").get(adminEmail) as any;
+  // Check if a user with the admin username or email already exists
+  const existingByUsername = db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)").get(adminUsername) as any;
+  const existingByEmail = db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").get(adminEmail) as any;
 
-if (!existingByUsername && !existingByEmail) {
-  console.log(`Creating default superadmin: ${adminUsername}`);
-  db.prepare(`
-    INSERT INTO users (id, name, username, email, pin, role, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    crypto.randomUUID(),
-    "Super Administrador",
-    adminUsername,
-    adminEmail,
-    "1234", // Default PIN
-    "superadmin",
-    new Date().toISOString()
-  );
-} else {
-  // If we found a user by email, prioritize that one as the superadmin
-  const targetUser = existingByEmail || existingByUsername;
-  console.log(`Ensuring superadmin role for: ${targetUser.username}`);
-  
-  // We only update the username to "admin" if it's not already taken by someone else
-  // or if the target user is already the one with that username.
-  const canUpdateUsername = !existingByUsername || existingByUsername.id === targetUser.id;
-  
-  if (canUpdateUsername) {
-    db.prepare("UPDATE users SET username = ?, pin = ?, role = ? WHERE id = ?")
-      .run(adminUsername, "1234", "superadmin", targetUser.id);
+  if (!existingByUsername && !existingByEmail) {
+    console.log(`Creating default superadmin: ${adminUsername}`);
+    db.prepare(`
+      INSERT INTO users (id, name, username, email, pin, role, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      crypto.randomUUID(),
+      "Super Administrador",
+      adminUsername,
+      adminEmail,
+      "1234", // Default PIN
+      "superadmin",
+      new Date().toISOString()
+    );
   } else {
-    // If username "admin" is taken by another user, just update PIN and role for the email-matched user
-    db.prepare("UPDATE users SET pin = ?, role = ? WHERE id = ?")
-      .run("1234", "superadmin", targetUser.id);
+    // If we found a user by email, prioritize that one as the superadmin
+    const targetUser = existingByEmail || existingByUsername;
+    console.log(`Ensuring superadmin role for: ${targetUser.username}`);
+    
+    // We only update the username to "admin" if it's not already taken by someone else
+    // or if the target user is already the one with that username.
+    const canUpdateUsername = !existingByUsername || existingByUsername.id === targetUser.id;
+    
+    if (canUpdateUsername) {
+      db.prepare("UPDATE users SET username = ?, pin = ?, role = ? WHERE id = ?")
+        .run(adminUsername, "1234", "superadmin", targetUser.id);
+    } else {
+      // If username "admin" is taken by another user, just update PIN and role for the email-matched user
+      db.prepare("UPDATE users SET pin = ?, role = ? WHERE id = ?")
+        .run("1234", "superadmin", targetUser.id);
+    }
   }
+} catch (err) {
+  console.error("Bootstrap error (users):", err);
 }
 
 // Bootstrap default settings if not exists
-const existingSettings = db.prepare("SELECT * FROM companySettings LIMIT 1").get() as any;
-if (!existingSettings) {
-  db.prepare(`
-    INSERT INTO companySettings (id, name, updatedAt)
-    VALUES (?, ?, ?)
-  `).run(crypto.randomUUID(), "Aurum Manager - Almacén", new Date().toISOString());
+try {
+  const existingSettings = db.prepare("SELECT * FROM companySettings LIMIT 1").get() as any;
+  if (!existingSettings) {
+    db.prepare(`
+      INSERT INTO companySettings (id, name, updatedAt)
+      VALUES (?, ?, ?)
+    `).run(crypto.randomUUID(), "Aurum Manager - Almacén", new Date().toISOString());
+  }
+} catch (err) {
+  console.error("Bootstrap error (settings):", err);
 }
 
 async function startServer() {
@@ -1052,16 +1120,18 @@ async function startServer() {
           const itemStmt = db.prepare(`
             INSERT INTO goldPurchaseItems (
               id, purchaseId, initialWeight, finalWeight, marketPrice, 
-              purity, pricePerGram, total, usdToBs, loss, lossPercentage, type, createdBy
+              purity, pricePerGram, total, usdToBs, loss, lossPercentage, type, createdBy,
+              otherWeight, otherPurity, material100
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `);
           
           items.forEach(item => {
             itemStmt.run(
               crypto.randomUUID(), purchaseId, item.initialWeight, item.finalWeight, 
               item.marketPrice, item.purity, item.pricePerGram, item.total, 
-              item.usdToBs, item.loss, item.lossPercentage || 0, item.type || 'pieza', createdBy
+              item.usdToBs, item.loss, item.lossPercentage || 0, item.type || 'pieza', createdBy,
+              item.otherWeight || null, item.otherPurity || null, item.material100 || null
             );
           });
         }
@@ -1135,7 +1205,112 @@ async function startServer() {
     db.prepare("DELETE FROM goldPurchases WHERE id = ?").run(req.params.id);
     res.json({ success: true });
   });
-  
+
+  // Gold Transfers
+  app.get("/api/gold-transfers", (req, res) => {
+    const { branchId } = req.query;
+    let transfers;
+    if (branchId) {
+      transfers = db.prepare("SELECT * FROM goldTransfers WHERE branchId = ? ORDER BY sentAt DESC").all(branchId);
+    } else {
+      transfers = db.prepare("SELECT * FROM goldTransfers ORDER BY sentAt DESC").all();
+    }
+    res.json(transfers.map((t: any) => ({ ...t, materialIds: JSON.parse(t.materialIds) })));
+  });
+
+  app.post("/api/gold-transfers", (req, res) => {
+    const { branchId, materialIds, totalWeight, totalGrams100, sentBy } = req.body;
+    const id = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+
+    try {
+      db.transaction(() => {
+        // Create transfer record
+        db.prepare(`
+          INSERT INTO goldTransfers (id, branchId, materialIds, totalWeight, totalGrams100, sentBy, sentAt, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, branchId, JSON.stringify(materialIds), totalWeight, totalGrams100, sentBy, sentAt, 'en_transito');
+
+        // Update purchase items
+        const placeholders = materialIds.map(() => "?").join(",");
+        db.prepare(`
+          UPDATE goldPurchaseItems 
+          SET isTransferred = 1, transferId = ? 
+          WHERE id IN (${placeholders})
+        `).run(id, ...materialIds);
+      })();
+      res.json({ id, sentAt });
+    } catch (error) {
+      console.error("Failed to process gold transfer:", error);
+      res.status(500).json({ error: "Failed to process gold transfer" });
+    }
+  });
+
+  app.put("/api/gold-transfers/:id/receive", (req, res) => {
+    const { id } = req.params;
+    const { receivedBy } = req.body;
+    const receivedAt = new Date().toISOString();
+
+    try {
+      db.prepare(`
+        UPDATE goldTransfers 
+        SET status = 'recibido', receivedBy = ?, receivedAt = ? 
+        WHERE id = ?
+      `).run(receivedBy, receivedAt, id);
+      res.json({ success: true, receivedAt });
+    } catch (error) {
+      console.error("Failed to receive gold transfer:", error);
+      res.status(500).json({ error: "Failed to receive gold transfer" });
+    }
+  });
+
+  app.post("/api/gold-transfers/verify-item", (req, res) => {
+    const { itemId, validatedData, verifiedBy } = req.body;
+    const verifiedAt = new Date().toISOString();
+
+    try {
+      db.transaction(() => {
+        // 1. Update purchase item as verified
+        db.prepare(`
+          UPDATE goldPurchaseItems 
+          SET isVerifiedInCentral = 1 
+          WHERE id = ?
+        `).run(itemId);
+
+        // 2. Insert into central inventory (materials table)
+        // Use validatedData which might be slightly edited by the user during verification
+        db.prepare(`
+          INSERT INTO materials (
+            id, receiptNumber, client, initialWeight, finalWeight, marketPrice,
+            loss, purity, usdToBs, pricePerGram, lossPercentage, registrationDate,
+            total, type, status, createdBy
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          crypto.randomUUID(),
+          validatedData.receiptNumber,
+          validatedData.clientName,
+          validatedData.initialWeight,
+          validatedData.finalWeight,
+          validatedData.marketPrice,
+          validatedData.loss || 0,
+          validatedData.purity,
+          validatedData.usdToBs,
+          validatedData.pricePerGram,
+          validatedData.lossPercentage || 0,
+          verifiedAt,
+          validatedData.total,
+          validatedData.type,
+          'disponible',
+          verifiedBy
+        );
+      })();
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Failed to verify gold item:", error);
+      res.status(500).json({ error: "Failed to verify gold item" });
+    }
+  });
+
   // API 404 handler: if a request starts with /api but didn't match any route above
   app.all("/api/*", (req, res) => {
     res.status(404).json({ error: "Route not found", path: req.url });
@@ -1160,6 +1335,13 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+  }).on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Error: Port ${PORT} is already in use. Please close the process using it and try again.`);
+    } else {
+      console.error("Server error:", err);
+    }
+    process.exit(1);
   });
 
   // Global error handler
@@ -1169,4 +1351,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(err => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});

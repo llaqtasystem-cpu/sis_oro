@@ -165,6 +165,23 @@ export interface GoldPurchaseItem {
   closeTotal?: number;
   otherWeight?: number;
   otherPurity?: number;
+  material100?: number;
+  isTransferred?: boolean;
+  isVerifiedInCentral?: boolean;
+  transferId?: string;
+}
+
+export interface GoldTransfer {
+  id: string;
+  branchId: string;
+  materialIds: string[]; // IDs of GoldPurchaseItem
+  totalWeight: number;
+  totalGrams100: number;
+  sentBy: string; // User name or ID
+  sentAt: string;
+  status: 'en_transito' | 'recibido';
+  receivedBy?: string;
+  receivedAt?: string;
 }
 
 export interface GoldPurchase {
