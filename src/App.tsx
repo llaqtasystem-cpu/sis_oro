@@ -41,7 +41,8 @@ import {
   Eye,
   Truck,
   ArrowRightLeft,
-  Save
+  Save,
+  ExternalLink
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
@@ -503,7 +504,7 @@ const MaterialModal = ({ isOpen, onClose, onSubmit, formData, setFormData, title
             initial={{ opacity: 0, scale: 0.9, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.9, y: 20 }}
-            className="relative bg-zinc-900 w-full max-w-5xl rounded-3xl shadow-2xl overflow-hidden border border-white/5"
+            className="relative bg-zinc-900 w-full max-w-[1200px] rounded-3xl shadow-2xl overflow-hidden border border-white/5"
           >
             <div className="p-8 border-b border-white/5 flex justify-between items-center">
               <div>
@@ -945,6 +946,8 @@ export default function App() {
   const [isTransferring, setIsTransferring] = useState(false);
   const [showTransferHistoryModal, setShowTransferHistoryModal] = useState(false);
   const [showTransferItemsModal, setShowTransferItemsModal] = useState(false);
+  const [showReceiveConfirmModal, setShowReceiveConfirmModal] = useState(false);
+  const [transferToReceive, setTransferToReceive] = useState<GoldTransfer | null>(null);
   const [selectedTransferForItems, setSelectedTransferForItems] = useState<GoldTransfer | null>(null);
   const [selectedItemToVerify, setSelectedItemToVerify] = useState<any | null>(null);
   const [showVerifyItemModal, setShowVerifyItemModal] = useState(false);
@@ -958,7 +961,7 @@ export default function App() {
   const [showClientHistoryModal, setShowClientHistoryModal] = useState(false);
   const [historyClient, setHistoryClient] = useState<Client | null>(null);
 
-  const [view, setView] = useState<'inventory' | 'smelt' | 'export' | 'users' | 'history' | 'settings' | 'deleted' | 'branches' | 'branch_dashboard' | 'branch_clients' | 'branch_purchases' | 'branch_referrers'>('inventory');
+  const [view, setView] = useState<'inventory' | 'smelt' | 'export' | 'users' | 'history' | 'settings' | 'deleted' | 'branches' | 'branch_dashboard' | 'branch_clients' | 'branch_purchases' | 'branch_referrers' | 'branch_transfers'>('inventory');
   const [branchMode, setBranchMode] = useState<string | null>(null); // null means Warehouse mode, otherwise branchId
   const [selectedForSmelting, setSelectedForSmelting] = useState<string[]>([]);
   const [selectedForExport, setSelectedForExport] = useState<string[]>([]);
@@ -1058,6 +1061,7 @@ export default function App() {
   const [referrerSearch, setReferrerSearch] = useState('');
   const [purchaseTypeFilter, setPurchaseTypeFilter] = useState<'abierto' | 'cerrado'>('abierto');
   const [purchaseHistoryPage, setPurchaseHistoryPage] = useState(1);
+  const [branchTransfersPage, setBranchTransfersPage] = useState(1);
   const PURCHASE_HISTORY_PER_PAGE = 10;
   const [expandedPurchases, setExpandedPurchases] = useState<string[]>([]);
   const [revaluationItem, setRevaluationItem] = useState<GoldPurchaseItem | null>(null);
@@ -1075,6 +1079,21 @@ export default function App() {
     setPurchaseHistoryPage(1);
     setExpandedPurchases([]);
   }, [view, branchMode, purchaseTypeFilter]);
+
+  useEffect(() => {
+    setBranchTransfersPage(1);
+  }, [view, branchMode]);
+
+  const filteredBranchTransfers = useMemo(() => {
+    return goldTransfers
+      .filter(t => t.branchId === branchMode)
+      .sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime());
+  }, [goldTransfers, branchMode]);
+
+  const paginatedBranchTransfers = useMemo(() => {
+    const start = (branchTransfersPage - 1) * 15;
+    return filteredBranchTransfers.slice(start, start + 15);
+  }, [filteredBranchTransfers, branchTransfersPage]);
 
   const filteredPurchaseHistory = useMemo(() => {
     return goldPurchases
@@ -1193,6 +1212,7 @@ export default function App() {
 
   const [editingPurchase, setEditingPurchase] = useState<GoldPurchase | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isVerifyingTransfer, setIsVerifyingTransfer] = useState(false);
   const purchaseInitialWeightRef = useRef<HTMLInputElement>(null);
   const clientSearchRef = useRef<HTMLInputElement>(null);
   const receiptNumberRef = useRef<HTMLInputElement>(null);
@@ -2333,25 +2353,39 @@ export default function App() {
     }
   };
 
-  const handleReceiveTransfer = async (transfer: GoldTransfer) => {
-    if (!user) return;
-    if (!confirm('¿Marcar este material como recibido en almacén central?')) return;
+  const handleReceiveTransfer = (transfer: GoldTransfer) => {
+    console.log("handleReceiveTransfer called for transfer:", transfer.id);
+    if (!user) {
+      console.error("No user found when trying to receive transfer");
+      alert("Error: Usuario no identificado. Por favor refresque la página.");
+      return;
+    }
+    setTransferToReceive(transfer);
+    setShowReceiveConfirmModal(true);
+  };
+
+  const confirmReceiveTransfer = async () => {
+    if (!user || !transferToReceive) return;
+    setIsVerifyingTransfer(true);
 
     try {
-      await apiFetch(`/api/gold-transfers/${transfer.id}/receive`, {
+      await apiFetch(`/api/gold-transfers/${transferToReceive.id}/receive`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ receivedBy: user.name })
       });
       
       // Update local state immediately to show the items modal
-      setSelectedTransferForItems({ ...transfer, status: 'recibido' });
+      setSelectedTransferForItems({ ...transferToReceive, status: 'recibido' });
       setShowTransferItemsModal(true);
+      setShowReceiveConfirmModal(false);
+      setTransferToReceive(null);
       
       await fetchData();
-      alert('Transferencia recibida. Ahora debe verificar cada ítem para el inventario central.');
     } catch (error) {
-      handleApiError(error, OperationType.UPDATE, `gold-transfers/${transfer.id}/receive`);
+      handleApiError(error, OperationType.UPDATE, `gold-transfers/${transferToReceive.id}/receive`);
+    } finally {
+      setIsVerifyingTransfer(false);
     }
   };
 
@@ -2698,7 +2732,7 @@ export default function App() {
       <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans pb-24">
       {/* Header */}
       <header className="bg-zinc-900/50 backdrop-blur-xl border-b border-white/5 sticky top-0 z-30 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex justify-between items-center">
+        <div className="max-w-[1750px] mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
             <div className="bg-gray-900 p-1.5 rounded-xl shadow-lg overflow-hidden flex items-center justify-center">
               {companySettings?.logoUrl ? (
@@ -2769,7 +2803,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-6 pt-8">
+      <main className="max-w-[1750px] mx-auto px-6 pt-8">
         {/* Stats Summary - ONLY for Warehouse */}
         {!branchMode && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
@@ -2887,6 +2921,12 @@ export default function App() {
                   className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === 'branch_purchases' ? 'bg-amber-500 text-white shadow-lg shadow-amber-500/20' : 'text-zinc-500 hover:bg-zinc-800'}`}
                 >
                   <Coins className="w-4 h-4" /> Compra Oro
+                </button>
+                <button 
+                  onClick={() => handleViewChange('branch_transfers')}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === 'branch_transfers' ? 'bg-amber-500 text-white shadow-lg shadow-amber-500/20' : 'text-zinc-500 hover:bg-zinc-800'}`}
+                >
+                  <Truck className="w-4 h-4" /> Envíos Central
                 </button>
                 <button 
                   onClick={() => handleViewChange('branch_referrers')}
@@ -3920,12 +3960,20 @@ export default function App() {
                       <p className="text-2xl font-bold text-zinc-100 italic">Central</p>
                     </div>
                   </div>
-                  <button 
-                    onClick={() => setShowTransferModal(true)}
-                    className="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2"
-                  >
-                    <ArrowRightLeft className="w-4 h-4" /> Enviar a Central
-                  </button>
+                  <div className="flex flex-col gap-2">
+                    <button 
+                      onClick={() => setShowTransferModal(true)}
+                      className="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2"
+                    >
+                      <ArrowRightLeft className="w-4 h-4" /> Enviar a Central
+                    </button>
+                    <button 
+                      onClick={() => setView('branch_transfers')}
+                      className="w-full py-2 bg-zinc-950/50 hover:bg-zinc-800 text-zinc-400 hover:text-white rounded-xl text-[10px] uppercase font-black transition-all flex items-center justify-center gap-2 border border-white/5"
+                    >
+                      <History className="w-3.5 h-3.5" /> Historial de Envíos
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -4007,7 +4055,8 @@ export default function App() {
               </div>
 
               <div className="bg-zinc-900 rounded-3xl border border-white/5 overflow-hidden">
-                <table className="w-full">
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full min-w-[1100px]">
                   <thead>
                     <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5">
                       <th className="px-6 py-4 text-left">Cliente</th>
@@ -4098,6 +4147,7 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+            </div>
             </motion.div>
           )}
 
@@ -4126,7 +4176,8 @@ export default function App() {
               </div>
 
               <div className="bg-zinc-900 rounded-3xl border border-white/5 overflow-hidden">
-                <table className="w-full">
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full min-w-[1000px]">
                   <thead>
                     <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5">
                       <th className="px-6 py-4 text-left">Nombre</th>
@@ -4220,12 +4271,114 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+              </div>
                 {referrers.filter(r => r.branchId === branchMode).length === 0 && (
                   <div className="px-6 py-12 text-center text-zinc-600">
                     <Users className="w-12 h-12 mx-auto mb-4 opacity-20" />
                     <p className="text-sm font-bold uppercase tracking-widest">No hay referidos registrados</p>
                   </div>
                 )}
+              </div>
+            </motion.div>
+          )}
+
+          {view === 'branch_transfers' && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-8"
+            >
+              <div className="flex justify-between items-center bg-zinc-900/50 p-6 rounded-3xl border border-white/5">
+                <div>
+                  <h2 className="text-2xl font-black text-white tracking-tight">Historial de Transferencias</h2>
+                  <p className="text-zinc-500 text-sm mt-1">Sigue el estado de los materiales enviados al Almacén Central</p>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="flex bg-zinc-950 p-1 rounded-xl border border-white/5">
+                    <div className="px-4 py-2 flex flex-col items-center border-r border-white/5">
+                      <span className="text-[10px] uppercase text-zinc-500 font-bold">Total Enviadas</span>
+                      <span className="text-lg font-black text-white">{goldTransfers.filter(t => t.branchId === branchMode).length}</span>
+                    </div>
+                    <div className="px-4 py-2 flex flex-col items-center">
+                      <span className="text-[10px] uppercase text-zinc-500 font-bold">En Tránsito</span>
+                      <span className="text-lg font-black text-amber-500">{goldTransfers.filter(t => t.branchId === branchMode && t.status === 'en_transito').length}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-zinc-900 rounded-3xl border border-white/5 overflow-hidden">
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full min-w-[1000px]">
+                    <thead>
+                      <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
+                        <th className="px-6 py-4 text-left">Fecha</th>
+                        <th className="px-6 py-4 text-left">Referencia</th>
+                        <th className="px-6 py-4 text-center">Ítems</th>
+                        <th className="px-6 py-4 text-right">Peso Neto Total</th>
+                        <th className="px-6 py-4 text-center">Estado</th>
+                        <th className="px-6 py-4 text-center">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {paginatedBranchTransfers.map((transfer) => (
+                        <tr key={transfer.id} className="hover:bg-white/[0.02] transition-colors group">
+                          <td className="px-6 py-4">
+                            <div className="text-sm text-zinc-300">{new Date(transfer.sentAt).toLocaleDateString()}</div>
+                            <div className="text-[10px] text-zinc-500">{new Date(transfer.sentAt).toLocaleTimeString()}</div>
+                          </td>
+                          <td className="px-6 py-4">
+                            <div className="text-sm font-bold text-white">#{transfer.id.slice(0, 8).toUpperCase()}</div>
+                          </td>
+                          <td className="px-6 py-4 text-center">
+                            <span className="bg-zinc-800 text-zinc-400 px-2 py-1 rounded-lg text-xs font-bold ring-1 ring-white/5 group-hover:ring-amber-500/30 transition-all">
+                              {transfer.materialIds.length} materiales
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 text-right">
+                            <div className="text-sm font-black text-white">{transfer.totalWeight.toFixed(2)}g</div>
+                          </td>
+                          <td className="px-6 py-4 text-center">
+                            <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                              transfer.status === 'recibido' 
+                                ? 'bg-emerald-500/10 text-emerald-500 ring-1 ring-emerald-500/20' 
+                                : 'bg-amber-500/10 text-amber-500 ring-1 ring-amber-500/20 animate-pulse'
+                            }`}>
+                              {transfer.status === 'recibido' ? <CheckCircle2 className="w-3 h-3" /> : <Truck className="w-3 h-3" />}
+                              {transfer.status === 'recibido' ? 'Recibido en Central' : 'En Tránsito'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 text-center">
+                            <button
+                              onClick={() => {
+                                setSelectedTransferForItems(transfer);
+                                setShowTransferItemsModal(true);
+                              }}
+                              className="p-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white rounded-xl transition-all"
+                              title="Ver Detalles"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  
+                  <Pagination 
+                    totalItems={filteredBranchTransfers.length}
+                    currentPage={branchTransfersPage}
+                    onPageChange={setBranchTransfersPage}
+                    itemsPerPage={15}
+                  />
+
+                  {filteredBranchTransfers.length === 0 && (
+                    <div className="px-6 py-12 text-center text-zinc-600">
+                      <Truck className="w-12 h-12 mx-auto mb-4 opacity-20" />
+                      <p className="text-sm">No se han realizado transferencias a central todavía.</p>
+                    </div>
+                  )}
+                </div>
               </div>
             </motion.div>
           )}
@@ -4293,10 +4446,8 @@ export default function App() {
               </div>
 
               <div className="bg-zinc-900 rounded-3xl border border-white/5 overflow-hidden">
-                <div className="px-6 py-4 border-b border-white/5">
-                  <h3 className="text-sm font-bold text-zinc-100">Historial de Compras</h3>
-                </div>
-                <table className="w-full">
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full min-w-[1200px]">
                   <thead>
                     <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5">
                       <th className="px-6 py-4 text-left">Recibo</th>
@@ -4530,6 +4681,7 @@ export default function App() {
                     })}
                   </tbody>
                 </table>
+              </div>
 
                 <Pagination 
                   totalItems={filteredPurchaseHistory.length}
@@ -5191,14 +5343,14 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-7xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+              className="relative w-full max-w-[1650px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[95vh]"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-center shrink-0">
                 <div>
                   <h2 className="text-2xl font-bold text-zinc-100">Nueva Compra de Oro</h2>
-                  <p className="text-sm text-zinc-400">Registro de compra por lote.</p>
-                </div>
-                <div className="flex items-center gap-6">
+                   <p className="text-sm text-zinc-400">Registro de compra por lote.</p>
+                 </div>
+                 <div className="flex items-center gap-6">
                   <div className="flex flex-col gap-1">
                     <label className="text-[10px] font-bold uppercase text-zinc-500">Fecha de Registro</label>
                     <input 
@@ -5769,7 +5921,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-6xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
+              className="relative w-full max-w-[1550px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-center">
                 <div>
@@ -6013,7 +6165,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="relative w-full max-w-6xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
+              className="relative w-full max-w-[1550px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-center">
                 <div>
@@ -6398,7 +6550,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+              className="relative w-full max-w-[1500px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[95vh]"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
                 <div>
@@ -6421,7 +6573,8 @@ export default function App() {
               <div className="flex-1 overflow-hidden flex flex-col">
                 <div className="p-8 overflow-y-auto custom-scrollbar">
                   <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden">
-                    <table className="w-full text-left">
+                    <div className="overflow-x-auto custom-scrollbar">
+                      <table className="w-full text-left min-w-[1300px]">
                       <thead>
                         <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
                           <th className="px-6 py-4">Seleccionar</th>
@@ -6431,6 +6584,9 @@ export default function App() {
                           <th className="px-6 py-4">Cliente</th>
                           <th className="px-6 py-4">Peso Final</th>
                           <th className="px-6 py-4">Ley (%)</th>
+                          <th className="px-6 py-4">Cotización</th>
+                          <th className="px-6 py-4">Dólar</th>
+                          <th className="px-6 py-4">Merma (g)</th>
                           <th className="px-6 py-4 text-right">Total BS</th>
                         </tr>
                       </thead>
@@ -6438,12 +6594,19 @@ export default function App() {
                         {(() => {
                           const available = goldPurchases
                             .filter(p => p.branchId === branchMode)
-                            .flatMap(p => (p.items || []).map(i => ({...i, receiptNumber: p.receiptNumber, clientId: p.clientId})))
+                            .flatMap(p => (p.items || []).map(i => ({
+                              ...i, 
+                              receiptNumber: p.receiptNumber, 
+                              clientId: p.clientId,
+                              // Ensure values come from item or parent if missing
+                              marketPrice: i.marketPrice || p.closeMarketPrice,
+                              usdToBs: i.usdToBs || p.closeUsdToBs
+                            })))
                             .filter(item => !item.isTransferred);
                           
                           if (available.length === 0) return (
                             <tr>
-                              <td colSpan={8} className="px-6 py-12 text-center text-zinc-600 italic">
+                              <td colSpan={11} className="px-6 py-12 text-center text-zinc-600 italic">
                                 No hay materiales disponibles para transferencia.
                               </td>
                             </tr>
@@ -6473,6 +6636,9 @@ export default function App() {
                               <td className="px-6 py-4 text-sm text-zinc-100">{clients.find(c => c.id === item.clientId)?.name}</td>
                               <td className="px-6 py-4 text-sm font-mono font-bold text-zinc-300">{formatNumber(item.finalWeight)}g</td>
                               <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">{formatNumber(item.purity)}%</td>
+                              <td className="px-6 py-4 text-sm font-mono text-zinc-500">{formatNumber(item.marketPrice || 0)}</td>
+                              <td className="px-6 py-4 text-sm font-mono text-zinc-500">{formatNumber(item.usdToBs || 0)}</td>
+                              <td className="px-6 py-4 text-sm font-mono text-red-500/70">{formatNumber(item.loss || 0)}g</td>
                               <td className="px-6 py-4 text-right text-sm font-mono font-bold text-zinc-100">{formatNumber(item.total)} BS</td>
                             </tr>
                           ));
@@ -6481,8 +6647,9 @@ export default function App() {
                     </table>
                   </div>
                 </div>
+              </div>
 
-                <div className="p-8 bg-zinc-950 border-t border-white/5 flex justify-between items-center">
+              <div className="p-8 bg-zinc-950 border-t border-white/5 flex justify-between items-center">
                   <div className="flex gap-8">
                     <div>
                       <p className="text-[10px] font-bold uppercase text-zinc-500 mb-1">Items Seleccionados</p>
@@ -6546,7 +6713,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-6xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+              className="relative w-full max-w-[1550px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[95vh]"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
                 <div>
@@ -6667,15 +6834,15 @@ export default function App() {
               className="absolute inset-0 bg-black/80 backdrop-blur-sm"
             />
             <motion.div 
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
-            >
-              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
-                <div>
-                  <h3 className="text-2xl font-bold text-zinc-100 flex items-center gap-3 italic">
-                    <Truck className="w-6 h-6 text-amber-500" /> Verificar Materiales de Transferencia
+               initial={{ opacity: 0, scale: 0.95, y: 20 }}
+               animate={{ opacity: 1, scale: 1, y: 0 }}
+               exit={{ opacity: 0, scale: 0.95, y: 20 }}
+               className="relative w-full max-w-[1600px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+             >
+               <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
+                  <div>
+                    <h3 className="text-2xl font-bold text-zinc-100 flex items-center gap-3 italic">
+                      <Truck className="w-6 h-6 text-amber-500" /> Verificar Materiales de Transferencia
                   </h3>
                   <p className="text-zinc-500 text-sm mt-1">Sucursal: {branches.find(b => b.id === selectedTransferForItems.branchId)?.name}</p>
                 </div>
@@ -6684,9 +6851,9 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
-                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden">
-                  <table className="w-full text-left">
+              <div className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar">
+                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 overflow-hidden overflow-x-auto">
+                  <table className="w-full text-left min-w-[1200px]">
                     <thead>
                       <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5 bg-zinc-900/50">
                         <th className="px-6 py-4">Recibo</th>
@@ -6694,7 +6861,9 @@ export default function App() {
                         <th className="px-6 py-4">Peso</th>
                         <th className="px-6 py-4">Ley</th>
                         <th className="px-6 py-4">Cotización</th>
+                        <th className="px-6 py-4">Dólar</th>
                         <th className="px-6 py-4">Precio/g</th>
+                        <th className="px-6 py-4">Merma (g)</th>
                         <th className="px-6 py-4">Total BS</th>
                         <th className="px-6 py-4">Estado</th>
                         <th className="px-6 py-4 text-right">Acción</th>
@@ -6702,15 +6871,25 @@ export default function App() {
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       {goldPurchases
-                        .flatMap(p => (p.items || []).map(i => ({...i, receiptNumber: p.receiptNumber, clientId: p.clientId, clientName: clients.find(c => c.id === p.clientId)?.name})))
+                        .flatMap(p => (p.items || []).map(i => ({
+                          ...i, 
+                          receiptNumber: p.receiptNumber, 
+                          clientId: p.clientId, 
+                          clientName: clients.find(c => c.id === p.clientId)?.name,
+                          marketPrice: i.marketPrice || p.closeMarketPrice,
+                          usdToBs: i.usdToBs || p.closeUsdToBs
+                        })))
                         .filter(item => selectedTransferForItems.materialIds.includes(item.id!))
                         .map((item) => (
                         <tr key={item.id} className="hover:bg-white/[0.02] transition-colors">
                           <td className="px-6 py-4 text-sm font-mono font-bold text-amber-500">#{item.receiptNumber}</td>
-                          <td className="px-6 py-4 text-xs text-zinc-400 uppercase font-bold">{item.type}</td>
                           <td className="px-6 py-4 text-sm text-zinc-100">{item.clientName}</td>
                           <td className="px-6 py-4 text-sm font-mono text-zinc-300">{formatNumber(item.finalWeight)}g</td>
                           <td className="px-6 py-4 text-sm font-mono text-amber-500">{formatNumber(item.purity)}%</td>
+                          <td className="px-6 py-4 text-sm font-mono text-zinc-500">{formatNumber(item.marketPrice || 0)}</td>
+                          <td className="px-6 py-4 text-sm font-mono text-zinc-500">{formatNumber(item.usdToBs || 0)}</td>
+                          <td className="px-6 py-4 text-sm font-mono text-zinc-500">{formatNumber(item.pricePerGram || 0)}</td>
+                          <td className="px-6 py-4 text-sm font-mono text-red-500/70">{formatNumber(item.loss || 0)}g</td>
                           <td className="px-6 py-4 text-sm font-mono text-zinc-100">{formatNumber(item.total)} BS</td>
                           <td className="px-6 py-4">
                             {item.isVerifiedInCentral ? (
@@ -6725,7 +6904,8 @@ export default function App() {
                                 onClick={() => {
                                   setSelectedItemToVerify({
                                     ...item,
-                                    usdToBs: goldPurchases.find(p => p.items?.some(i => i.id === item.id))?.usdToBs || 0
+                                    loss: item.initialWeight - item.finalWeight,
+                                    lossPercentage: item.initialWeight > 0 ? ((item.initialWeight - item.finalWeight) / item.initialWeight) * 100 : 0
                                   });
                                   setShowVerifyItemModal(true);
                                 }}
@@ -6739,6 +6919,60 @@ export default function App() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Receive Transfer Confirmation Modal */}
+      <AnimatePresence>
+        {showReceiveConfirmModal && transferToReceive && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => {
+                setShowReceiveConfirmModal(false);
+                setTransferToReceive(null);
+              }}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
+            >
+              <div className="p-8 text-center space-y-4">
+                <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto">
+                  <CheckCircle2 className="w-8 h-8 text-emerald-500" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-bold text-zinc-100">Confirmar Recepción</h3>
+                  <p className="text-zinc-500 text-sm mt-2">
+                    ¿Marcar el material enviado por <span className="text-zinc-100 font-bold uppercase italic">{transferToReceive.sentBy}</span> como recibido en Almacén Central?
+                  </p>
+                </div>
+                <div className="flex gap-4 pt-4">
+                  <button 
+                    onClick={() => {
+                      setShowReceiveConfirmModal(false);
+                      setTransferToReceive(null);
+                    }}
+                    className="flex-1 py-3 bg-zinc-800 text-zinc-300 rounded-2xl font-bold hover:bg-zinc-700 transition-all"
+                  >
+                    Cancelar
+                  </button>
+                  <button 
+                    onClick={confirmReceiveTransfer}
+                    disabled={isVerifyingTransfer}
+                    className="flex-1 py-3 bg-emerald-600 text-white rounded-2xl font-bold shadow-xl shadow-emerald-600/20 hover:bg-emerald-500 transition-all flex items-center justify-center gap-2"
+                  >
+                    {isVerifyingTransfer ? <RefreshCw className="w-5 h-5 animate-spin" /> : 'Confirmar'}
+                  </button>
                 </div>
               </div>
             </motion.div>
@@ -6842,8 +7076,7 @@ export default function App() {
                   <div className="space-y-1">
                     <label className="text-[10px] font-bold uppercase text-zinc-500">Merma (g)</label>
                     <input 
-                      type="number" 
-                      step="0.01"
+                      type="text" 
                       value={formatNumber(selectedItemToVerify.loss || 0)}
                       disabled
                       className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-sm text-zinc-500 outline-none cursor-not-allowed"
@@ -6852,9 +7085,8 @@ export default function App() {
                   <div className="space-y-1">
                     <label className="text-[10px] font-bold uppercase text-zinc-500">Merma (%)</label>
                     <input 
-                      type="number" 
-                      step="0.01"
-                      value={formatNumber(selectedItemToVerify.lossPercentage || 0)}
+                      type="text" 
+                      value={formatNumber(selectedItemToVerify.lossPercentage || 0) + '%'}
                       disabled
                       className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-sm text-zinc-500 outline-none cursor-not-allowed"
                     />
@@ -7168,7 +7400,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+              className="relative w-full max-w-[1300px] bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[95vh]"
             >
               <div className="p-8 border-b border-white/5 flex justify-between items-start bg-zinc-950">
                 <div>
