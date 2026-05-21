@@ -1,0 +1,24 @@
+2026-05-11T00:36:08.436Z - Starting database schema initialization
+2026-05-11T00:36:08.438Z - Schema initialization successful
+2026-05-11T00:36:08.438Z - Running migrations
+2026-05-11T00:36:08.440Z - Migrations successful
+2026-05-11T00:36:08.746Z - Server running on http://localhost:3000
+2026-05-11T00:36:19.646Z - Running migrations
+2026-05-11T00:36:19.648Z - Migrations successful
+2026-05-11T00:36:25.425Z - Running migrations
+2026-05-11T00:36:25.428Z - Migrations successful
+2026-05-11T00:36:25.706Z - Server error: listen EADDRINUSE: address already in use 0.0.0.0:3000
+2026-05-15T01:07:54.917Z - Running migrations
+2026-05-15T01:07:54.920Z - Migrations successful
+2026-05-15T02:46:28.425Z - Running migrations
+2026-05-15T02:46:28.428Z - Migrations successful
+2026-05-15T02:47:55.862Z - Running migrations
+2026-05-15T02:47:55.867Z - Migrations successful
+2026-05-15T02:48:34.189Z - Running migrations
+2026-05-15T02:48:34.192Z - Migrations successful
+2026-05-15T02:49:53.948Z - Running migrations
+2026-05-15T02:49:53.951Z - Migrations successful
+2026-05-15T02:50:12.449Z - Running migrations
+2026-05-15T02:50:12.452Z - Migrations successful
+2026-05-15T02:53:19.818Z - Running migrations
+2026-05-15T02:53:19.825Z - Migrations successful

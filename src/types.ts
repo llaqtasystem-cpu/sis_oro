@@ -13,6 +13,7 @@ export interface User {
   branchId?: string;
   createdAt: string;
   anonymousUid?: string;
+  photo?: string;
 }
 
 export interface Branch {
@@ -22,6 +23,15 @@ export interface Branch {
   location: string;
   phone: string;
   managerId?: string;
+  createdAt: string;
+  bankAccounts?: BranchBankAccount[];
+}
+
+export interface BranchBankAccount {
+  id: string;
+  branchId: string;
+  bankName: string;
+  accountNumber: string;
   createdAt: string;
 }
 
@@ -49,6 +59,7 @@ export interface Material {
   purity: number;
   usdToBs: number;
   pricePerGram: number;
+  pricePerGram100?: number;
   registrationDate: string;
   total: number;
   type: MaterialType;
@@ -118,6 +129,8 @@ export interface Client {
   branchName?: string;
   registeredBy?: string;
   createdAt: string;
+  photo?: string;
+  documentPhoto?: string;
 }
 
 export interface Referrer {
@@ -130,6 +143,8 @@ export interface Referrer {
   createdAt: string;
   totalCommissionsEarned?: number;
   totalCommissionsPaid?: number;
+  photo?: string;
+  documentPhoto?: string;
 }
 
 export interface ReferrerPayout {
@@ -153,6 +168,7 @@ export interface GoldPurchaseItem {
   marketPrice: number;
   purity: number;
   pricePerGram: number;
+  pricePerGram100?: number;
   total: number;
   usdToBs: number;
   loss: number;
@@ -163,7 +179,7 @@ export interface GoldPurchaseItem {
   closeUsdToBs?: number;
   closePricePerGram?: number;
   closeTotal?: number;
-  otherWeight?: number;
+  otherQuotation?: number;
   otherPurity?: number;
   material100?: number;
   isTransferred?: boolean;
@@ -184,6 +200,20 @@ export interface GoldTransfer {
   receivedAt?: string;
 }
 
+export interface AdvancePayment {
+  id: string;
+  amount: number;
+  date: string;
+  concept: string;
+  paymentType: 'efectivo' | 'transferencia' | 'mixto';
+  cashAmount?: number;
+  bankAmount?: number;
+  sourceBankAccountId?: string;
+  clientBank?: string;
+  clientAccountNumber?: string;
+  createdBy: string;
+}
+
 export interface GoldPurchase {
   id: string;
   receiptNumber: string;
@@ -201,9 +231,52 @@ export interface GoldPurchase {
   commissionPaidAt?: string;
   commissionPaidBy?: string;
   advancePayment?: number;
+  advanceCashAmount?: number;
+  advanceBankAmount?: number;
+  advancePaymentType?: 'efectivo' | 'transferencia' | 'mixto';
+  advanceSourceBankAccountId?: string;
+  advanceClientBank?: string;
+  advanceClientAccountNumber?: string;
+  advances?: AdvancePayment[];
+  isFullPayment?: boolean;
   closedAt?: string;
   closedBy?: string;
   closeMarketPrice?: number;
   closeUsdToBs?: number;
   closeTotal?: number;
+  closePaymentType?: 'efectivo' | 'transferencia' | 'mixto';
+  closeCashAmount?: number;
+  closeBankAmount?: number;
+  closeSourceBankAccountId?: string;
+  closeClientBank?: string;
+  closeClientAccountNumber?: string;
+  closureId?: string;
+}
+
+export interface BranchCashMove {
+  id: string;
+  branchId: string;
+  amount: number;
+  type: 'ingreso' | 'egreso';
+  concept: string;
+  category: 'compra' | 'adelanto' | 'pago_referido' | 'manual' | 'ajuste';
+  paymentType: 'efectivo' | 'transferencia';
+  bankAccountId?: string;
+  date: string;
+  createdBy: string;
+  referenceId?: string;
+}
+
+export interface BranchClosure {
+  id: string;
+  branchId: string;
+  date: string;
+  initialBalance: number;
+  totalCashIn: number;
+  totalCashOut: number;
+  finalBalance: number;
+  status: 'pendiente' | 'cerrado';
+  createdBy: string;
+  closedAt?: string;
+  notes?: string;
 }
