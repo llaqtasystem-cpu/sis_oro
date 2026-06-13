@@ -1,5 +1,6 @@
 {
   "name": "Aurum Manager - Almacén oro",
-  "description": "Módulo de Almacén del sistema Aurum Manager. Gestión de inventario, fundición y exportación de metales preciosos.",
-  "requestFramePermissions": ["camera"]
+  "description": "Módulo de Almacén del sistema Aurum Manager. Control de piezas/barras, detalles de registro, descarga de recibo de compra PDF, transferencia masiva de materiales y gestión de fundición.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

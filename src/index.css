@@ -6,13 +6,177 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   --font-serif: "Cormorant Garamond", serif;
 
+  --color-zinc-950: var(--zinc-950);
+  --color-zinc-900: var(--zinc-900);
+  --color-zinc-800: var(--zinc-800);
+  --color-zinc-700: var(--zinc-700);
+  --color-zinc-650: var(--zinc-650);
+  --color-zinc-600: var(--zinc-600);
+  --color-zinc-500: var(--zinc-500);
+  --color-zinc-400: var(--zinc-400);
+  --color-zinc-300: var(--zinc-300);
+  --color-zinc-200: var(--zinc-200);
+  --color-zinc-100: var(--zinc-100);
+  --color-zinc-50: var(--zinc-50);
+
   @keyframes shimmer {
     0% { transform: translateX(-100%); }
     100% { transform: translateX(100%); }
   }
 }
 
-body {
-  background-color: #09090b; /* zinc-950 */
-  color: #f4f4f5; /* zinc-100 */
+:root {
+  --zinc-950: #09090b;
+  --zinc-900: #18181b;
+  --zinc-800: #27272a;
+  --zinc-700: #3f3f46;
+  --zinc-650: #4b4b52;
+  --zinc-600: #52525b;
+  --zinc-500: #71717a;
+  --zinc-400: #a1a1aa;
+  --zinc-300: #d4d4d8;
+  --zinc-200: #e4e4e7;
+  --zinc-100: #f4f4f5;
+  --zinc-50: #fafafa;
 }
+
+/* Light mode overrides */
+.light {
+  --zinc-950: #f8f8fa; /* Soft off-white canvas */
+  --zinc-900: #ffffff; /* Clean white card surfaces */
+  --zinc-800: #f1f1f4; /* Subtle section blocks */
+  --zinc-700: #e4e4e9; /* Active states and subtle frames */
+  --zinc-650: #d4d4dc;
+  --zinc-600: #7a7a85; /* Soft supporting utility text */
+  --zinc-500: #62626d; /* Muted descriptor copy */
+  --zinc-400: #44444f; /* Balanced readable text content */
+  --zinc-300: #2a2a35; /* Strong high-contrast content */
+  --zinc-200: #1a1a24; /* Bold section titles */
+  --zinc-100: #090911; /* Pitch black display headings */
+  --zinc-50: #020205;
+}
+
+body {
+  background-color: var(--zinc-950);
+  color: var(--zinc-100);
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
+/* Support for nice transitions on cards */
+.bg-zinc-900, .bg-zinc-950, .bg-zinc-800, .text-zinc-100, .text-zinc-400, .text-zinc-300, .border-white\/5, .border-white\/10 {
+  transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+}
+
+/* Specific border color adjustment overrides for Light Mode to prevent invisibility */
+.light .border-white\/5 {
+  border-color: rgba(9, 9, 17, 0.06) !important;
+}
+
+.light .border-white\/10 {
+  border-color: rgba(9, 9, 17, 0.12) !important;
+}
+
+.light .border-white\/20 {
+  border-color: rgba(9, 9, 17, 0.22) !important;
+}
+
+.light .border-white\/25 {
+  border-color: rgba(9, 9, 17, 0.28) !important;
+}
+
+.light .border-white\/30 {
+  border-color: rgba(9, 9, 17, 0.35) !important;
+}
+
+.light .border-white\/50 {
+  border-color: rgba(9, 9, 17, 0.55) !important;
+}
+
+.light .border-b-white\/5 {
+  border-bottom-color: rgba(9, 9, 17, 0.06) !important;
+}
+
+.light .border-t-white\/5 {
+  border-top-color: rgba(9, 9, 17, 0.06) !important;
+}
+
+.light .bg-zinc-950\/30 {
+  background-color: rgba(15, 15, 30, 0.03) !important;
+}
+
+.light .bg-zinc-950\/40 {
+  background-color: rgba(15, 15, 30, 0.04) !important;
+}
+
+.light .bg-zinc-950\/50 {
+  background-color: rgba(15, 15, 30, 0.06) !important;
+}
+
+.light .bg-zinc-950\/80 {
+  background-color: rgba(15, 15, 30, 0.08) !important;
+}
+
+.light .bg-zinc-900\/40 {
+  background-color: rgba(255, 255, 255, 0.5) !important;
+}
+
+.light .bg-zinc-900\/50 {
+  background-color: rgba(255, 255, 255, 0.6) !important;
+}
+
+.light .bg-zinc-900\/60 {
+  background-color: rgba(255, 255, 255, 0.72) !important;
+}
+
+.light .to-zinc-950\/75, .light .to-zinc-950\/80 {
+  --tw-gradient-to: rgba(248, 248, 250, 0.8) !important;
+}
+
+.light .from-zinc-950\/75 {
+  --tw-gradient-from: rgba(248, 248, 250, 0.8) !important;
+}
+
+.light .via-zinc-950\/50 {
+  --tw-gradient-via: rgba(248, 248, 250, 0.5) !important;
+}
+
+.light .shadow-inner {
+  shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.02) !important;
+}
+
+/* Ensure pdf or printable tables etc look great too */
+.light select option {
+  background-color: #ffffff !important;
+  color: #090911 !important;
+}
+
+/* Custom scrollbar styles for improved scroll visibility in tables & panels */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 9999px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--zinc-700);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--zinc-500);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--zinc-700) transparent;
+}
+
+

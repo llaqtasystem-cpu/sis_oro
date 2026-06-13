@@ -10,6 +10,11 @@ dotenv.config();
 // Create active transaction thread-local storage context
 const activeTransactionStorage = new AsyncLocalStorage<DB>();
 
+// Helper to sanitize parameters by replacing undefined with null for MySQL/SQLite consistency
+function sanitizeParams(params: any[] = []): any[] {
+  return params.map(val => val === undefined ? null : val);
+}
+
 export interface DB {
   query(sql: string, params?: any[]): Promise<any>;
   all(sql: string, params?: any[]): Promise<any[]>;
@@ -35,7 +40,8 @@ class MySQLWrapper implements DB {
     if (active !== this) {
       return active.query(sql, params);
     }
-    const [rows] = await this.pool.execute(sql, params);
+    const cleanParams = sanitizeParams(params);
+    const [rows] = await this.pool.execute(sql, cleanParams);
     return rows;
   }
 
@@ -44,7 +50,8 @@ class MySQLWrapper implements DB {
     if (active !== this) {
       return active.all(sql, params);
     }
-    const [rows] = await this.pool.execute(sql, params);
+    const cleanParams = sanitizeParams(params);
+    const [rows] = await this.pool.execute(sql, cleanParams);
     return rows as any[];
   }
 
@@ -53,7 +60,8 @@ class MySQLWrapper implements DB {
     if (active !== this) {
       return active.get(sql, params);
     }
-    const [rows] = await this.pool.execute(sql, params) as any[];
+    const cleanParams = sanitizeParams(params);
+    const [rows] = await this.pool.execute(sql, cleanParams) as any[];
     return rows && rows.length > 0 ? rows[0] : undefined;
   }
 
@@ -62,7 +70,8 @@ class MySQLWrapper implements DB {
     if (active !== this) {
       return active.run(sql, params);
     }
-    const [result] = await this.pool.execute(sql, params) as any;
+    const cleanParams = sanitizeParams(params);
+    const [result] = await this.pool.execute(sql, cleanParams) as any;
     return {
       lastInsertRowid: result.insertId,
       changes: result.affectedRows
@@ -115,19 +124,23 @@ class MySQLConnectionWrapper implements DB {
     isMySQL = true;
     constructor(private connection: mysql.PoolConnection) {}
     async query(sql: string, params: any[] = []) {
-        const [rows] = await this.connection.execute(sql, params);
+        const cleanParams = sanitizeParams(params);
+        const [rows] = await this.connection.execute(sql, cleanParams);
         return rows;
     }
     async all(sql: string, params: any[] = []) {
-        const [rows] = await this.connection.execute(sql, params);
+        const cleanParams = sanitizeParams(params);
+        const [rows] = await this.connection.execute(sql, cleanParams);
         return rows as any[];
     }
     async get(sql: string, params: any[] = []) {
-        const [rows] = await this.connection.execute(sql, params) as any[];
+        const cleanParams = sanitizeParams(params);
+        const [rows] = await this.connection.execute(sql, cleanParams) as any[];
         return rows && rows.length > 0 ? rows[0] : undefined;
     }
     async run(sql: string, params: any[] = []) {
-        const [result] = await this.connection.execute(sql, params) as any;
+        const cleanParams = sanitizeParams(params);
+        const [result] = await this.connection.execute(sql, cleanParams) as any;
         return { lastInsertRowid: result.insertId, changes: result.affectedRows };
     }
     async exec(sql: string) {
@@ -148,22 +161,32 @@ class SQLiteWrapper implements DB {
   constructor(path: string) {
     this.db = new Database(path);
     this.db.exec("PRAGMA foreign_keys = ON;");
+    try {
+      this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.exec("PRAGMA synchronous = NORMAL;");
+    } catch (e) {
+      console.warn("Could not set performance PRAGMAs in SQLite:", e);
+    }
   }
 
   async query(sql: string, params: any[] = []) {
-    return this.db.prepare(this.convertSql(sql)).all(...params);
+    const cleanParams = sanitizeParams(params);
+    return this.db.prepare(this.convertSql(sql)).all(...cleanParams);
   }
 
   async all(sql: string, params: any[] = []) {
-    return this.db.prepare(this.convertSql(sql)).all(...params);
+    const cleanParams = sanitizeParams(params);
+    return this.db.prepare(this.convertSql(sql)).all(...cleanParams);
   }
 
   async get(sql: string, params: any[] = []) {
-    return this.db.prepare(this.convertSql(sql)).get(...params);
+    const cleanParams = sanitizeParams(params);
+    return this.db.prepare(this.convertSql(sql)).get(...cleanParams);
   }
 
   async run(sql: string, params: any[] = []) {
-    const result = this.db.prepare(this.convertSql(sql)).run(...params);
+    const cleanParams = sanitizeParams(params);
+    const result = this.db.prepare(this.convertSql(sql)).run(...cleanParams);
     return {
       lastInsertRowid: Number(result.lastInsertRowid),
       changes: result.changes
@@ -208,16 +231,9 @@ class SQLiteWrapper implements DB {
 
 export async function getDatabaseConfig() {
   const configPath = path.join(process.cwd(), 'db-config.json');
-  if (fs.existsSync(configPath)) {
-    try {
-      const content = fs.readFileSync(configPath, 'utf8');
-      return JSON.parse(content);
-    } catch (e) {
-      console.error('Error reading db-config.json', e);
-    }
-  }
-  return {
-    type: process.env.DB_TYPE || (process.env.DB_HOST ? 'mysql' : 'sqlite'),
+  const defaults = {
+    type: 'sqlite',
+    useSandbox: false,
     mysql: {
       host: process.env.DB_HOST || 'localhost',
       user: process.env.DB_USER || 'root',
@@ -227,8 +243,60 @@ export async function getDatabaseConfig() {
     },
     sqlite: {
       path: process.env.SQLITE_DB_PATH || 'database.sqlite'
+    },
+    sandbox: {
+      type: 'mysql',
+      mysql: {
+        host: process.env.DB_SANDBOX_HOST || '',
+        user: process.env.DB_SANDBOX_USER || '',
+        password: process.env.DB_SANDBOX_PASSWORD || '',
+        database: process.env.DB_SANDBOX_NAME || 'llaqta_gold_sandbox',
+        port: Number(process.env.DB_SANDBOX_PORT) || 3306
+      },
+      sqlite: {
+        path: 'sandbox.sqlite'
+      }
     }
   };
+
+  let config = { ...defaults };
+
+  if (fs.existsSync(configPath)) {
+    try {
+      const content = fs.readFileSync(configPath, 'utf8');
+      const loaded = JSON.parse(content);
+      config = {
+        ...defaults,
+        ...loaded,
+        mysql: { ...defaults.mysql, ...(loaded.mysql || {}) },
+        sqlite: { ...defaults.sqlite, ...(loaded.sqlite || {}) },
+        sandbox: { 
+          ...defaults.sandbox, 
+          ...(loaded.sandbox || {}),
+          mysql: { ...defaults.sandbox.mysql, ...((loaded.sandbox && loaded.sandbox.mysql) || {}) },
+          sqlite: { ...defaults.sandbox.sqlite, ...((loaded.sandbox && loaded.sandbox.sqlite) || {}) }
+        }
+      };
+    } catch (e) {
+      console.error('Error reading db-config.json', e);
+    }
+  }
+
+  // Environment variables precedence (if set)
+  if (process.env.DB_HOST) config.mysql.host = process.env.DB_HOST;
+  if (process.env.DB_USER) config.mysql.user = process.env.DB_USER;
+  if (process.env.DB_PASSWORD !== undefined) config.mysql.password = process.env.DB_PASSWORD;
+  if (process.env.DB_NAME) config.mysql.database = process.env.DB_NAME;
+  if (process.env.DB_PORT) config.mysql.port = Number(process.env.DB_PORT) || 3306;
+  if (process.env.SQLITE_DB_PATH) config.sqlite.path = process.env.SQLITE_DB_PATH;
+
+  if (process.env.DB_SANDBOX_HOST) config.sandbox.mysql.host = process.env.DB_SANDBOX_HOST;
+  if (process.env.DB_SANDBOX_USER) config.sandbox.mysql.user = process.env.DB_SANDBOX_USER;
+  if (process.env.DB_SANDBOX_PASSWORD !== undefined) config.sandbox.mysql.password = process.env.DB_SANDBOX_PASSWORD;
+  if (process.env.DB_SANDBOX_NAME) config.sandbox.mysql.database = process.env.DB_SANDBOX_NAME;
+  if (process.env.DB_SANDBOX_PORT) config.sandbox.mysql.port = Number(process.env.DB_SANDBOX_PORT) || 3306;
+
+  return config;
 }
 
 export async function saveDatabaseConfig(config: any) {
@@ -238,26 +306,50 @@ export async function saveDatabaseConfig(config: any) {
 
 export async function initDatabase(): Promise<DB> {
   const config = await getDatabaseConfig();
-  if (config.type === 'mysql') {
-    console.log('Using MySQL database:', config.mysql.host, config.mysql.database);
-    try {
-      const pool = mysql.createPool({
-        host: config.mysql.host,
-        user: config.mysql.user,
-        password: config.mysql.password,
-        database: config.mysql.database,
-        port: Number(config.mysql.port) || 3306,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0
-      });
-      // Test the pool
-      await pool.query('SELECT 1');
-      return new MySQLWrapper(pool);
-    } catch (error) {
-      console.error('MySQL connection failed. Falling back to SQLite.', error);
+  const isSandboxActive = !!config.useSandbox;
+  const activeType = isSandboxActive ? (config.sandbox?.type || 'mysql') : config.type;
+
+  if (isSandboxActive) {
+    console.log('🤖 --- ENTRANDO EN MODO PRUEBAS / SANDBOX DATABASE ---');
+  }
+
+  if (activeType === 'mysql') {
+    const activeMysql = isSandboxActive ? config.sandbox?.mysql : config.mysql;
+    const host = activeMysql?.host || 'localhost';
+    const database = activeMysql?.database || 'llaqta_gold';
+    const user = activeMysql?.user || 'root';
+    const password = activeMysql?.password || '';
+    const port = Number(activeMysql?.port) || 3306;
+
+    const isPlaceholderHost = !host || host.includes('example.com') || host.includes('example');
+
+    if (isPlaceholderHost) {
+      console.log(`ℹ️ [Database] El host de MySQL es un marcador de posición (${host || 'vacío'}). Usando SQLite de forma directa.`);
+    } else {
+      console.log(`Using ${isSandboxActive ? 'SANDBOX ' : ''}MySQL database:`, host, database);
+      try {
+        const pool = mysql.createPool({
+          host,
+          user,
+          password,
+          database,
+          port,
+          waitForConnections: true,
+          connectionLimit: 10,
+          queueLimit: 0,
+          connectTimeout: 2000 // 2 seconds timeout to fallback immediately if host is unreachable
+        });
+        // Test the pool
+        await pool.query('SELECT 1');
+        return new MySQLWrapper(pool);
+      } catch (error: any) {
+        console.warn(`${isSandboxActive ? 'SANDBOX ' : ''}MySQL connection failed. Falling back to SQLite.`, error.message || error);
+      }
     }
   }
-  console.log('Using SQLite database:', config.sqlite.path);
-  return new SQLiteWrapper(config.sqlite.path);
+
+  const activeSqlite = isSandboxActive ? config.sandbox?.sqlite : config.sqlite;
+  const sqlitePath = activeSqlite?.path || (isSandboxActive ? 'sandbox.sqlite' : 'database.sqlite');
+  console.log(`Using ${isSandboxActive ? 'SANDBOX ' : ''}SQLite database:`, sqlitePath);
+  return new SQLiteWrapper(sqlitePath);
 }

@@ -1,5 +1,5 @@
 export type MaterialType = 'pieza' | 'barra';
-export type MaterialStatus = 'disponible' | 'fundido' | 'exportado' | 'eliminado';
+export type MaterialStatus = 'disponible' | 'fundido' | 'exportado' | 'eliminado' | 'no disponible';
 
 export type UserRole = 'superadmin' | 'admin' | 'operator';
 
@@ -22,9 +22,14 @@ export interface Branch {
   abbreviation: string;
   location: string;
   phone: string;
+  phoneCountryCode?: string;
+  referentialPhone?: string;
+  referentialCountryCode?: string;
   managerId?: string;
   createdAt: string;
+  active?: number;
   bankAccounts?: BranchBankAccount[];
+  lastClosedAt?: string;
 }
 
 export interface BranchBankAccount {
@@ -112,6 +117,19 @@ export interface CompanySettings {
   email: string;
   taxId: string;
   logoUrl: string;
+  loginBgUrl?: string;
+  inactivityTimeout?: number;
+  timezone?: string;
+  maxStayMinutes?: number;
+  maxStayMinutes_pieza?: number;
+  maxStayMinutes_barra?: number;
+  notifyVisual_pieza?: boolean | number;
+  notifyVisual_barra?: boolean | number;
+  notifySound_pieza?: boolean | number;
+  notifySound_barra?: boolean | number;
+  cashDenominations?: string;
+  lowPurityThreshold_pieza?: number;
+  lowPurityThreshold_barra?: number;
   updatedAt: string;
 }
 
@@ -131,13 +149,16 @@ export interface Client {
   createdAt: string;
   photo?: string;
   documentPhoto?: string;
+  documentPhotoBack?: string;
 }
 
 export interface Referrer {
   id: string;
   name: string;
   phone1: string;
+  phone1CountryCode?: string;
   phone2?: string;
+  phone2CountryCode?: string;
   ci: string;
   branchId: string;
   createdAt: string;
@@ -178,6 +199,7 @@ export interface GoldPurchaseItem {
   closeMarketPrice?: number;
   closeUsdToBs?: number;
   closePricePerGram?: number;
+  closePricePerGram100?: number;
   closeTotal?: number;
   otherQuotation?: number;
   otherPurity?: number;
@@ -220,7 +242,12 @@ export interface GoldPurchase {
   branchId: string;
   clientId: string;
   total: number;
-  type: 'abierto' | 'cerrado';
+  type: 'abierto' | 'cerrado' | 'anulado';
+  voidedAt?: string;
+  voidedBy?: string;
+  voidReason?: string;
+  openEstimateFactor?: number;
+  expirationDays?: number;
   createdBy: string;
   createdAt: string;
   date?: string;
@@ -251,6 +278,22 @@ export interface GoldPurchase {
   closeClientBank?: string;
   closeClientAccountNumber?: string;
   closureId?: string;
+  closeSignature?: string;
+  payments?: LiquidationPayment[];
+}
+
+export interface LiquidationPayment {
+  id: string;
+  amount: number;
+  paymentType: 'efectivo' | 'transferencia' | 'mixto';
+  cashAmount: number;
+  bankAmount: number;
+  sourceBankAccountId?: string;
+  clientBank?: string;
+  clientAccountNumber?: string;
+  date: string;
+  createdBy: string;
+  isInitial?: boolean;
 }
 
 export interface BranchCashMove {
@@ -279,4 +322,8 @@ export interface BranchClosure {
   createdBy: string;
   closedAt?: string;
   notes?: string;
+  physicalBalance?: number;
+  differenceAmount?: number;
+  differenceJustification?: string;
+  cashCountBreakdown?: string;
 }

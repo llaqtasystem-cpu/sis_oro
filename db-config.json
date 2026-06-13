@@ -1,0 +1,27 @@
+{
+  "type": "sqlite",
+  "useSandbox": false,
+  "mysql": {
+    "host": "localhost",
+    "user": "root",
+    "password": "",
+    "database": "llaqta_gold",
+    "port": 3306
+  },
+  "sqlite": {
+    "path": "database.sqlite"
+  },
+  "sandbox": {
+    "type": "mysql",
+    "mysql": {
+      "host": "external-mysql-sandbox.example.com",
+      "user": "sandbox_user",
+      "password": "",
+      "database": "llaqta_gold_sandbox",
+      "port": 3306
+    },
+    "sqlite": {
+      "path": "sandbox.sqlite"
+    }
+  }
+}
