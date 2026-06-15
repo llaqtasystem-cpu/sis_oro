@@ -2361,35 +2361,8 @@ async function startServer() {
               isHistoricNum === 1 ? 1 : 0
             ]);
 
-            if (isHistoricNum === 1) {
-              // Register directly in central inventory with status 'no disponible'
-              await db.run(`
-                INSERT INTO materials (
-                  id, receiptNumber, client, initialWeight, finalWeight, marketPrice, 
-                  loss, purity, usdToBs, pricePerGram, pricePerGram100, lossPercentage, registrationDate, total, 
-                  type, status, createdBy, sourceMaterials
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              `, [
-                crypto.randomUUID(),
-                receiptNumber,
-                clientName,
-                item.initialWeight,
-                item.finalWeight,
-                item.marketPrice,
-                item.loss || 0,
-                item.purity,
-                item.usdToBs,
-                item.pricePerGram,
-                item.pricePerGram100 || null,
-                item.lossPercentage || 0,
-                createdAt,
-                item.total,
-                item.type || 'pieza',
-                'no disponible',
-                createdBy,
-                null
-              ]);
-            }
+            // Note: We do NOT insert into Sede Central's materials table directly.
+            // Items must go through the transfer and verification flow to enter Central.
           }
         }
         // Register initial advances (ONLY if NOT historic!)
@@ -2751,6 +2724,166 @@ async function startServer() {
     await db.run("DELETE FROM goldPurchases WHERE id = ?", [req.params.id]);
     res.json({ success: true });
     broadcast("purchase_deleted", { id: req.params.id });
+  });
+
+  // Toggle historic status (allows validator to mark purchase as historic which pulls from petty cash / inventory)
+  apiRouter.post("/gold-purchases/:id/toggle-historic", async (req, res) => {
+    const { id } = req.params;
+    const { validatedBy, reason } = req.body;
+
+    if (!validatedBy) {
+      return res.status(400).json({ error: "Debe especificar el validador / auditor que autoriza esta operación." });
+    }
+
+    try {
+      await db.transaction(async () => {
+        // 1. Get purchase info
+        const purchase = await db.get("SELECT * FROM goldPurchases WHERE id = ?", [id]) as any;
+        if (!purchase) {
+          throw new Error("Compra de oro no encontrada");
+        }
+
+        const isCurrentlyHistoric = purchase.isHistoric === 1 || purchase.isHistoric === true || parseInt(purchase.isHistoric + '') === 1;
+        const newIsHistoric = isCurrentlyHistoric ? 0 : 1;
+
+        // 2. Update status of the purchase
+        await db.run("UPDATE goldPurchases SET isHistoric = ? WHERE id = ?", [newIsHistoric, id]);
+
+        if (newIsHistoric === 1) {
+          // Transitions from Normal to Historic
+          // a. Delete cash moves related to this purchase so it doesn't affect petty cash
+          await db.run("DELETE FROM branchCashMoves WHERE referenceId = ?", [id]);
+
+          // b. Update materials in inventory to be "no disponible" if already transferred & verified
+          const existingMaterials = await db.all("SELECT id FROM materials WHERE receiptNumber = ?", [purchase.receiptNumber]);
+          if (existingMaterials.length > 0) {
+            await db.run("UPDATE materials SET status = 'no disponible' WHERE receiptNumber = ?", [purchase.receiptNumber]);
+          } else {
+            // Since they are not in Sede Central's inventory yet (have not been transferred and verified),
+            // we do nothing to the materials table. They will stay in the sucursal's items domain.
+          }
+        } else {
+          // Transitions from Historic to Normal
+          // a. Update materials in inventory to be "disponible" (so they show up as active or available)
+          await db.run("UPDATE materials SET status = 'disponible' WHERE receiptNumber = ?", [purchase.receiptNumber]);
+
+          // b. Let's delete any previously created cash moves just to avoid duplicates
+          await db.run("DELETE FROM branchCashMoves WHERE referenceId = ?", [id]);
+
+          // c. Re-insert initial advances cash moves
+          if (purchase.advancePayment > 0) {
+            const concept = purchase.isFullPayment ? `Pago Total Compra: ${purchase.receiptNumber}` : `Adelanto de la compra: ${purchase.receiptNumber}`;
+            if (purchase.advancePaymentType === 'efectivo') {
+              await db.run(`
+                INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `, [crypto.randomUUID(), purchase.branchId, purchase.advancePayment, 'egreso', concept, 'adelanto', 'efectivo', null, purchase.createdAt, purchase.createdBy, id]);
+            } else if (purchase.advancePaymentType === 'transferencia') {
+              await db.run(`
+                INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `, [crypto.randomUUID(), purchase.branchId, purchase.advancePayment, 'egreso', concept, 'adelanto', 'transferencia', purchase.advanceSourceBankAccountId || null, purchase.createdAt, purchase.createdBy, id]);
+            } else if (purchase.advancePaymentType === 'mixto') {
+              if ((purchase.advanceCashAmount || 0) > 0) {
+                await db.run(`
+                  INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [crypto.randomUUID(), purchase.branchId, purchase.advanceCashAmount, 'egreso', `${concept} (Efectivo)`, 'adelanto', 'efectivo', null, purchase.createdAt, purchase.createdBy, id]);
+              }
+              if ((purchase.advanceBankAmount || 0) > 0) {
+                await db.run(`
+                  INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [crypto.randomUUID(), purchase.branchId, purchase.advanceBankAmount, 'egreso', `${concept} (Banco)`, 'adelanto', 'transferencia', purchase.advanceSourceBankAccountId || null, purchase.createdAt, purchase.createdBy, id]);
+              }
+            }
+          }
+
+          // d. Re-insert any other mid-way advances
+          const advancesList = purchase.advances ? JSON.parse(purchase.advances) : [];
+          for (const adv of advancesList) {
+            if (adv.amount > 0) {
+              const concept = `Adelanto de la compra: ${purchase.receiptNumber}`;
+              if (adv.paymentType === 'efectivo') {
+                await db.run(`
+                  INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [crypto.randomUUID(), purchase.branchId, adv.amount, 'egreso', concept, 'adelanto', 'efectivo', null, adv.date || purchase.createdAt, adv.createdBy || 'system', id]);
+              } else if (adv.paymentType === 'transferencia') {
+                await db.run(`
+                  INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [crypto.randomUUID(), purchase.branchId, adv.amount, 'egreso', concept, 'adelanto', 'transferencia', adv.bankAccountId || null, adv.date || purchase.createdAt, adv.createdBy || 'system', id]);
+              } else if (adv.paymentType === 'mixto') {
+                if ((adv.cashAmount || 0) > 0) {
+                  await db.run(`
+                    INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `, [crypto.randomUUID(), purchase.branchId, adv.cashAmount, 'egreso', `${concept} (Efectivo)`, 'adelanto', 'efectivo', null, adv.date || purchase.createdAt, adv.createdBy || 'system', id]);
+                }
+                if ((adv.bankAmount || 0) > 0) {
+                  await db.run(`
+                    INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `, [crypto.randomUUID(), purchase.branchId, adv.bankAmount, 'egreso', `${concept} (Banco)`, 'adelanto', 'transferencia', adv.bankAccountId || null, adv.date || purchase.createdAt, adv.createdBy || 'system', id]);
+                }
+              }
+            }
+          }
+
+          // e. If purchase is closed ('cerrado'), restore close-liquidating cash moves
+          if (purchase.type === 'cerrado') {
+            const conceptPrefix = `Liquidación Compra: ${purchase.receiptNumber}`;
+            const closedDate = purchase.closedAt || purchase.createdAt;
+            const closedUser = purchase.closedBy || purchase.createdBy;
+
+            if ((purchase.closeCashAmount || 0) > 0) {
+              await db.run(`
+                INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `, [crypto.randomUUID(), purchase.branchId, purchase.closeCashAmount, 'egreso', `${conceptPrefix} (Efectivo)`, 'compra', 'efectivo', null, closedDate, closedUser, id]);
+            }
+            if ((purchase.closeBankAmount || 0) > 0) {
+              await db.run(`
+                INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `, [crypto.randomUUID(), purchase.branchId, purchase.closeBankAmount, 'egreso', `${conceptPrefix} (Banco)`, 'compra', 'transferencia', purchase.closeSourceBankAccountId || null, closedDate, closedUser, id]);
+            }
+
+            // Also restore any subsequent payments on liquidation balance
+            const liquidationPayments = purchase.payments ? JSON.parse(purchase.payments) : [];
+            for (const p of liquidationPayments) {
+              const liqConcept = `Pago Balance Liquidación: ${purchase.receiptNumber}`;
+              const pDate = p.date || closedDate;
+              const pUser = p.createdBy || closedUser;
+              
+              if (p.paymentType === 'efectivo' || p.paymentType === 'mixto') {
+                if ((p.cashAmount || 0) > 0) {
+                  await db.run(`
+                    INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `, [crypto.randomUUID(), purchase.branchId, p.cashAmount, 'egreso', `${liqConcept} (Efectivo)`, 'compra', 'efectivo', null, pDate, pUser, id]);
+                }
+              }
+              if (p.paymentType === 'transferencia' || p.paymentType === 'mixto') {
+                if ((p.bankAmount || 0) > 0) {
+                  await db.run(`
+                    INSERT INTO branchCashMoves (id, branchId, amount, type, concept, category, paymentType, bankAccountId, \`date\`, createdBy, referenceId)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `, [crypto.randomUUID(), purchase.branchId, p.bankAmount, 'egreso', `${liqConcept} (Transferencia)`, 'compra', 'transferencia', p.bankAccountId || null, pDate, pUser, id]);
+                }
+              }
+            }
+          }
+        }
+      });
+
+      res.json({ success: true });
+      broadcast("purchase_historic_toggled", { id });
+    } catch (error: any) {
+      console.error("Failed to toggle purchase historic status:", error);
+      res.status(500).json({ error: error.message || "Failed to toggle purchase historic status" });
+    }
   });
 
   // Void/Annul Gold Purchase Analysis
