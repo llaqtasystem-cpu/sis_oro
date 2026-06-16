@@ -6,6 +6,8 @@ import {
   BarChart,
   Bar,
   Line,
+  LineChart,
+  ReferenceLine,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -2735,6 +2737,47 @@ export default function App() {
   const [showCacheCleanupModal, setShowCacheCleanupModal] = useState(false);
   const warnedMaterialIdsRef = useRef<Record<string, boolean>>({});
 
+  // Custom Alert and Confirm Modal States
+  const [modalAlertState, setModalAlertState] = useState<{
+    show: boolean;
+    title: string;
+    message: string;
+    type: "success" | "error" | "info" | "warning";
+    onConfirm?: () => void;
+  } | null>(null);
+
+  const [modalConfirmState, setModalConfirmState] = useState<{
+    show: boolean;
+    title: string;
+    message: string;
+    resolve: (value: boolean) => void;
+  } | null>(null);
+
+  useEffect(() => {
+    // Override window.alert to show the beautiful custom React Modal
+    window.alert = (message: any) => {
+      const msgStr = String(message);
+      setModalAlertState({
+        show: true,
+        title: "Mensaje del Sistema",
+        message: msgStr,
+        type: msgStr.toLowerCase().includes("error") || msgStr.toLowerCase().includes("problema") || msgStr.toLowerCase().includes("incorrecta") || msgStr.toLowerCase().includes("falló") ? "error" : "success",
+      });
+    };
+
+    // Define customConfirm on window object
+    (window as any).customConfirm = (message: string, title: string = "Confirmación Requerida") => {
+      return new Promise<boolean>((resolve) => {
+        setModalConfirmState({
+          show: true,
+          title,
+          message,
+          resolve,
+        });
+      });
+    };
+  }, []);
+
   const playNotificationSound = useCallback(() => {
     try {
       const audioCtx = new (
@@ -2930,6 +2973,19 @@ export default function App() {
   const [executiveBranchFilter, setExecutiveBranchFilter] =
     useState<string>("all");
   const [executiveYearFilter, setExecutiveYearFilter] = useState<string>("all");
+  const [auditBranchFilter, setAuditBranchFilter] = useState<string>("all");
+  const [auditClosuresPage, setAuditClosuresPage] = useState<number>(1);
+  const [sedeTab, setSedeTab] = useState<"operaciones" | "auditoria" | "admin">("operaciones");
+
+  useEffect(() => {
+    if (["inventory", "smelt", "export"].includes(view)) {
+      setSedeTab("operaciones");
+    } else if (["branch_purchases", "history"].includes(view)) {
+      setSedeTab("auditoria");
+    } else if (["executive_dashboard", "branches", "users", "settings", "deleted"].includes(view)) {
+      setSedeTab("admin");
+    }
+  }, [view]);
 
   const pendingLiquidationsAlerts = useMemo(() => {
     if (!branchMode) return [];
@@ -4284,6 +4340,7 @@ export default function App() {
 
   const [clientSearch, setClientSearch] = useState("");
   const [referrerSearch, setReferrerSearch] = useState("");
+  const [branchReferrerSearch, setBranchReferrerSearch] = useState("");
   const [branchTransfersSearch, setBranchTransfersSearch] = useState("");
   const [purchaseTypeFilter, setPurchaseTypeFilter] = useState<
     "abierto" | "cerrado"
@@ -4296,6 +4353,7 @@ export default function App() {
   const [cashMovesSearch, setCashMovesSearch] = useState("");
   const [cashMovesPage, setCashMovesPage] = useState(1);
   const [closuresPage, setClosuresPage] = useState(1);
+  const [cashDashboardMode, setCashDashboardMode] = useState<"weekly_days" | "monthly_weeks">("weekly_days");
   const PURCHASE_HISTORY_PER_PAGE = 10;
   const [expandedPurchases, setExpandedPurchases] = useState<string[]>([]);
   const [revaluationItem, setRevaluationItem] =
@@ -4383,6 +4441,312 @@ export default function App() {
     return closures.slice(start, start + ITEMS_PER_PAGE);
   }, [branchClosures, branchMode, closuresPage]);
 
+  const closureDifferencesTrendData = useMemo(() => {
+    const branchCls = [...branchClosures]
+      .filter((c) => c.branchId === branchMode)
+      .sort((a, b) => new Date(a.closedAt || a.date).getTime() - new Date(b.closedAt || b.date).getTime());
+    
+    // Recent closures up to 15
+    const recentCls = branchCls.slice(-15);
+    
+    const trendList = recentCls.map((c) => {
+      const dateObj = new Date(c.closedAt || c.date);
+      const label = `${dateObj.getDate()}/${dateObj.getMonth() + 1}`;
+      const code = c.id.slice(0, 8).toUpperCase();
+      const diff = c.differenceAmount !== undefined && c.differenceAmount !== null ? Number(c.differenceAmount) : 0;
+      
+      return {
+        id: c.id,
+        labelStr: `${label} (${code})`,
+        dateStr: dateObj.toLocaleDateString(),
+        difference: diff,
+        absDifference: Math.abs(diff),
+        physical: c.physicalBalance || 0,
+        calculated: c.finalBalance || 0,
+      };
+    });
+
+    // Statistical Summary computed from ALL closures in this branch
+    const allDiffs = branchCls.map(c => c.differenceAmount !== undefined && c.differenceAmount !== null ? Number(c.differenceAmount) : 0);
+    const nonZeroDiffs = allDiffs.filter(d => d !== 0);
+    const hasClosures = allDiffs.length > 0;
+    
+    const avgDiff = hasClosures ? allDiffs.reduce((sum, d) => sum + d, 0) / allDiffs.length : 0;
+    const errorCount = nonZeroDiffs.length;
+    const errorPercentage = hasClosures ? (errorCount / allDiffs.length) * 100 : 0;
+    
+    const negatives = allDiffs.filter(d => d < 0);
+    const positives = allDiffs.filter(d => d > 0);
+    
+    const worstFaltante = negatives.length > 0 ? Math.min(...negatives) : 0;
+    const bestSobrante = positives.length > 0 ? Math.max(...positives) : 0;
+
+    return {
+      trend: trendList,
+      stats: {
+        average: avgDiff,
+        errorPercentage,
+        errorCount,
+        totalClosuresCount: branchCls.length,
+        worstFaltante,
+        bestSobrante,
+      }
+    };
+  }, [branchClosures, branchMode]);
+
+  const globalAuditDifferencesData = useMemo(() => {
+    let filteredCls = [...branchClosures];
+    if (auditBranchFilter !== "all") {
+      filteredCls = filteredCls.filter((c) => c.branchId === auditBranchFilter);
+    }
+    
+    const sorted = [...filteredCls].sort((a, b) => {
+      return new Date(a.closedAt || a.date).getTime() - new Date(b.closedAt || b.date).getTime();
+    });
+
+    const recent = sorted.slice(-25);
+
+    const trend = recent.map((c) => {
+      const dateObj = new Date(c.closedAt || c.date);
+      const label = `${dateObj.getDate()}/${dateObj.getMonth() + 1}`;
+      const code = c.id.slice(0, 8).toUpperCase();
+      const diff = c.differenceAmount !== undefined && c.differenceAmount !== null ? Number(c.differenceAmount) : 0;
+      const bObj = branches.find((b) => b.id === c.branchId);
+      const bName = bObj ? bObj.name : "Casa de Cambio";
+      
+      return {
+        id: c.id,
+        labelStr: `${label} (${code})`,
+        dateStr: dateObj.toLocaleDateString(),
+        timeStr: dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        difference: diff,
+        absDifference: Math.abs(diff),
+        physical: c.physicalBalance || 0,
+        calculated: c.finalBalance || 0,
+        branchName: bName,
+        createdBy: c.createdBy,
+        justification: c.differenceJustification || "",
+      };
+    });
+
+    const allDiffs = sorted.map(c => c.differenceAmount !== undefined && c.differenceAmount !== null ? Number(c.differenceAmount) : 0);
+    const nonZeroDiffs = allDiffs.filter(d => d !== 0);
+    const hasClosures = allDiffs.length > 0;
+
+    const totalClosuresCount = sorted.length;
+    const errorCount = nonZeroDiffs.length;
+    const errorPercentage = hasClosures ? (errorCount / totalClosuresCount) * 100 : 0;
+    const average = hasClosures ? allDiffs.reduce((sum, d) => sum + d, 0) / totalClosuresCount : 0;
+    const totalAbsoluteError = allDiffs.reduce((sum, d) => sum + Math.abs(d), 0);
+
+    const negatives = allDiffs.filter(d => d < 0);
+    const positives = allDiffs.filter(d => d > 0);
+
+    const worstFaltante = negatives.length > 0 ? Math.min(...negatives) : 0;
+    const bestSobrante = positives.length > 0 ? Math.max(...positives) : 0;
+
+    const sortedNewestFirst = [...filteredCls].sort((a, b) => {
+      return new Date(b.closedAt || b.date).getTime() - new Date(a.closedAt || a.date).getTime();
+    });
+
+    return {
+      trend,
+      stats: {
+        totalClosuresCount,
+        errorCount,
+        errorPercentage,
+        average,
+        totalAbsoluteError,
+        worstFaltante,
+        bestSobrante,
+      },
+      sortedNewestFirst,
+    };
+  }, [branchClosures, auditBranchFilter, branches]);
+
+  const paginatedAuditClosures = useMemo(() => {
+    const list = globalAuditDifferencesData.sortedNewestFirst;
+    const start = (auditClosuresPage - 1) * ITEMS_PER_PAGE;
+    return list.slice(start, start + ITEMS_PER_PAGE);
+  }, [globalAuditDifferencesData.sortedNewestFirst, auditClosuresPage]);
+
+  const last7DaysData = useMemo(() => {
+    if (!branchMode) return [];
+    const days = [];
+    const now = new Date();
+    
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(now.getDate() - i);
+      d.setHours(0, 0, 0, 0);
+      days.push(d);
+    }
+
+    const activeMoves = branchCashMoves.filter((m) => m.branchId === branchMode);
+
+    return days.map((dayDate) => {
+      const startOfDay = dayDate.getTime();
+      const endOfDay = startOfDay + 24 * 60 * 60 * 1000;
+      
+      const dayMoves = activeMoves.filter((m) => {
+        const t = new Date(m.date).getTime();
+        return t >= startOfDay && t < endOfDay;
+      });
+
+      const ingresos = dayMoves
+        .filter((m) => m.type === "ingreso")
+        .reduce((sum, m) => sum + m.amount, 0);
+      const egresos = dayMoves
+        .filter((m) => m.type === "egreso")
+        .reduce((sum, m) => sum + m.amount, 0);
+      const neto = ingresos - egresos;
+
+      const daysOfWeek = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+      const label = `${daysOfWeek[dayDate.getDay()]} ${dayDate.getDate()}/${dayDate.getMonth() + 1}`;
+
+      return {
+        label,
+        "Ingresos": ingresos,
+        "Egresos": egresos,
+        "Neto": neto,
+      };
+    });
+  }, [branchCashMoves, branchMode]);
+
+  const last5WeeksData = useMemo(() => {
+    if (!branchMode) return [];
+    const weeks = [];
+    const now = new Date();
+    
+    // Create previous 5 weeks starting on Mondays
+    for (let i = 4; i >= 0; i--) {
+      const startOfWeek = new Date();
+      startOfWeek.setDate(now.getDate() - now.getDay() + 1 - (i * 7));
+      startOfWeek.setHours(0, 0, 0, 0);
+      
+      const endOfWeek = new Date(startOfWeek.getTime() + 7 * 24 * 60 * 60 * 1000);
+      
+      weeks.push({
+        start: startOfWeek,
+        end: endOfWeek,
+        label: `Semana -${i === 0 ? "Actual" : i}`,
+      });
+    }
+
+    const activeMoves = branchCashMoves.filter((m) => m.branchId === branchMode);
+
+    return weeks.map((w) => {
+      const wMoves = activeMoves.filter((m) => {
+        const t = new Date(m.date).getTime();
+        return t >= w.start.getTime() && t < w.end.getTime();
+      });
+
+      const ingresos = wMoves
+        .filter((m) => m.type === "ingreso")
+        .reduce((sum, m) => sum + m.amount, 0);
+      const egresos = wMoves
+        .filter((m) => m.type === "egreso")
+        .reduce((sum, m) => sum + m.amount, 0);
+      const neto = ingresos - egresos;
+
+      const startLabel = `${w.start.getDate()}/${w.start.getMonth() + 1}`;
+      const endLabel = `${new Date(w.end.getTime() - 1000).getDate()}/${new Date(w.end.getTime() - 1000).getMonth() + 1}`;
+      const dateRange = `(${startLabel} - ${endLabel})`;
+
+      return {
+        label: w.label,
+        dateRange,
+        "Ingresos": ingresos,
+        "Egresos": egresos,
+        "Neto": neto,
+      };
+    });
+  }, [branchCashMoves, branchMode]);
+
+  const chartTotals = useMemo(() => {
+    const dataset = cashDashboardMode === "weekly_days" ? last7DaysData : last5WeeksData;
+    const totalIn = dataset.reduce((sum, item) => sum + item["Ingresos"], 0);
+    const totalOut = dataset.reduce((sum, item) => sum + item["Egresos"], 0);
+    const net = totalIn - totalOut;
+
+    return { totalIn, totalOut, net };
+  }, [cashDashboardMode, last7DaysData, last5WeeksData]);
+
+  const branchMaterialDistribution = useMemo(() => {
+    if (!branchMode) return [];
+    let totalPiezasWeight = 0;
+    let totalBarrasWeight = 0;
+    let totalPiezasCount = 0;
+    let totalBarrasCount = 0;
+
+    goldPurchases
+      .filter((p) => p.branchId === branchMode && p.type !== "anulado")
+      .forEach((p) => {
+        p.items?.forEach((item: any) => {
+          const itemType = item.type || "pieza";
+          const weight = item.finalWeight || item.initialWeight || 0;
+          if (itemType === "barra") {
+            totalBarrasWeight += weight;
+            totalBarrasCount += 1;
+          } else {
+            totalPiezasWeight += weight;
+            totalPiezasCount += 1;
+          }
+        });
+      });
+
+    return [
+      {
+        name: "Piezas",
+        value: parseFloat(totalPiezasWeight.toFixed(2)),
+        count: totalPiezasCount,
+        color: "#f59e0b",
+      },
+      {
+        name: "Barras",
+        value: parseFloat(totalBarrasWeight.toFixed(2)),
+        count: totalBarrasCount,
+        color: "#3b82f6",
+      },
+    ].filter((item) => item.value > 0 || item.count > 0);
+  }, [goldPurchases, branchMode]);
+
+  const topBranchClients = useMemo(() => {
+    if (!branchMode) return [];
+    const clientPurchasesMap: { [clientId: string]: { weight: number; total: number; count: number } } = {};
+
+    goldPurchases
+      .filter((p) => p.branchId === branchMode && p.type !== "anulado")
+      .forEach((p) => {
+        const clientId = p.clientId;
+        if (!clientId) return;
+        const weight = p.items?.reduce((acc, curr) => acc + curr.finalWeight, 0) || 0;
+        const total = p.total || 0;
+
+        if (!clientPurchasesMap[clientId]) {
+          clientPurchasesMap[clientId] = { weight: 0, total: 0, count: 0 };
+        }
+        clientPurchasesMap[clientId].weight += weight;
+        clientPurchasesMap[clientId].total += total;
+        clientPurchasesMap[clientId].count += 1;
+      });
+
+    const bClients = clients.filter((c) => c.branchId === branchMode);
+
+    return bClients
+      .map((c) => {
+        const stats = clientPurchasesMap[c.id] || { weight: 0, total: 0, count: 0 };
+        return {
+          ...c,
+          purchasedWeight: stats.weight,
+          purchasedTotal: stats.total,
+          purchaseCount: stats.count,
+        };
+      })
+      .sort((a, b) => b.purchasedTotal - a.purchasedTotal)
+      .slice(0, 5);
+  }, [goldPurchases, clients, branchMode]);
+
   const filteredBranchClients = useMemo(() => {
     return clients
       .filter((c) => c.branchId === branchMode)
@@ -4408,15 +4772,15 @@ export default function App() {
       .filter((r) => r.branchId === branchMode)
       .filter(
         (r) =>
-          r.name.toLowerCase().includes(referrerSearch.toLowerCase()) ||
-          (r.ci || "").toLowerCase().includes(referrerSearch.toLowerCase()) ||
-          (r.phone1 || "").toLowerCase().includes(referrerSearch.toLowerCase()),
+          r.name.toLowerCase().includes(branchReferrerSearch.toLowerCase()) ||
+          (r.ci || "").toLowerCase().includes(branchReferrerSearch.toLowerCase()) ||
+          (r.phone1 || "").toLowerCase().includes(branchReferrerSearch.toLowerCase()),
       )
       .sort(
         (a, b) =>
           new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       );
-  }, [referrers, branchMode, referrerSearch]);
+  }, [referrers, branchMode, branchReferrerSearch]);
 
   const paginatedBranchReferrers = useMemo(() => {
     const start = (branchReferrersPage - 1) * ITEMS_PER_PAGE;
@@ -4425,7 +4789,7 @@ export default function App() {
 
   const filteredPurchaseHistory = useMemo(() => {
     return goldPurchases
-      .filter((p) => p.branchId === branchMode)
+      .filter((p) => !branchMode || p.branchId === branchMode)
       .filter((p) => p.type === purchaseTypeFilter)
       .filter((p) => {
         const clientName = clients.find((c) => c.id === p.clientId)?.name || "";
@@ -5607,7 +5971,7 @@ export default function App() {
     }
 
     try {
-      await apiFetch(`/api/branches/${branchMode}/closures`, {
+      const res = await apiFetch(`/api/branches/${branchMode}/closures`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -5623,6 +5987,27 @@ export default function App() {
       setShowAddClosureModal(false);
       setClosureFormData({ notes: "" });
       fetchData();
+
+      if (res && res.emailNotificationSent) {
+        setToastAlerts((prev) => [
+          {
+            id: String(Date.now()),
+            title: "Correo de Diferencia Enviado",
+            message: `Notificación enviada a los administradores (${res.recipients ? res.recipients.join(", ") : "llaqtasystem@gmail.com"}) por la diferencia de ${pdiff} BS.`,
+            date: new Date().toLocaleTimeString(),
+          },
+          ...prev,
+        ]);
+        alert(
+          `Cierre de caja registrado. Se detectó una diferencia de ${pdiff} BS y se envió una notificación automática por correo electrónico a los administradores.`
+        );
+      } else if (pdiff !== 0) {
+        alert(
+          `Cierre registrado con una diferencia de ${pdiff} BS. (Notificación por correo omitida o no configurada).`
+        );
+      } else {
+        alert("Cierre de caja realizado exitosamente.");
+      }
     } catch (error) {
       handleApiError(error, OperationType.CREATE, "closure");
     }
@@ -7490,10 +7875,11 @@ export default function App() {
     destination: "sqlite" | "mysql",
     clearDestination: boolean,
   ) => {
-    const confirmation = window.confirm(
+    const confirmation = await (window as any).customConfirm(
       `¿Está seguro de querer migrar TODOS sus registros desde ${source.toUpperCase()} hacia ${destination.toUpperCase()}?\n\n` +
         `${clearDestination ? "⚠️ ATENCIÓN: Se eliminarán TODOS los registros de la base de datos DESTINO antes de la carga, para que sea una copia exacta." : "Se añadirán/actualizarán los registros que no existan."}\n\n` +
         `¿Desea continuar con esta operación?`,
+      "Confirmación de Migración de Base de Datos"
     );
     if (!confirmation) return;
 
@@ -7571,7 +7957,7 @@ export default function App() {
           return;
         }
 
-        const confirmRestore = window.confirm(
+        const confirmRestore = await (window as any).customConfirm(
           `¿Está seguro de que desea restaurar los datos? Se aplicarán sobre:\n- ${
             dbTargetBranch === "all"
               ? "TODAS las sucursales"
@@ -7581,6 +7967,7 @@ export default function App() {
               ? "⚠️ ¡ATENCIÓN! Se VACIARÁN los datos correspondientes antes de realizar la carga."
               : "Se fusionarán/actualizarán los datos existentes (sin borrar)."
           }\n\n¿Desea proceder?`,
+          "Confirmación de Restauración de Datos"
         );
         if (!confirmRestore) return;
 
@@ -7615,8 +8002,9 @@ export default function App() {
       ? "COMPLETO"
       : branches.find((b) => b.id === dbTargetBranch)?.name || dbTargetBranch;
 
-    const confirm1 = window.confirm(
+    const confirm1 = await (window as any).customConfirm(
       `⚠️ ALERTA DE SEGURIDAD ⚠️\n\n¿Está totalmente seguro de que desea vaciar los datos de la sucursal/base de datos: "${sucursalName}"?\nSe eliminarán de forma permanente compras, inventarios, cierres, traslados, etc.\nEsta acción NO se puede deshacer.`,
+      "⚠️ Alerta de Seguridad"
     );
     if (!confirm1) return;
 
@@ -8163,7 +8551,7 @@ export default function App() {
       id === user.id
     )
       return;
-    if (confirm("¿Está seguro de eliminar este usuario?")) {
+    if (await (window as any).customConfirm("¿Está seguro de eliminar este usuario?", "Eliminar Usuario")) {
       try {
         await fetch(`/api/users/${id}`, { method: "DELETE" });
         fetchData();
@@ -8310,6 +8698,7 @@ export default function App() {
     if (!user || !branchMode) return;
 
     if (isCiAlreadyUsed) {
+      alert("Error: Ya existe un cliente con este número de CI registrado en esta sucursal.");
       return;
     }
 
@@ -8513,6 +8902,11 @@ export default function App() {
     e.preventDefault();
     if (!user || !branchMode) return;
 
+    if (isReferrerCiAlreadyUsed) {
+      alert("Error: Ya existe un referido con este número de CI registrado en esta sucursal.");
+      return;
+    }
+
     try {
       const response = await apiFetch(
         editingReferrer
@@ -8562,7 +8956,7 @@ export default function App() {
   };
 
   const handleDeleteReferrer = async (id: string) => {
-    if (!confirm("¿Estás seguro de eliminar este referido?")) return;
+    if (!await (window as any).customConfirm("¿Estás seguro de eliminar este referido?", "Eliminar Referido")) return;
     try {
       const response = await fetch(`/api/referrers/${id}`, {
         method: "DELETE",
@@ -11808,8 +12202,9 @@ export default function App() {
         // Option to print immediately
         if (
           newAdvanceToPrint &&
-          confirm(
+          await (window as any).customConfirm(
             `¿Desea imprimir el comprobante de adelanto (${editingAdvanceId ? "actualizado" : "nuevo"}) ahora?`,
+            "Imprimir Comprobante"
           )
         ) {
           handlePrintAdvanceReceipt(
@@ -11842,16 +12237,6 @@ export default function App() {
     }
 
     const selectedCloseDate = new Date(closeAtDate + "T00:00:00");
-    const today = new Date();
-    // Comparing YYYY-MM-DD strings makes it extremely precise for local times
-    const todayYMD = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-
-    if (closeAtDate > todayYMD) {
-      setCloseValidationError(
-        "La fecha de liquidación no puede ser una fecha futura.",
-      );
-      return;
-    }
 
     if (p.createdAt) {
       const creationDateYMD = p.createdAt.split("T")[0];
@@ -12000,10 +12385,11 @@ export default function App() {
           closeSignature,
         };
 
-        setTimeout(() => {
+        setTimeout(async () => {
           if (
-            confirm(
+            await (window as any).customConfirm(
               "Compra cerrada correctamente con los nuevos valores recalculados. ¿Desea imprimir el Comprobante de Liquidación de Saldo ahora?",
+              "Imprimir Comprobante"
             )
           ) {
             handlePrintLiquidationReceipt(closedPurchaseObj);
@@ -12500,7 +12886,7 @@ export default function App() {
   };
 
   const handleDeleteBranchBankAccount = async (id: string) => {
-    if (!window.confirm("¿Eliminar esta cuenta bancaria?")) return;
+    if (!await (window as any).customConfirm("¿Eliminar esta cuenta bancaria?", "Eliminar Cuenta Bancaria")) return;
     try {
       await fetch(`/api/branch-bank-accounts/${id}`, {
         method: "DELETE",
@@ -13107,225 +13493,286 @@ export default function App() {
           )}
 
           {/* Controls */}
-          <div className="flex flex-col md:flex-row gap-4 mb-8 items-center justify-between">
-            <div className="flex items-center gap-2 bg-zinc-900 p-1 rounded-2xl border border-white/5 w-full md:w-auto overflow-x-auto">
-              {!branchMode ? (
-                <>
+          <div className="flex flex-col lg:flex-row gap-6 mb-8 items-stretch lg:items-center justify-between">
+            {!branchMode ? (
+              <div className="flex flex-col gap-4 w-full lg:flex-1">
+                {/* Category Selector */}
+                <div className="flex flex-wrap items-center gap-1.5 bg-zinc-950/70 p-1.5 rounded-2xl border border-white/5 self-start">
                   <button
-                    onClick={() => handleViewChange("inventory")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "inventory" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
-                  >
-                    <span>Inventario</span>
-                    <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "inventory"
-                          ? "bg-zinc-200 text-zinc-900 border-zinc-300"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
-                    >
-                      {
-                        materials.filter((m) => m.status === "disponible")
-                          .length
-                      }
-                    </span>
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("smelt")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "smelt" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
-                  >
-                    <Flame className="w-4 h-4" /> Fundir
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("export")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "export" ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
-                  >
-                    <TrendingUp className="w-4 h-4" /> Exportar
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("history")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "history" ? "bg-purple-600 text-white shadow-lg shadow-purple-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
-                  >
-                    <History className="w-4 h-4" />
-                    <span>Historial</span>
-                    {expiredPurchasesCount > 0 && (
-                      <span
-                        className="px-1.5 py-0.5 text-[9px] bg-red-650 text-white font-extrabold rounded-full border border-red-500 animate-pulse shrink-0"
-                        title={`${expiredPurchasesCount} compras con plazo de días vencido`}
-                      >
-                        {expiredPurchasesCount}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    onClick={() => setShowTransferHistoryModal(true)}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap text-zinc-500 hover:bg-zinc-800`}
-                  >
-                    <Truck className="w-4 h-4" /> Transitos
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={() => handleViewChange("branch_dashboard")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${view === "branch_dashboard" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800"}`}
-                  >
-                    Panel Sucursal
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("branch_clients")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_clients" ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
-                  >
-                    <User className="w-4 h-4" />
-                    <span>Clientes</span>
-                    <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "branch_clients"
-                          ? "bg-blue-700 text-blue-100 border-blue-550"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
-                    >
-                      {clients.filter((c) => c.branchId === branchMode).length}
-                    </span>
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("branch_purchases")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_purchases" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
-                  >
-                    <Coins className="w-4 h-4" />
-                    <span>Compra Oro</span>
-                    {expiredPurchasesCount > 0 && (
-                      <span
-                        className="px-1.5 py-0.5 text-[9px] bg-red-650 text-white font-extrabold rounded-full border border-red-500 animate-pulse shrink-0"
-                        title={`${expiredPurchasesCount} compras con plazo de días vencido`}
-                      >
-                        {expiredPurchasesCount}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    onClick={() => handleViewChange("branch_inventory")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_inventory" ? "bg-violet-600 text-white shadow-lg shadow-violet-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
+                    onClick={() => {
+                      setSedeTab("operaciones");
+                      handleViewChange("inventory");
+                    }}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 whitespace-nowrap ${
+                      sedeTab === "operaciones"
+                        ? "bg-zinc-100 text-zinc-900 shadow-lg font-black"
+                        : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900"
+                    }`}
                   >
                     <Package className="w-4 h-4" />
-                    <span>Inventario de Materiales</span>
-                    <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "branch_inventory"
-                          ? "bg-violet-700 text-violet-100 border-violet-550"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
-                    >
-                      {
-                        branchAllItems.filter(
-                          (i) =>
-                            !i.isTransferred &&
-                            !i.isHistoric &&
-                            i.purchaseType === "cerrado",
-                        ).length
-                      }
-                    </span>
+                    <span>Operaciones</span>
                   </button>
+
                   <button
-                    onClick={() => handleViewChange("branch_transfers")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_transfers" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                    onClick={() => {
+                      setSedeTab("auditoria");
+                      handleViewChange("branch_purchases");
+                    }}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 whitespace-nowrap ${
+                      sedeTab === "auditoria"
+                        ? "bg-zinc-100 text-zinc-900 shadow-lg font-black"
+                        : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900"
+                    }`}
                   >
-                    <Truck className="w-4 h-4" /> Envíos Central
+                    <History className="w-4 h-4" />
+                    <span>Auditoría e Historial</span>
                   </button>
-                  <button
-                    onClick={() => handleViewChange("branch_referrers")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_referrers" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
-                  >
-                    <Users className="w-4 h-4" />
-                    <span>Referidos</span>
-                    <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "branch_referrers"
-                          ? "bg-indigo-700 text-indigo-100 border-indigo-550"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
-                    >
-                      {
-                        referrers.filter((r) => r.branchId === branchMode)
-                          .length
-                      }
-                    </span>
-                  </button>
+
                   {(user.role === "admin" || user.role === "superadmin") && (
                     <button
-                      onClick={() => handleViewChange("branch_cash")}
-                      className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_cash" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      onClick={() => {
+                        setSedeTab("admin");
+                        handleViewChange("executive_dashboard");
+                      }}
+                      className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 whitespace-nowrap ${
+                        sedeTab === "admin"
+                          ? "bg-zinc-100 text-zinc-900 shadow-lg font-black"
+                          : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900"
+                      }`}
                     >
-                      <Scale className="w-4 h-4" /> Caja Chica
+                      <Settings className="w-4 h-4" />
+                      <span>Configuración y Gestión</span>
                     </button>
                   )}
-                </>
-              )}
-              {!branchMode &&
-                (user.role === "admin" || user.role === "superadmin") && (
-                  <button
-                    onClick={() => handleViewChange("executive_dashboard")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "executive_dashboard" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                </div>
+
+                {/* Sub-menu Options */}
+                <div className="flex items-center gap-2 bg-zinc-900 p-1.5 rounded-2xl border border-white/5 w-full overflow-x-auto">
+                  {sedeTab === "operaciones" && (
+                    <>
+                      <button
+                        onClick={() => handleViewChange("inventory")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "inventory" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-350"}`}
+                      >
+                        <span>Inventario</span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                            view === "inventory"
+                              ? "bg-zinc-200 text-zinc-900 border-zinc-300"
+                              : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                          }`}
+                        >
+                          {materials.filter((m) => m.status === "disponible").length}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("smelt")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "smelt" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <Flame className="w-4 h-4" /> Fundir
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("export")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "export" ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <TrendingUp className="w-4 h-4" /> Exportar
+                      </button>
+                      <button
+                        onClick={() => setShowTransferHistoryModal(true)}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap text-zinc-500 hover:bg-zinc-800`}
+                      >
+                        <Truck className="w-4 h-4" /> Tránsitos
+                      </button>
+                    </>
+                  )}
+
+                  {sedeTab === "auditoria" && (
+                    <>
+                      <button
+                        onClick={() => handleViewChange("branch_purchases")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_purchases" ? "bg-amber-500 text-zinc-950 shadow-lg shadow-amber-500/20 hover:bg-amber-400" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <Coins className="w-4 h-4" />
+                        <span>Recibos Sucursales</span>
+                        {expiredPurchasesCount > 0 && (
+                          <span
+                            className="px-1.5 py-0.5 text-[9px] bg-red-650 text-white font-extrabold rounded-full border border-red-500 animate-pulse shrink-0"
+                            title={`${expiredPurchasesCount} compras con plazo de días vencido`}
+                          >
+                            {expiredPurchasesCount}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("audit_closures")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "audit_closures" ? "bg-rose-500 text-white shadow-lg shadow-rose-500/20 hover:bg-rose-400" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <TrendingUp className="w-4 h-4" />
+                        <span>Auditoría de Cierres</span>
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("history")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "history" ? "bg-purple-600 text-white shadow-lg shadow-purple-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <History className="w-4 h-4" />
+                        <span>Historial General</span>
+                      </button>
+                    </>
+                  )}
+
+                  {sedeTab === "admin" && (
+                    <>
+                      <button
+                        onClick={() => handleViewChange("executive_dashboard")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "executive_dashboard" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <TrendingUp className="w-4 h-4" /> Dashboard Ejecutivo
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("branches")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branches" ? "bg-orange-600 text-white shadow-lg shadow-orange-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"}`}
+                      >
+                        <Building2 className="w-4 h-4" />
+                        <span>Sucursales</span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                            view === "branches"
+                              ? "bg-orange-700 text-orange-100 border-orange-550"
+                              : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                          }`}
+                        >
+                          {branches.filter((b) => b.active !== 0).length}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("users")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "users" ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"}`}
+                      >
+                        <User className="w-4 h-4" />
+                        <span>Usuarios</span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                            view === "users"
+                              ? "bg-blue-700 text-blue-100 border-blue-550"
+                              : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                          }`}
+                        >
+                          {systemUsers.length}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("settings")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "settings" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <Settings className="w-4 h-4" /> Empresa
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("deleted")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "deleted" ? "bg-red-600 text-white shadow-lg shadow-red-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                      >
+                        <Trash2 className="w-4 h-4" /> Eliminados
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 bg-zinc-900 p-1.5 rounded-2xl border border-white/5 w-full lg:w-auto overflow-x-auto">
+                <button
+                  onClick={() => handleViewChange("branch_dashboard")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${view === "branch_dashboard" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800"}`}
+                >
+                  Panel Sucursal
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_clients")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_clients" ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
+                >
+                  <User className="w-4 h-4" />
+                  <span>Clientes</span>
+                  <span
+                    className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                      view === "branch_clients"
+                        ? "bg-blue-700 text-blue-100 border-blue-550"
+                        : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                    }`}
                   >
-                    <TrendingUp className="w-4 h-4" /> Dashboard Ejecutivo
-                  </button>
-                )}
-              {!branchMode &&
-                (user.role === "admin" || user.role === "superadmin") && (
-                  <button
-                    onClick={() => handleViewChange("users")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "users" ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
-                  >
-                    <User className="w-4 h-4" />
-                    <span>Usuarios</span>
+                    {clients.filter((c) => c.branchId === branchMode).length}
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_purchases")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_purchases" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                >
+                  <Coins className="w-4 h-4" />
+                  <span>Compra Oro</span>
+                  {expiredPurchasesCount > 0 && (
                     <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "users"
-                          ? "bg-blue-700 text-blue-100 border-blue-550"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
+                      className="px-1.5 py-0.5 text-[9px] bg-red-650 text-white font-extrabold rounded-full border border-red-500 animate-pulse shrink-0"
+                      title={`${expiredPurchasesCount} compras con plazo de días vencido`}
                     >
-                      {systemUsers.length}
+                      {expiredPurchasesCount}
                     </span>
-                  </button>
-                )}
-              {!branchMode &&
-                (user.role === "admin" || user.role === "superadmin") && (
-                  <button
-                    onClick={() => handleViewChange("deleted")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "deleted" ? "bg-red-600 text-white shadow-lg shadow-red-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                  )}
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_inventory")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_inventory" ? "bg-violet-600 text-white shadow-lg shadow-violet-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
+                >
+                  <Package className="w-4 h-4" />
+                  <span>Inventario de Materiales</span>
+                  <span
+                    className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                      view === "branch_inventory"
+                        ? "bg-violet-700 text-violet-100 border-violet-550"
+                        : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                    }`}
                   >
-                    <Trash2 className="w-4 h-4" /> Eliminados
-                  </button>
-                )}
-              {!branchMode &&
-                (user.role === "admin" || user.role === "superadmin") && (
-                  <button
-                    onClick={() => handleViewChange("settings")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "settings" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                    {
+                      branchAllItems.filter(
+                        (i) =>
+                          !i.isTransferred &&
+                          !i.isHistoric &&
+                          i.purchaseType === "cerrado",
+                      ).length
+                    }
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_transfers")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_transfers" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:bg-zinc-800"}`}
+                >
+                  <Truck className="w-4 h-4" /> Envíos Central
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_referrers")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_referrers" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
+                >
+                  <Users className="w-4 h-4" />
+                  <span>Referidos</span>
+                  <span
+                    className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                      view === "branch_referrers"
+                        ? "bg-indigo-700 text-indigo-100 border-indigo-550"
+                        : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                    }`}
                   >
-                    <Settings className="w-4 h-4" /> Empresa
-                  </button>
-                )}
-              {!branchMode &&
-                (user.role === "admin" || user.role === "superadmin") && (
+                    {
+                      referrers.filter((r) => r.branchId === branchMode)
+                        .length
+                    }
+                  </span>
+                </button>
+                {(user.role === "admin" || user.role === "superadmin") && (
                   <button
-                    onClick={() => handleViewChange("branches")}
-                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branches" ? "bg-orange-600 text-white shadow-lg shadow-orange-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-305"}`}
+                    onClick={() => handleViewChange("branch_cash")}
+                    className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${view === "branch_cash" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800"}`}
                   >
-                    <Building2 className="w-4 h-4" />
-                    <span>Sucursales</span>
-                    <span
-                      className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
-                        view === "branches"
-                          ? "bg-orange-700 text-orange-100 border-orange-550"
-                          : "bg-zinc-950/60 text-zinc-400 border-white/5"
-                      }`}
-                    >
-                      {branches.filter((b) => b.active !== 0).length}
-                    </span>
+                    <Scale className="w-4 h-4" /> Caja Chica
                   </button>
                 )}
-            </div>
+              </div>
+            )}
 
             {!branchMode &&
               view !== "users" &&
@@ -14481,6 +14928,346 @@ export default function App() {
                   currentPage={currentPage}
                   onPageChange={setCurrentPage}
                 />
+              </motion.div>
+            )}
+
+            {view === "audit_closures" && (
+              <motion.div
+                key="audit_closures"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6 text-white"
+              >
+                <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 bg-zinc-900/50 p-6 rounded-[32px] border border-white/5">
+                  <div>
+                    <h2 className="text-2xl font-black text-white italic tracking-tighter flex items-center gap-3">
+                      <Scale className="w-7 h-7 text-rose-500" /> Auditoría de Arqueos y Cierres
+                    </h2>
+                    <p className="text-zinc-500 text-xs font-medium mt-1">
+                      Supervisión y control de diferencias (faltantes y sobrantes) de efectivo en cajas por sucursal
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-3 w-full lg:w-auto">
+                    <span className="text-xs text-zinc-400 font-bold uppercase tracking-wider shrink-0">Filtrar Sucursal:</span>
+                    <select
+                      value={auditBranchFilter}
+                      onChange={(e) => {
+                        setAuditBranchFilter(e.target.value);
+                        setAuditClosuresPage(1);
+                      }}
+                      className="bg-zinc-950 text-white border border-white/10 rounded-2xl px-4 py-2.5 text-xs font-bold focus:outline-none focus:border-rose-500/50 transition-all cursor-pointer w-full lg:w-64"
+                    >
+                      <option value="all">Todas las Sucursales</option>
+                      {branches.map((b) => (
+                        <option key={b.id} value={b.id}>{b.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Bento Statistics Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  <div className="bg-zinc-90 w-full p-6 rounded-[28px] border border-white/5 bg-zinc-900/40 relative overflow-hidden flex flex-col justify-between h-[130px]">
+                    <div>
+                      <p className="text-[10px] text-zinc-500 font-black uppercase tracking-[0.2em]">Cierres Registrados</p>
+                      <h4 className="text-3xl font-mono font-black text-zinc-100 mt-2">
+                        {globalAuditDifferencesData.stats.totalClosuresCount}
+                      </h4>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mt-3 font-medium">Historial completo con filtros aplicados</p>
+                  </div>
+
+                  <div className="bg-zinc-90 w-full p-6 rounded-[28px] border border-white/5 bg-zinc-900/40 relative overflow-hidden flex flex-col justify-between h-[130px]">
+                    <div>
+                      <p className="text-[10px] text-zinc-500 font-black uppercase tracking-[0.2em] text-amber-500">Tasa de Desviación</p>
+                      <h4 className="text-3xl font-mono font-black text-amber-500 mt-2">
+                        {formatNumber(globalAuditDifferencesData.stats.errorPercentage)}%
+                      </h4>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mt-2 font-medium">
+                      {globalAuditDifferencesData.stats.errorCount} de {globalAuditDifferencesData.stats.totalClosuresCount} cierres con diferencias
+                    </p>
+                  </div>
+
+                  <div className="bg-zinc-90 w-full p-6 rounded-[28px] border border-white/5 bg-zinc-900/40 relative overflow-hidden flex flex-col justify-between h-[130px]">
+                    <div>
+                      <p className="text-[10px] text-zinc-400 font-black uppercase tracking-[0.2em] text-purple-400">Desfase Acumulado Absoluto</p>
+                      <h4 className="text-3xl font-mono font-black text-purple-400 mt-2">
+                        {formatNumber(globalAuditDifferencesData.stats.totalAbsoluteError)} BS
+                      </h4>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mt-3 font-medium">Dinero total fuera del saldo esperado</p>
+                  </div>
+
+                  <div className="bg-zinc-90 w-full p-6 rounded-[28px] border border-white/5 bg-zinc-900/40 relative overflow-hidden flex flex-col justify-between h-[130px]">
+                    <div>
+                      <p className="text-[10px] text-zinc-500 font-black uppercase tracking-[0.2em]">Desvíos Extremos</p>
+                      <div className="flex flex-col text-xs font-mono mt-1 space-y-1">
+                        <span className="text-emerald-400 flex justify-between">
+                          Sobrante: <span className="font-extrabold">+{formatNumber(globalAuditDifferencesData.stats.bestSobrante)} BS</span>
+                        </span>
+                        <span className="text-rose-400 flex justify-between">
+                          Faltante: <span className="font-extrabold">{formatNumber(globalAuditDifferencesData.stats.worstFaltante)} BS</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Line Chart Card */}
+                <div className="bg-zinc-900/40 p-6 md:p-8 rounded-[32px] border border-white/5 relative overflow-hidden">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+                    <div>
+                      <h3 className="text-md font-extrabold text-white flex items-center gap-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse" />
+                        Evolución de Diferencias de Caja
+                      </h3>
+                      <p className="text-zinc-500 text-xs mt-0.5">
+                        Línea temporal mostrando la tendencia de faltantes (valores negativos) y sobrantes (valores positivos).
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-4 text-[10px] font-bold uppercase tracking-wider">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                        <span className="text-zinc-400">Sobrante</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-rose-500" />
+                        <span className="text-zinc-400">Faltante</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-zinc-500" />
+                        <span className="text-zinc-500">Sin Diferencia</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="h-[320px] w-full bg-zinc-950/30 p-4 rounded-2xl border border-white/[0.02]">
+                    {globalAuditDifferencesData.trend.length > 1 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart
+                          data={globalAuditDifferencesData.trend}
+                          margin={{ top: 15, right: 15, left: -10, bottom: 5 }}
+                        >
+                          <CartesianGrid strokeDasharray="4 4" stroke="#1f1f2e" vertical={false} />
+                          <XAxis
+                            dataKey="labelStr"
+                            stroke="#52525b"
+                            fontSize={9}
+                            tickLine={false}
+                            axisLine={false}
+                            dy={8}
+                          />
+                          <YAxis
+                            stroke="#52525b"
+                            fontSize={10}
+                            tickLine={false}
+                            axisLine={false}
+                            unit=" BS"
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: "#09090b",
+                              borderColor: "#27272a",
+                              borderRadius: "16px",
+                              padding: "12px",
+                            }}
+                            labelStyle={{
+                              color: "#f4f4f5",
+                              fontWeight: "bold",
+                              fontSize: "11px",
+                              marginBottom: "4px",
+                            }}
+                            itemStyle={{ fontSize: "11px" }}
+                            formatter={(value: any) => [
+                              <span className={`font-mono font-bold ${Number(value) < 0 ? "text-rose-450" : Number(value) > 0 ? "text-emerald-400" : "text-zinc-400"}`}>
+                                {Number(value) > 0 ? "+" : ""}{formatNumber(Number(value))} BS
+                              </span>,
+                              "Monto Diferencia"
+                            ]}
+                            labelFormatter={(labelValue: any, items: any[]) => {
+                              const item = items[0]?.payload;
+                              if (!item) return labelValue;
+                              return (
+                                <div className="space-y-1">
+                                  <p className="text-zinc-100 font-extrabold text-xs">Arqueo {item.labelStr}</p>
+                                  <p className="text-[10px] text-zinc-450 font-bold">Sucursal: {item.branchName}</p>
+                                  <p className="text-[10px] text-zinc-500">Fecha: {item.dateStr} {item.timeStr}</p>
+                                  <div className="border-t border-white/5 pt-1.5 mt-1.5 font-mono text-[10px] text-zinc-450 space-y-1">
+                                    <div className="flex justify-between gap-4">
+                                      <span>Saldo Esperado:</span>
+                                      <span className="text-zinc-400 font-bold">{formatNumber(item.calculated)} BS</span>
+                                    </div>
+                                    <div className="flex justify-between gap-4">
+                                      <span>Saldo Físico:</span>
+                                      <span className="text-amber-500 font-bold">{formatNumber(item.physical)} BS</span>
+                                    </div>
+                                    <div className="flex justify-between gap-4 border-t border-white/5 pt-1">
+                                      <span>Cajero:</span>
+                                      <span className="text-zinc-300 font-bold">{item.createdBy}</span>
+                                    </div>
+                                    {item.justification && (
+                                      <div className="mt-1 p-1.5 bg-zinc-900 rounded border border-white/5 text-[9px] italic text-zinc-400 break-words max-w-[200px]">
+                                        "{item.justification}"
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            }}
+                          />
+                          <ReferenceLine y={0} stroke="#3f3f46" strokeWidth={1} strokeDasharray="3 3" />
+                          <Line
+                            type="monotone"
+                            dataKey="difference"
+                            stroke="#a855f7"
+                            strokeWidth={2.5}
+                            dot={(dotProps: any) => {
+                              const { cx, cy, payload } = dotProps;
+                              const diff = payload.difference;
+                              const fill = diff > 0 ? "#10b981" : diff < 0 ? "#f43f5e" : "#52525b";
+                              return (
+                                <circle
+                                  key={payload.id}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={5}
+                                  fill={fill}
+                                  stroke="#09090b"
+                                  strokeWidth={1.5}
+                                />
+                              );
+                            }}
+                            activeDot={{ r: 7, strokeWidth: 1.5, stroke: "#ffffff" }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex flex-col items-center justify-center h-full text-zinc-500 border border-dashed border-white/5 rounded-xl bg-zinc-950/10">
+                        <TrendingUp className="w-8 h-8 opacity-25 mb-1.5 text-zinc-400" />
+                        <p className="text-xs font-bold text-zinc-400">Se requieren 2 o más arqueos registrados.</p>
+                        <p className="text-[10px] text-zinc-500 mt-1">Siga completando cierres para poder trazar el gráfico de tendencias.</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Audit Table Logs */}
+                <div className="bg-zinc-900 rounded-[32px] border border-white/5 overflow-hidden flex flex-col">
+                  <div className="p-6 border-b border-white/5 bg-zinc-900/50 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                    <div>
+                      <h3 className="font-extrabold text-zinc-100 flex items-center gap-2">
+                        <FileText className="w-4 h-4 text-rose-500" /> Registro Detallado de Arqueos y Desfases
+                      </h3>
+                      <p className="text-[10px] text-zinc-500 font-bold mt-0.5">
+                        Listado íntegro de cierres ordenados cronológicamente
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="text-[10px] text-zinc-500 uppercase font-black tracking-widest border-b border-white/5 bg-zinc-950">
+                          <th className="px-6 py-4">Sucursal / Código</th>
+                          <th className="px-6 py-4">Fecha & Cajero</th>
+                          <th className="px-6 py-4">Sueldos (Esperado vs Físico)</th>
+                          <th className="px-6 py-4">Desviación / Diferencia</th>
+                          <th className="px-6 py-4">Justificación de la Discrepancia</th>
+                          <th className="px-6 py-4 text-center">Acciones</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/5">
+                        {paginatedAuditClosures.map((c) => {
+                          const dateObj = new Date(c.closedAt || c.date);
+                          const bObj = branches.find((b) => b.id === c.branchId);
+                          const bName = bObj ? bObj.name : "Casa de Cambio";
+                          const diff = c.differenceAmount !== undefined && c.differenceAmount !== null ? Number(c.differenceAmount) : 0;
+                          
+                          return (
+                            <tr key={c.id} className="hover:bg-white/[0.01] transition-colors group">
+                              <td className="px-6 py-4">
+                                <p className="text-xs font-bold text-zinc-200">{bName}</p>
+                                <p className="text-[9px] font-mono font-black text-rose-500 mt-0.5 uppercase tracking-wider">
+                                  #{c.id.slice(0, 8).toUpperCase()}
+                                </p>
+                              </td>
+                              <td className="px-6 py-4">
+                                <div className="text-xs text-zinc-300">
+                                  {dateObj.toLocaleDateString()} <span className="text-[10px] text-zinc-500 ml-1">({dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})</span>
+                                </div>
+                                <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-tighter mt-1">Cajero: {c.createdBy}</p>
+                              </td>
+                              <td className="px-6 py-4 space-y-0.5">
+                                <div className="text-[10px] text-zinc-450 flex justify-between w-44">
+                                  <span>Esperado:</span>
+                                  <span className="font-mono text-zinc-300 font-bold">{formatNumber(c.finalBalance)} BS</span>
+                                </div>
+                                <div className="text-[10px] text-zinc-450 flex justify-between w-44">
+                                  <span>Físico:</span>
+                                  <span className="font-mono text-amber-500 font-bold">{formatNumber(c.physicalBalance || 0)} BS</span>
+                                </div>
+                              </td>
+                              <td className="px-6 py-4">
+                                {diff === 0 ? (
+                                  <span className="px-2 py-0.5 bg-zinc-800 text-zinc-500 rounded-md text-[9px] font-bold border border-white/5 uppercase">
+                                    Sin diferencia
+                                  </span>
+                                ) : (
+                                  <span className={`px-2.5 py-1 rounded-lg text-[10px] font-mono font-extrabold border ${diff < 0 ? "bg-rose-500/10 text-rose-400 border-rose-500/20" : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"}`}>
+                                    {diff > 0 ? "+" : ""}{formatNumber(diff)} BS
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-6 py-4 max-w-xs">
+                                <p className="text-xs text-zinc-400 font-medium italic break-words">
+                                  {c.differenceJustification ? `"${c.differenceJustification}"` : <span className="text-zinc-650 not-italic">No se ingresó justificación</span>}
+                                </p>
+                              </td>
+                              <td className="px-6 py-4 text-center whitespace-nowrap">
+                                <div className="flex gap-2 justify-center">
+                                  <button
+                                    onClick={() => handleViewClosure(c)}
+                                    className="p-1.5 bg-zinc-800/80 hover:bg-zinc-700 hover:text-white rounded-lg text-zinc-300 transition-colors"
+                                    title="Ver Detalle"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => handlePrintClosureReceipt(c)}
+                                    className="p-1.5 bg-zinc-800/80 hover:bg-zinc-700 hover:text-white rounded-lg text-zinc-300 transition-colors"
+                                    title="Imprimir Auditoría"
+                                  >
+                                    <FileText className="w-3.5 h-3.5 text-amber-500" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {globalAuditDifferencesData.sortedNewestFirst.length === 0 && (
+                          <tr>
+                            <td colSpan={6} className="px-6 py-16 text-center text-zinc-500 italic text-xs">
+                              No hay arqueos registrados coincidentes con el filtro.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="p-4 border-t border-white/5 bg-zinc-950/20">
+                    <Pagination
+                      totalItems={globalAuditDifferencesData.sortedNewestFirst.length}
+                      currentPage={auditClosuresPage}
+                      onPageChange={setAuditClosuresPage}
+                      itemsPerPage={ITEMS_PER_PAGE}
+                    />
+                  </div>
+                </div>
               </motion.div>
             )}
 
@@ -16596,6 +17383,185 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Distribución de Material y Top Clientes - Fila de Dashboards adicionales */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {/* Material TYPE DISTRIBUTION: Barra vs Pieza */}
+                  <div className="bg-zinc-900 p-6 md:p-8 rounded-[32px] border border-white/5 flex flex-col justify-between relative overflow-hidden">
+                    <div>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="p-1.5 bg-amber-500/10 rounded-xl border border-amber-500/20">
+                          <Scale className="w-4 h-4 text-amber-500" />
+                        </span>
+                        <span className="text-[10px] text-zinc-500 uppercase font-black tracking-[0.2em]">
+                          Distribución de Material
+                        </span>
+                      </div>
+                      <h3 className="text-base font-bold text-zinc-100 italic">
+                        Barras vs Piezas
+                      </h3>
+                      <p className="text-zinc-500 text-xs mt-0.5">
+                        Proporción total en gramos comprados en esta sucursal
+                      </p>
+                    </div>
+
+                    <div className="h-56 w-full mt-4 flex items-center justify-center relative">
+                      {branchMaterialDistribution.length > 0 ? (
+                        <>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <PieChart>
+                              <Pie
+                                data={branchMaterialDistribution}
+                                cx="50%"
+                                cy="50%"
+                                innerRadius={55}
+                                outerRadius={75}
+                                paddingAngle={5}
+                                dataKey="value"
+                              >
+                                {branchMaterialDistribution.map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={entry.color} />
+                                ))}
+                              </Pie>
+                              <Tooltip
+                                formatter={(value: any, name: any, props: any) => [
+                                  `${formatNumber(Number(value))} g (${props.payload.count} trans.)`,
+                                  name,
+                                ]}
+                                contentStyle={{
+                                  backgroundColor: "#18181b",
+                                  borderColor: "#27272a",
+                                  borderRadius: "12px",
+                                }}
+                              />
+                            </PieChart>
+                          </ResponsiveContainer>
+                          {/* Inner total weight overlay */}
+                          <div className="absolute flex flex-col items-center justify-center pointer-events-none">
+                            <span className="text-[8px] text-zinc-500 uppercase tracking-widest font-black">
+                              Total Peso
+                            </span>
+                            <span className="text-sm font-mono font-black text-zinc-100">
+                              {formatNumber(
+                                branchMaterialDistribution.reduce((acc, entry) => acc + entry.value, 0)
+                              )}g
+                            </span>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-zinc-650 gap-2">
+                          <Scale className="w-8 h-8 opacity-20" />
+                          <p className="text-xs text-zinc-500 font-medium text-center">
+                            Aún no se registran transacciones para clasificar material.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Proportional breakdown list */}
+                    {branchMaterialDistribution.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-white/5 grid grid-cols-2 gap-4 text-xs">
+                        {branchMaterialDistribution.map((entry) => (
+                          <div key={entry.name} className="space-y-1">
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className="w-2.5 h-2.5 rounded-full shrink-0"
+                                style={{ backgroundColor: entry.color }}
+                              />
+                              <span className="font-bold text-zinc-300">{entry.name}</span>
+                            </div>
+                            <p className="font-mono font-bold text-zinc-100 text-sm">
+                              {formatNumber(entry.value)} g
+                            </p>
+                            <p className="text-[10px] text-zinc-500 font-medium">
+                              {entry.count} transacciones
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* TOP 5 CLIENTS: Principales Clientes de la Sucursal */}
+                  <div className="lg:col-span-2 bg-zinc-900 p-6 md:p-8 rounded-[32px] border border-white/5 flex flex-col justify-between overflow-hidden">
+                    <div>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="p-1.5 bg-amber-500/10 rounded-xl border border-amber-500/20">
+                          <Users className="w-4 h-4 text-amber-500" />
+                        </span>
+                        <span className="text-[10px] text-zinc-500 uppercase font-black tracking-[0.2em]">
+                          Clasificación de Clientes
+                        </span>
+                      </div>
+                      <h3 className="text-base font-bold text-zinc-100 italic">
+                        Top 5 Principales Clientes
+                      </h3>
+                      <p className="text-zinc-500 text-xs mt-0.5">
+                        Clientes más productivos medidos por volumen monetario total transaccionado en esta sucursal
+                      </p>
+                    </div>
+
+                    <div className="overflow-x-auto mt-4 rounded-2xl border border-white/5 bg-zinc-950/40">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="bg-zinc-950/85 border-b border-white/5 text-[10px] uppercase font-bold text-zinc-400 tracking-wider">
+                            <th className="px-5 py-3">Cliente</th>
+                            <th className="px-5 py-3 font-mono">CI / Identidad</th>
+                            <th className="px-5 py-3 text-right">Transacciones</th>
+                            <th className="px-5 py-3 text-right">Oro Vendido (g)</th>
+                            <th className="px-4 py-3 text-right">Total Transaccionado</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5 text-xs text-zinc-300">
+                          {topBranchClients.length > 0 ? (
+                            topBranchClients.map((c, index) => (
+                              <tr key={c.id} className="hover:bg-white/[0.01] transition-colors">
+                                <td className="px-5 py-3">
+                                  <div className="flex items-center gap-2.5">
+                                    <span className="w-5 h-5 rounded-full bg-zinc-800 text-zinc-400 text-[10px] font-black flex items-center justify-center border border-white/5">
+                                      #{index + 1}
+                                    </span>
+                                    <div>
+                                      <p className="font-extrabold text-zinc-100">{c.name}</p>
+                                      <p className="text-[10px] text-zinc-500 font-medium">{c.phone || "Sin Teléfono"}</p>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="px-5 py-3 font-mono text-zinc-400">
+                                  {c.ci || "S/D"}
+                                </td>
+                                <td className="px-5 py-3 text-right font-mono font-bold">
+                                  {c.purchaseCount}
+                                </td>
+                                <td className="px-5 py-3 text-right font-mono font-extrabold text-amber-500">
+                                  {formatNumber(c.purchasedWeight)}g
+                                </td>
+                                <td className="px-4 py-3 text-right font-mono font-black text-emerald-400">
+                                  {formatNumber(c.purchasedTotal)} BS
+                                </td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={5} className="px-6 py-8 text-center text-zinc-500 font-bold">
+                                No se registran movimientos de clientes en esta sucursal.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                    
+                    <div className="mt-4 pt-4 border-t border-white/5 text-right">
+                      <button
+                        onClick={() => setView("branch_clients")}
+                        className="text-xs text-amber-500 font-bold hover:underline"
+                      >
+                        Ver todos los clientes de la sucursal &rarr;
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Deuda Acumulada por Sucursal (Only for Admins/Superadmins) */}
                 {(user.role === "admin" || user.role === "superadmin") && (
                   <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 shadow-sm space-y-6 mt-6">
@@ -17354,9 +18320,9 @@ export default function App() {
                       <input
                         type="text"
                         placeholder="Buscar por nombre, CI o teléfono..."
-                        value={referrerSearch}
+                        value={branchReferrerSearch}
                         onChange={(e) => {
-                          setReferrerSearch(e.target.value);
+                          setBranchReferrerSearch(e.target.value);
                           setBranchReferrersPage(1);
                         }}
                         className="bg-zinc-950 text-white pl-11 pr-6 py-3 rounded-2xl border border-white/5 focus:border-amber-500/50 focus:outline-none w-[350px] text-sm transition-all shadow-inner"
@@ -18042,6 +19008,325 @@ export default function App() {
                       </>
                     );
                   })()}
+                </div>
+
+                {/* Cash Flow Weekly Dashboard Summary */}
+                <div className="bg-zinc-900/50 p-6 md:p-8 rounded-[32px] border border-white/5 relative overflow-hidden">
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mb-8">
+                    <div>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="p-1.5 bg-amber-500/10 rounded-xl border border-amber-500/20">
+                          <TrendingUp className="w-4 h-4 text-amber-500" />
+                        </span>
+                        <span className="text-[10px] text-zinc-500 uppercase font-black tracking-[0.2em]">
+                          Resumen Fluctuación
+                        </span>
+                      </div>
+                      <h3 className="text-xl font-black text-white italic tracking-tight">
+                        Flujo de Efectivo {cashDashboardMode === "weekly_days" ? "Diario (Últimos 7 Días)" : "Semanal (Últimas 5 Semanas)"}
+                      </h3>
+                      <p className="text-zinc-500 text-xs mt-0.5">
+                        Monitoreo de entradas (ingresos) y salidas (egresos) de la caja general de la sucursal
+                      </p>
+                    </div>
+
+                    {/* Mode Toggle Controls */}
+                    <div className="flex items-center gap-2 self-start lg:self-center bg-zinc-950 p-1.5 rounded-2xl border border-white/5">
+                      <button
+                        onClick={() => setCashDashboardMode("weekly_days")}
+                        className={`px-4 py-2 text-xs font-bold rounded-xl transition-all ${
+                          cashDashboardMode === "weekly_days"
+                            ? "bg-amber-500 text-zinc-950 shadow-md"
+                            : "text-zinc-400 hover:text-white"
+                        }`}
+                      >
+                        Últimos 7 Días
+                      </button>
+                      <button
+                        onClick={() => setCashDashboardMode("monthly_weeks")}
+                        className={`px-4 py-2 text-xs font-bold rounded-xl transition-all ${
+                          cashDashboardMode === "monthly_weeks"
+                            ? "bg-amber-500 text-zinc-950 shadow-md"
+                            : "text-zinc-400 hover:text-white"
+                        }`}
+                      >
+                        Últimas 5 Semanas
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Summary Metric Counters */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Total Ingresos</p>
+                      <p className="text-xl font-mono font-black text-emerald-400">+{formatNumber(chartTotals.totalIn)} BS</p>
+                    </div>
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Total Egresos</p>
+                      <p className="text-xl font-mono font-black text-red-400">-{formatNumber(chartTotals.totalOut)} BS</p>
+                    </div>
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Flujo Neto</p>
+                      <p className={`text-xl font-mono font-black ${chartTotals.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {chartTotals.net >= 0 ? "+" : ""}{formatNumber(chartTotals.net)} BS
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Chart Visualizer */}
+                  <div className="h-[300px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart
+                        data={cashDashboardMode === "weekly_days" ? last7DaysData : last5WeeksData}
+                        margin={{ top: 10, right: 10, left: -10, bottom: 5 }}
+                      >
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          stroke="#27272a"
+                          vertical={false}
+                        />
+                        <XAxis
+                          dataKey="label"
+                          stroke="#71717a"
+                          fontSize={10}
+                          tickLine={false}
+                          axisLine={false}
+                          dy={8}
+                        />
+                        <YAxis
+                          stroke="#71717a"
+                          fontSize={10}
+                          tickLine={false}
+                          axisLine={false}
+                          unit=" BS"
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: "#18181b",
+                            borderColor: "#27272a",
+                            borderRadius: "16px",
+                            padding: "12px",
+                          }}
+                          labelStyle={{
+                            color: "#f4f4f5",
+                            fontWeight: "bold",
+                            fontSize: "11px",
+                            marginBottom: "4px",
+                          }}
+                          itemStyle={{ fontSize: "11px", padding: "2px 0" }}
+                          formatter={(value: any, name: any) => [
+                            `${formatNumber(Number(value))} BS`,
+                            name,
+                          ]}
+                        />
+                        <Legend
+                          iconType="circle"
+                          iconSize={8}
+                          wrapperStyle={{
+                            fontSize: "11px",
+                            paddingTop: "15px",
+                          }}
+                        />
+                        <Bar
+                          dataKey="Ingresos"
+                          fill="#10b981"
+                          name="Entradas (Ingresos)"
+                          radius={[4, 4, 0, 0]}
+                        />
+                        <Bar
+                          dataKey="Egresos"
+                          fill="#ef4444"
+                          name="Salidas (Egresos)"
+                          radius={[4, 4, 0, 0]}
+                        />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Trend Analysis of Cash Closure Differences */}
+                <div className="bg-zinc-900/40 p-6 md:p-8 rounded-[32px] border border-white/5 relative overflow-hidden">
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mb-6">
+                    <div>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="p-1.5 bg-rose-500/10 rounded-xl border border-rose-500/20">
+                          <TrendingUp className="w-4 h-4 text-rose-400" />
+                        </span>
+                        <span className="text-[10px] text-zinc-500 uppercase font-black tracking-[0.2em]">
+                          Análisis de Auditoría de Sucursal
+                        </span>
+                      </div>
+                      <h3 className="text-xl font-black text-white italic tracking-tight">
+                        Tendencia de Diferencias de Caja en Arqueos
+                      </h3>
+                      <p className="text-zinc-500 text-xs mt-0.5">
+                        Tendencia cronológica de faltantes (-) y sobrantes (+) en los cierres de caja registrados (Últimos 15 cierres)
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-4 text-[10px] font-bold uppercase tracking-wider">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 border border-zinc-950" />
+                        <span className="text-zinc-400">Sobrante (+)</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-rose-500 border border-zinc-950" />
+                        <span className="text-zinc-400">Faltante (-)</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-zinc-500 border border-zinc-950" />
+                        <span className="text-zinc-400 font-medium">Sin Diferencia (0)</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Micro stats boxes */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Cierres Analizados</p>
+                      <p className="text-xl font-mono font-black text-zinc-350">
+                        {closureDifferencesTrendData.stats.totalClosuresCount}
+                      </p>
+                    </div>
+                    
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Tasa de Desviación</p>
+                      <p className="text-xl font-mono font-black text-amber-500">
+                        {formatNumber(closureDifferencesTrendData.stats.errorPercentage)}% 
+                        <span className="text-[9px] text-zinc-500 font-sans font-normal ml-1">
+                          ({closureDifferencesTrendData.stats.errorCount} cierres)
+                        </span>
+                      </p>
+                    </div>
+
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Diferencia Promedio</p>
+                      <p className={`text-xl font-mono font-black ${closureDifferencesTrendData.stats.average < 0 ? "text-rose-400" : closureDifferencesTrendData.stats.average > 0 ? "text-emerald-400" : "text-zinc-400"}`}>
+                        {closureDifferencesTrendData.stats.average > 0 ? "+" : ""}
+                        {formatNumber(closureDifferencesTrendData.stats.average)} BS
+                      </p>
+                    </div>
+
+                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
+                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Máximos Registrados</p>
+                      <div className="flex flex-col text-[10px] font-mono mt-0.5">
+                        <span className="text-emerald-400 flex justify-between">
+                          Sobrante: <span className="font-extrabold">+{formatNumber(closureDifferencesTrendData.stats.bestSobrante)} BS</span>
+                        </span>
+                        <span className="text-rose-450 flex justify-between mt-0.5">
+                          Faltante: <span className="font-extrabold">{formatNumber(closureDifferencesTrendData.stats.worstFaltante)} BS</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Real Line Chart */}
+                  <div className="h-[280px] w-full bg-zinc-950/25 p-4 rounded-2xl border border-white/[0.02]">
+                    {closureDifferencesTrendData.trend.length > 1 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart
+                          data={closureDifferencesTrendData.trend}
+                          margin={{ top: 15, right: 15, left: -10, bottom: 5 }}
+                        >
+                          <CartesianGrid
+                            strokeDasharray="4 4"
+                            stroke="#222224"
+                            vertical={false}
+                          />
+                          <XAxis
+                            dataKey="labelStr"
+                            stroke="#52525b"
+                            fontSize={9}
+                            tickLine={false}
+                            axisLine={false}
+                            dy={8}
+                          />
+                          <YAxis
+                            stroke="#52525b"
+                            fontSize={10}
+                            tickLine={false}
+                            axisLine={false}
+                            unit=" BS"
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: "#09090b",
+                              borderColor: "#27272a",
+                              borderRadius: "16px",
+                              padding: "12px",
+                            }}
+                            labelStyle={{
+                              color: "#f4f4f5",
+                              fontWeight: "bold",
+                              fontSize: "11px",
+                              marginBottom: "4px",
+                            }}
+                            itemStyle={{ fontSize: "11px", padding: "2px 0" }}
+                            formatter={(value: any, name: any, props: any) => [
+                              <span className={`font-mono font-bold ${Number(value) < 0 ? "text-rose-400" : Number(value) > 0 ? "text-emerald-400" : "text-zinc-400"}`}>
+                                {Number(value) > 0 ? "+" : ""}{formatNumber(Number(value))} BS
+                              </span>,
+                              "Diferencia Real"
+                            ]}
+                            labelFormatter={(labelValue: any, items: any[]) => {
+                              const item = items[0]?.payload;
+                              if (!item) return labelValue;
+                              return (
+                                <div className="space-y-1">
+                                  <p className="text-zinc-100 font-extrabold text-xs">Arqueo {item.labelStr}</p>
+                                  <p className="text-[10px] text-zinc-500">{item.dateStr}</p>
+                                  <div className="border-t border-white/5 pt-1 mt-1 font-mono text-[10px] text-zinc-450 space-y-0.5">
+                                    <div className="flex justify-between gap-4">
+                                      <span>Saldo Esperado:</span>
+                                      <span className="text-zinc-400 font-bold">{formatNumber(item.calculated)} BS</span>
+                                    </div>
+                                    <div className="flex justify-between gap-4">
+                                      <span>Saldo Físico:</span>
+                                      <span className="text-amber-500 font-bold">{formatNumber(item.physical)} BS</span>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            }}
+                          />
+                          
+                          {/* Ideal reference line of Y = 0 */}
+                          <ReferenceLine y={0} stroke="#3f3f46" strokeWidth={1.5} strokeDasharray="3 3" />
+                          
+                          <Line
+                            type="monotone"
+                            dataKey="difference"
+                            name="Diferencia"
+                            stroke="#52525b"
+                            strokeWidth={2}
+                            dot={(dotProps: any) => {
+                              const { cx, cy, payload } = dotProps;
+                              const diff = payload.difference;
+                              const fill = diff > 0 ? "#10b981" : diff < 0 ? "#f43f5e" : "#71717a";
+                              return (
+                                <circle
+                                  key={payload.id}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={ payload.difference === 0 ? 4 : 5 }
+                                  fill={fill}
+                                  stroke="#1f1f2e"
+                                  strokeWidth={1.5}
+                                />
+                              );
+                            }}
+                            activeDot={{ r: 7, strokeWidth: 2, stroke: "#09090b" }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex flex-col items-center justify-center h-full text-zinc-500 border border-dashed border-white/5 rounded-xl bg-zinc-950/10 py-10">
+                        <TrendingUp className="w-8 h-8 opacity-25 mb-2 text-zinc-400" />
+                        <p className="text-xs font-bold text-zinc-400">Se requieren al menos 2 cierres de caja en esta sucursal.</p>
+                        <p className="text-[10px] text-zinc-500 mt-1">Siga registrando arqueos con diferencias o sin desviaciones para graficar su comportamiento.</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -19106,53 +20391,55 @@ export default function App() {
                       <FileText className="w-4 h-4 text-emerald-400" /> Generar
                       Reporte
                     </button>
-                    <button
-                      onClick={() => {
-                        setEditingPurchase(null);
-                        setPurchaseCart([]);
-                        setPurchaseHeader({
-                          clientId: "",
-                          type: "abierto",
-                          openEstimateFactor: 90,
-                          expirationDays: 15,
-                          date: getLocalCurrentDateTimeString(
-                            companySettings?.timezone,
-                          ),
-                          referrerName: "",
-                          commission: 0,
-                          advancePayment: 0,
-                          advancePaymentType: "efectivo",
-                          advanceCashAmount: 0,
-                          advanceBankAmount: 0,
-                          advanceSourceBankAccountId: "",
-                          advanceClientBank: "",
-                          advanceClientAccountNumber: "",
-                          isFullPayment: false,
-                          photo: "",
-                          isHistoric: false,
-                        });
-                        setPurchaseItem({
-                          type: "pieza" as MaterialType,
-                          initialWeight: 0,
-                          finalWeight: 0,
-                          marketPrice: 0,
-                          purity: 100,
-                          pricePerGram: 0,
-                          pricePerGram100: 0,
-                          total: 0,
-                          usdToBs: 6.96,
-                          loss: 0,
-                          lossPercentage: 0,
-                          material100: 0,
-                          photo: "",
-                        });
-                        setClientSearch("");
-                        setShowAddPurchaseModal(true);
-                      }}
-                      className="bg-amber-500 text-zinc-950 px-4 py-2 rounded-xl text-sm font-bold shadow-lg hover:bg-amber-400 transition-all flex items-center gap-2"
-                    >
-                      <Plus className="w-4 h-4" /> Nueva Compra
-                    </button>
+                    {branchMode && (
+                      <button
+                        onClick={() => {
+                          setEditingPurchase(null);
+                          setPurchaseCart([]);
+                          setPurchaseHeader({
+                            clientId: "",
+                            type: "abierto",
+                            openEstimateFactor: 90,
+                            expirationDays: 15,
+                            date: getLocalCurrentDateTimeString(
+                              companySettings?.timezone,
+                            ),
+                            referrerName: "",
+                            commission: 0,
+                            advancePayment: 0,
+                            advancePaymentType: "efectivo",
+                            advanceCashAmount: 0,
+                            advanceBankAmount: 0,
+                            advanceSourceBankAccountId: "",
+                            advanceClientBank: "",
+                            advanceClientAccountNumber: "",
+                            isFullPayment: false,
+                            photo: "",
+                            isHistoric: false,
+                          });
+                          setPurchaseItem({
+                            type: "pieza" as MaterialType,
+                            initialWeight: 0,
+                            finalWeight: 0,
+                            marketPrice: 0,
+                            purity: 100,
+                            pricePerGram: 0,
+                            pricePerGram100: 0,
+                            total: 0,
+                            usdToBs: 6.96,
+                            loss: 0,
+                            lossPercentage: 0,
+                            material100: 0,
+                            photo: "",
+                          });
+                          setClientSearch("");
+                          setShowAddPurchaseModal(true);
+                        }}
+                        className="bg-amber-500 text-zinc-950 px-4 py-2 rounded-xl text-sm font-bold shadow-lg hover:bg-amber-400 transition-all flex items-center gap-2"
+                      >
+                        <Plus className="w-4 h-4" /> Nueva Compra
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -19162,6 +20449,9 @@ export default function App() {
                       <thead>
                         <tr className="text-[10px] text-zinc-500 uppercase font-bold border-b border-white/5">
                           <th className="px-6 py-4 text-left">Recibo</th>
+                          {!branchMode && (
+                            <th className="px-6 py-4 text-left">Sucursal</th>
+                          )}
                           <th className="px-6 py-4 text-left">Cliente</th>
                           <th className="px-6 py-4 text-left">Items</th>
                           <th className="px-6 py-4 text-left">Tipo</th>
@@ -19294,6 +20584,13 @@ export default function App() {
                                     </div>
                                   </div>
                                 </td>
+                                {!branchMode && (
+                                  <td className="px-6 py-4">
+                                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-purple-500/10 text-purple-400 border border-purple-500/20 rounded-md text-[10px] font-black uppercase tracking-wider">
+                                      {branches.find((br) => br.id === p.branchId)?.name || "Almacén/Matriz"}
+                                    </span>
+                                  </td>
+                                )}
                                 <td className="px-6 py-4">
                                   <div>
                                     <p className="text-sm font-bold text-zinc-100">
@@ -19640,7 +20937,7 @@ export default function App() {
                                       </button>
                                     )}
 
-                                    {p.type !== "anulado" && (
+                                    {p.type !== "anulado" && !(p.isHistoric === 1 || p.isHistoric === true) && (
                                       <button
                                         onClick={() => {
                                           setHistoricTargetPurchase(p);
@@ -19652,7 +20949,7 @@ export default function App() {
                                           setShowToggleHistoricModal(true);
                                         }}
                                         className="p-2 bg-indigo-500/10 text-indigo-400 rounded-xl hover:bg-indigo-500 hover:text-white transition-all border border-indigo-500/20"
-                                        title="Cambiar Tipo de Registro (Histórico <=> Normal)"
+                                        title="Cambiar Tipo de Registro"
                                       >
                                         <Database className="w-4 h-4" />
                                       </button>
@@ -19669,7 +20966,7 @@ export default function App() {
                                     exit={{ opacity: 0, height: 0 }}
                                     className="bg-zinc-950/50"
                                   >
-                                    <td colSpan={10} className="px-6 py-4">
+                                    <td colSpan={!branchMode ? 11 : 10} className="px-6 py-4">
                                       <div className="pl-10 border-l-2 border-amber-500/30 py-4 space-y-6">
                                         {(hasOpeningDetails ||
                                           p.type === "abierto" ||
@@ -21127,6 +22424,54 @@ export default function App() {
                               </div>
                             </div>
                           </div>
+
+                          {/* NOTIFICACIONES DE SECTOR CIERRES */}
+                          <div className="col-span-full bg-zinc-950/40 border border-white/5 p-5 rounded-2xl space-y-4">
+                            <div>
+                              <h4 className="text-xs font-black uppercase tracking-widest text-zinc-200 flex items-center gap-2">
+                                <span className="p-1 rounded bg-indigo-500/10 text-indigo-500">
+                                  📧
+                                </span>
+                                Notificaciones de Cierres de Caja
+                              </h4>
+                              <p className="text-[10px] text-zinc-500 font-medium mt-0.5">
+                                Configure las alertas y notificaciones que se enviarán al administrador de forma automática.
+                              </p>
+                            </div>
+
+                            <div className="bg-zinc-900/60 border border-white/[0.03] p-4 rounded-xl space-y-4 shadow-sm">
+                              <label className="flex items-center justify-between cursor-pointer group">
+                                <div className="space-y-0.5 max-w-[80%]">
+                                  <span className="text-xs text-zinc-300 group-hover:text-zinc-100 transition-colors font-bold block">
+                                    Notificaciones de Diferencias en Arqueos
+                                  </span>
+                                  <span className="text-[10px] text-zinc-500 block">
+                                    Enviar un correo electrónico automático a los administradores y superadministradores cuando un cajero envíe un cierre de caja con diferencias (faltantes o sobrantes de caja).
+                                  </span>
+                                </div>
+                                <div className="relative flex items-center shrink-0">
+                                  <input
+                                    type="checkbox"
+                                    checked={
+                                      companyFormData.notifyEmailOnClosureDifference !== undefined
+                                        ? companyFormData.notifyEmailOnClosureDifference === true ||
+                                          Number(companyFormData.notifyEmailOnClosureDifference) !== 0
+                                        : false
+                                    }
+                                    onChange={(e) =>
+                                      setCompanyFormData((prev) => ({
+                                        ...prev,
+                                        notifyEmailOnClosureDifference: e.target.checked,
+                                      }))
+                                    }
+                                    className="sr-only peer"
+                                  />
+                                  <div className="w-9 h-5 bg-zinc-850 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-100 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                                </div>
+                              </label>
+                            </div>
+                          </div>
+
                           <div className="col-span-full space-y-2">
                             <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">
                               Dirección
@@ -21432,10 +22777,11 @@ export default function App() {
 
                                 <button
                                   type="button"
-                                  onClick={() => {
+                                  onClick={async () => {
                                     if (
-                                      confirm(
+                                      await (window as any).customConfirm(
                                         "¿Restablecer las denominaciones de Bolivianos (BS) por defecto?",
+                                        "Restablecer Valores"
                                       )
                                     ) {
                                       setCompanyFormData((prev) => ({
@@ -25847,8 +27193,9 @@ DB_NAME=aurum_gestor
                               type="button"
                               onClick={async () => {
                                 if (
-                                  confirm(
+                                  await (window as any).customConfirm(
                                     "¿Desea eliminar la foto de este lote?",
+                                    "Eliminar Foto de Lote"
                                   )
                                 ) {
                                   try {
@@ -26913,8 +28260,9 @@ DB_NAME=aurum_gestor
                                           type="button"
                                           onClick={async () => {
                                             if (
-                                              confirm(
+                                              await (window as any).customConfirm(
                                                 "¿Desea eliminar la foto de este material?",
+                                                "Eliminar Foto de Material"
                                               )
                                             ) {
                                               try {
@@ -29354,6 +30702,134 @@ DB_NAME=aurum_gestor
                     )}
                     Autorizar y Cambiar Estado
                   </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Custom State-driven Alert Modal */}
+        <AnimatePresence>
+          {modalAlertState && modalAlertState.show && (
+            <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => {
+                  if (modalAlertState.onConfirm) modalAlertState.onConfirm();
+                  setModalAlertState(null);
+                }}
+                className="absolute inset-0 bg-black/85 backdrop-blur-sm"
+              />
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 20 }}
+                className="relative w-full max-w-md bg-zinc-900 border border-white/10 rounded-[28px] shadow-2xl overflow-hidden flex flex-col z-[201]"
+              >
+                <div className="p-8 flex flex-col items-center text-center space-y-5">
+                  {modalAlertState.type === "success" ? (
+                    <div className="w-16 h-16 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                      <CheckCircle2 className="w-9 h-9" />
+                    </div>
+                  ) : modalAlertState.type === "error" ? (
+                    <div className="w-16 h-16 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                      <AlertCircle className="w-9 h-9" />
+                    </div>
+                  ) : modalAlertState.type === "warning" ? (
+                    <div className="w-16 h-16 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+                      <AlertTriangle className="w-9 h-9" />
+                    </div>
+                  ) : (
+                    <div className="w-16 h-16 rounded-full bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
+                      <Info className="w-9 h-9" />
+                    </div>
+                  )}
+
+                  <div className="space-y-2 w-full text-zinc-150 font-sans">
+                    <h3 className="text-lg font-bold text-zinc-100 leading-snug">
+                      {modalAlertState.title}
+                    </h3>
+                    <p className="text-sm text-zinc-400 leading-relaxed max-h-[40vh] overflow-y-auto px-2 select-text">
+                      {modalAlertState.message}
+                    </p>
+                  </div>
+
+                  <div className="pt-2 w-full">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (modalAlertState.onConfirm) modalAlertState.onConfirm();
+                        setModalAlertState(null);
+                      }}
+                      className="w-full py-3.5 bg-zinc-800 hover:bg-zinc-750 active:bg-zinc-850 border border-white/5 text-zinc-100 rounded-2xl text-sm font-bold transition-all shadow-md cursor-pointer"
+                    >
+                      Aceptar
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Custom State-driven Confirm Modal */}
+        <AnimatePresence>
+          {modalConfirmState && modalConfirmState.show && (
+            <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => {
+                  modalConfirmState.resolve(false);
+                  setModalConfirmState(null);
+                }}
+                className="absolute inset-0 bg-black/85 backdrop-blur-sm"
+              />
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 20 }}
+                className="relative w-full max-w-md bg-zinc-900 border border-white/10 rounded-[28px] shadow-2xl overflow-hidden flex flex-col z-[201]"
+              >
+                <div className="p-8 flex flex-col items-center text-center space-y-5">
+                  <div className="w-16 h-16 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-500">
+                    <AlertTriangle className="w-9 h-9" />
+                  </div>
+
+                  <div className="space-y-2 w-full text-zinc-150 font-sans">
+                    <h3 className="text-lg font-bold text-zinc-100 leading-snug">
+                      {modalConfirmState.title}
+                    </h3>
+                    <p className="text-sm text-zinc-400 leading-relaxed max-h-[40vh] overflow-y-auto px-2 select-text">
+                      {modalConfirmState.message}
+                    </p>
+                  </div>
+
+                  <div className="pt-2 flex gap-3 w-full">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        modalConfirmState.resolve(false);
+                        setModalConfirmState(null);
+                      }}
+                      className="flex-1 py-3.5 bg-zinc-800 hover:bg-zinc-750 text-zinc-350 rounded-2xl text-sm font-bold transition-all cursor-pointer"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        modalConfirmState.resolve(true);
+                        setModalConfirmState(null);
+                      }}
+                      className="flex-1 py-3.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-750 text-black rounded-2xl text-sm font-extrabold transition-all shadow-lg shadow-amber-500/10 cursor-pointer"
+                    >
+                      Confirmar
+                    </button>
+                  </div>
                 </div>
               </motion.div>
             </div>

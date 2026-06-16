@@ -130,6 +130,7 @@ export interface CompanySettings {
   cashDenominations?: string;
   lowPurityThreshold_pieza?: number;
   lowPurityThreshold_barra?: number;
+  notifyEmailOnClosureDifference?: boolean | number;
   updatedAt: string;
 }
 

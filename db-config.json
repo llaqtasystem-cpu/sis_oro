@@ -2,23 +2,23 @@
   "type": "sqlite",
   "useSandbox": false,
   "mysql": {
-    "host": "localhost",
-    "user": "root",
-    "password": "",
-    "database": "llaqta_gold",
+    "host": "sql10.freesqldatabase.com",
+    "user": "sql10830595",
+    "password": "hMBmvVqXHi",
+    "database": "sql10830595",
     "port": 3306
   },
   "sqlite": {
-    "path": "database.sqlite"
+    "path": "database"
   },
   "sandbox": {
     "type": "mysql",
     "mysql": {
-      "host": "external-mysql-sandbox.example.com",
-      "user": "sandbox_user",
-      "password": "",
-      "database": "llaqta_gold_sandbox",
-      "port": 3306
+      "host": "8080",
+      "user": "root",
+      "password": "root",
+      "database": "sis_oro",
+      "port": 3080
     },
     "sqlite": {
       "path": "sandbox.sqlite"

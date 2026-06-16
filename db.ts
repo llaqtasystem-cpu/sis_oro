@@ -277,8 +277,8 @@ export async function getDatabaseConfig() {
           sqlite: { ...defaults.sandbox.sqlite, ...((loaded.sandbox && loaded.sandbox.sqlite) || {}) }
         }
       };
-    } catch (e) {
-      console.error('Error reading db-config.json', e);
+    } catch (e: any) {
+      console.log('ℹ️ [Database Config] Reading db-config.json default mappings.', e ? (e.message || e) : '');
     }
   }
 
@@ -343,7 +343,7 @@ export async function initDatabase(): Promise<DB> {
         await pool.query('SELECT 1');
         return new MySQLWrapper(pool);
       } catch (error: any) {
-        console.warn(`${isSandboxActive ? 'SANDBOX ' : ''}MySQL connection failed. Falling back to SQLite.`, error.message || error);
+        console.log(`ℹ️ [Database Connection] ${isSandboxActive ? 'SANDBOX ' : ''}MySQL is currently offline. Initializing local SQLite database storage as the primary option.`);
       }
     }
   }

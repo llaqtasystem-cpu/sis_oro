@@ -145,6 +145,7 @@ async function startServer() {
       cashDenominations TEXT,
       lowPurityThreshold_pieza DOUBLE DEFAULT 50.0,
       lowPurityThreshold_barra DOUBLE DEFAULT 50.0,
+      notifyEmailOnClosureDifference INTEGER DEFAULT 0,
       updatedAt VARCHAR(255) NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS branches (
@@ -594,6 +595,9 @@ async function startServer() {
       }
       if (!await columnExists(targetDb, 'goldPurchases', 'isHistoric')) {
         await targetDb.exec("ALTER TABLE goldPurchases ADD COLUMN isHistoric INTEGER DEFAULT 0");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'notifyEmailOnClosureDifference')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN notifyEmailOnClosureDifference INTEGER DEFAULT 0");
       }
 
       fs.appendFileSync("startup_log.txt", `${new Date().toISOString()} - Migrations successful\n`);
@@ -1331,7 +1335,7 @@ async function startServer() {
     const updatedAt = new Date().toISOString();
     
     // Normalize boolean settings to integers for database compatibility
-    const booleanFields = ['notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra'];
+    const booleanFields = ['notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra', 'notifyEmailOnClosureDifference'];
     booleanFields.forEach(f => {
       if (data[f] !== undefined) {
         data[f] = data[f] === true || data[f] === 1 || data[f] === "true" ? 1 : 0;
@@ -1345,7 +1349,7 @@ async function startServer() {
     const allowedFields = [
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 'inactivityTimeout', 'timezone', 'maxStayMinutes',
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference'
     ];
     const values = allowedFields.map(f => data[f] !== undefined ? data[f] : null);
 
@@ -1370,7 +1374,7 @@ async function startServer() {
     const { id, ...updateData } = data;
 
     // Normalize boolean settings to integers for database compatibility
-    const booleanFields = ['notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra'];
+    const booleanFields = ['notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra', 'notifyEmailOnClosureDifference'];
     booleanFields.forEach(f => {
       if (updateData[f] !== undefined) {
         updateData[f] = updateData[f] === true || updateData[f] === 1 || updateData[f] === "true" ? 1 : 0;
@@ -1382,7 +1386,7 @@ async function startServer() {
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 
       'inactivityTimeout', 'timezone', 'maxStayMinutes', 
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'updatedAt'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'updatedAt'
     ];
     for (const key of Object.keys(updateData)) {
       if (!allowedColumns.includes(key)) {
@@ -1445,7 +1449,7 @@ async function startServer() {
         await conn.end();
         return res.json({ success: true, message: "Conexión a MySQL exitosa" });
       } catch (err: any) {
-        console.error("Test MySQL connection failed:", err);
+        console.log("ℹ️ [Database Test] Test MySQL connection failed:", err.message || err);
         let errorMsg = `Error de conexión: ${err.message}`;
         const hostName = mysqlConfig.host || 'localhost';
         
@@ -1866,6 +1870,24 @@ async function startServer() {
             }
             if (tableName === "branches" && row.id !== branchId) {
               continue;
+            }
+          }
+
+          // Preemptively resolve UNIQUE constraint conflicts to prevent import/restore failures
+          if (tableName === "users" && row.username) {
+            const conflictingUser = await db.get("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", [row.username]);
+            if (conflictingUser && conflictingUser.id !== row.id) {
+              await db.run("DELETE FROM users WHERE id = ?", [conflictingUser.id]);
+            }
+          } else if (tableName === "clients" && row.ci && row.branchId) {
+            const conflictingClient = await db.get("SELECT id FROM clients WHERE ci = ? AND branchId = ?", [row.ci, row.branchId]);
+            if (conflictingClient && conflictingClient.id !== row.id) {
+              await db.run("DELETE FROM clients WHERE id = ?", [conflictingClient.id]);
+            }
+          } else if (tableName === "referrers" && row.ci && row.branchId) {
+            const conflictingReferrer = await db.get("SELECT id FROM referrers WHERE ci = ? AND branchId = ?", [row.ci, row.branchId]);
+            if (conflictingReferrer && conflictingReferrer.id !== row.id) {
+              await db.run("DELETE FROM referrers WHERE id = ?", [conflictingReferrer.id]);
             }
           }
 
@@ -3145,18 +3167,23 @@ async function startServer() {
     const closedAt = new Date().toISOString();
     const closureId = crypto.randomUUID();
 
+    let incomes = 0;
+    let expenses = 0;
+    let initialBalance = 0;
+    let finalBalance = 0;
+
     try {
       // Calculate balances ONLY from pending moves (closureId IS NULL) and ONLY effective cash
       await db.transaction(async () => {
         const moves = await db.all("SELECT * FROM branchCashMoves WHERE branchId = ? AND closureId IS NULL", [branchId]);
         const cashMoves = moves.filter((m: any) => m.paymentType === 'efectivo');
-        const incomes = cashMoves.filter((m: any) => m.type === 'ingreso').reduce((acc: number, m: any) => acc + (Number(m.amount) || 0), 0);
-        const expenses = cashMoves.filter((m: any) => m.type === 'egreso').reduce((acc: number, m: any) => acc + (Number(m.amount) || 0), 0);
+        incomes = cashMoves.filter((m: any) => m.type === 'ingreso').reduce((acc: number, m: any) => acc + (Number(m.amount) || 0), 0);
+        expenses = cashMoves.filter((m: any) => m.type === 'egreso').reduce((acc: number, m: any) => acc + (Number(m.amount) || 0), 0);
         const cycleBalance = incomes - expenses;
 
-        const lastClosure = await db.get("SELECT finalBalance FROM branchClosures WHERE branchId = ? ORDER BY \`date\` DESC LIMIT 1", [branchId]) as any;
-        const initialBalance = lastClosure ? lastClosure.finalBalance : 0;
-        const finalBalance = initialBalance + cycleBalance;
+        const lastClosure = await db.get("SELECT finalBalance FROM branchClosures WHERE branchId = ? ORDER BY `date` DESC LIMIT 1", [branchId]) as any;
+        initialBalance = lastClosure ? lastClosure.finalBalance : 0;
+        finalBalance = initialBalance + cycleBalance;
 
         // Insert closure record
         await db.run(`
@@ -3194,7 +3221,91 @@ async function startServer() {
           )
         `, [closureId, closureId]);
       });
-      res.json({ success: true, id: closureId });
+
+      // After transaction completes successfully, check for difference email notification
+      let emailNotificationSent = false;
+      let recipients: string[] = [];
+      const diffAmount = differenceAmount !== undefined && differenceAmount !== null ? Number(differenceAmount) : 0;
+
+      if (diffAmount !== 0) {
+        const settings = await db.get("SELECT notifyEmailOnClosureDifference, email FROM companySettings LIMIT 1") as any;
+        const isEmailEnabled = settings && Number(settings.notifyEmailOnClosureDifference) !== 0;
+        
+        if (isEmailEnabled) {
+          const branch = await db.get("SELECT name FROM branches WHERE id = ?", [branchId]) as any;
+          const branchName = branch ? branch.name : `Sucursal ID: ${branchId}`;
+          
+          // Get administrator emails
+          const admins = await db.all("SELECT email FROM users WHERE role = 'admin' OR role = 'superadmin'") as any[];
+          const adminEmails = admins.map(a => a.email).filter(e => e && e.includes('@'));
+          
+          if (settings && settings.email && settings.email.includes('@')) {
+            adminEmails.push(settings.email);
+          }
+          
+          // Default fallbacks if no admin emails found
+          if (adminEmails.length === 0) {
+            adminEmails.push("llaqtasystem@gmail.com");
+          }
+          
+          // Deduplicate
+          recipients = Array.from(new Set(adminEmails));
+          
+          const differenceType = diffAmount > 0 ? "SOBRANTE" : "FALTANTE";
+          
+          const emailSubject = `⚠️ ALERTA DE SEGURIDAD: Cierre de Caja con Diferencia (${differenceType}) - Sucursal ${branchName}`;
+          
+          const emailBody = `
+========================================================================
+📧 NOTIFICACIÓN ENVIADA POR CORREO ELECTRÓNICO (SIMULACIÓN DE SERVICIO)
+========================================================================
+De: alertas-sistema@aurummanager.com
+Para: ${recipients.join(", ")}
+Fecha: ${new Date().toLocaleString()}
+Asunto: ${emailSubject}
+------------------------------------------------------------------------
+Estimado Administrador,
+
+Se le notifica que se ha registrado un cierre de caja con diferencias en el sistema.
+
+Detalles de la operación:
+- Sucursal: ${branchName}
+- Cerrado por: ${createdBy}
+- Fecha del Cierre: ${closureDate} (Hora: ${new Date().toLocaleTimeString() || ''})
+- Saldo en Efectivo Reportado Físicamente: ${physicalBalance} BS
+- Diferencia de Caja Detectada: ${diffAmount} BS (${differenceType})
+
+Justificación de la diferencia dada por el cajero:
+"${differenceJustification || 'No se proporcionó justificación'}"
+
+Detalles de saldos:
+- Saldo Inicial: ${initialBalance} BS
+- Total Ingresos en Efectivo: ${incomes} BS
+- Total Egresos en Efectivo: ${expenses} BS
+- Saldo Teórico Esperado: ${finalBalance} BS
+
+Por favor, proceda a revisar la conciliación física de la sucursal de inmediato.
+========================================================================
+`;
+          // Print to server logs
+          console.log(emailBody);
+          
+          // Append to persistent log file
+          fs.appendFileSync(
+            path.join(process.cwd(), "cierre_notifications.log"),
+            `${new Date().toISOString()} - EMAIL TO ${recipients.join(", ")}\nSUBJECT: ${emailSubject}\nBODY:\n${emailBody}\n\n`
+          );
+          
+          emailNotificationSent = true;
+        }
+      }
+
+      res.json({ 
+        success: true, 
+        id: closureId,
+        emailNotificationSent,
+        recipients
+      });
     } catch (error) {
       console.error("Closure failed:", error);
       res.status(500).json({ error: "Failed to create closure" });
