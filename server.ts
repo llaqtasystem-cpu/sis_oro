@@ -1,4 +1,6 @@
 import express from "express";
+import http from "http";
+import https from "https";
 console.log("SERVER SCRIPT LOADING...");
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
@@ -146,6 +148,7 @@ async function startServer() {
       lowPurityThreshold_pieza DOUBLE DEFAULT 50.0,
       lowPurityThreshold_barra DOUBLE DEFAULT 50.0,
       notifyEmailOnClosureDifference INTEGER DEFAULT 0,
+      serverIp VARCHAR(255) DEFAULT 'localhost',
       updatedAt VARCHAR(255) NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS branches (
@@ -326,6 +329,15 @@ async function startServer() {
       userId VARCHAR(255) NOT NULL,
       credentialId TEXT NOT NULL,
       publicKey TEXT,
+      createdAt VARCHAR(255) NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS configAuditLogs (
+      id VARCHAR(255) PRIMARY KEY,
+      category VARCHAR(255) NOT NULL,
+      fieldName VARCHAR(255) NOT NULL,
+      oldValue TEXT,
+      newValue TEXT,
+      createdByName VARCHAR(255) NOT NULL,
       createdAt VARCHAR(255) NOT NULL
     )`
   ];
@@ -598,6 +610,9 @@ async function startServer() {
       }
       if (!await columnExists(targetDb, 'companySettings', 'notifyEmailOnClosureDifference')) {
         await targetDb.exec("ALTER TABLE companySettings ADD COLUMN notifyEmailOnClosureDifference INTEGER DEFAULT 0");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'serverIp')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN serverIp VARCHAR(255) DEFAULT 'localhost'");
       }
 
       fs.appendFileSync("startup_log.txt", `${new Date().toISOString()} - Migrations successful\n`);
@@ -1343,17 +1358,27 @@ async function startServer() {
     });
 
     // Get the existing settings ID
-    const existing = await db.get("SELECT id FROM companySettings LIMIT 1");
+    const existing = await db.get("SELECT id, serverIp FROM companySettings LIMIT 1");
     const settingsId = existing ? existing.id : crypto.randomUUID();
     
     const allowedFields = [
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 'inactivityTimeout', 'timezone', 'maxStayMinutes',
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp'
     ];
     const values = allowedFields.map(f => data[f] !== undefined ? data[f] : null);
 
     try {
+      const oldIp = existing ? (existing.serverIp || 'localhost') : 'localhost';
+      const newIp = data.serverIp !== undefined ? data.serverIp : 'localhost';
+      if (oldIp !== newIp) {
+        const auditUser = req.headers['x-audit-user'] || 'Sistema';
+        await db.run(
+          `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), 'network', 'Dirección IP', oldIp, newIp, auditUser as string, new Date().toISOString()]
+        );
+      }
+
       if (existing) {
         const setClause = allowedFields.map(f => `${f} = ?`).join(", ");
         await db.run(`UPDATE companySettings SET ${setClause}, updatedAt = ? WHERE id = ?`, [...values, updatedAt, settingsId]);
@@ -1386,18 +1411,36 @@ async function startServer() {
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 
       'inactivityTimeout', 'timezone', 'maxStayMinutes', 
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'updatedAt'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp', 'updatedAt'
     ];
     for (const key of Object.keys(updateData)) {
       if (!allowedColumns.includes(key)) {
         delete updateData[key];
       }
     }
-    
-    const fields = Object.keys(updateData).map(k => `${k} = ?`).join(", ");
-    const values = Object.values(updateData);
-    await db.run(`UPDATE companySettings SET ${fields} WHERE id = ?`, [...values, req.params.id]);
-    res.json({ success: true });
+
+    try {
+      if (updateData.serverIp !== undefined) {
+        const existing = await db.get("SELECT serverIp FROM companySettings WHERE id = ?", [req.params.id]);
+        const oldIp = existing ? (existing.serverIp || 'localhost') : 'localhost';
+        const newIp = updateData.serverIp;
+        if (oldIp !== newIp) {
+          const auditUser = req.headers['x-audit-user'] || 'Sistema';
+          await db.run(
+            `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [crypto.randomUUID(), 'network', 'Dirección IP', oldIp, newIp, auditUser as string, new Date().toISOString()]
+          );
+        }
+      }
+      
+      const fields = Object.keys(updateData).map(k => `${k} = ?`).join(", ");
+      const values = Object.values(updateData);
+      await db.run(`UPDATE companySettings SET ${fields} WHERE id = ?`, [...values, req.params.id]);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error updating settings:", error);
+      res.status(500).json({ error: "Error al actualizar la configuración" });
+    }
   });
 
   // Database Configurations, Backup, Restore and Vaciar (Clear) Endpoints
@@ -1413,6 +1456,7 @@ async function startServer() {
   apiRouter.post("/database/config", async (req, res) => {
     try {
       const config = req.body;
+      const oldConfig = await getDatabaseConfig();
       await saveDatabaseConfig(config);
       
       // Instantly recompute active database dynamic instance
@@ -1422,6 +1466,50 @@ async function startServer() {
       // Synchronously execute full table setup & column alterations on new target database
       await applySchemaAndMigrations(db);
       await bootstrapDefaultData(db);
+
+      // Audit logs! Let's log what changed.
+      const auditUser = (req.headers['x-audit-user'] || 'Sistema') as string;
+      const createdAt = new Date().toISOString();
+      
+      // 1. Motor de Base de Datos
+      const oldType = oldConfig.useSandbox ? `${oldConfig.sandbox?.type || 'mysql'} (Sandbox)` : oldConfig.type;
+      const newType = config.useSandbox ? `${config.sandbox?.type || 'mysql'} (Sandbox)` : config.type;
+      if (oldType !== newType) {
+        await db.run(
+          `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), 'database', 'Motor de Base de Datos', oldType, newType, auditUser, createdAt]
+        );
+      }
+      
+      // 2. Host (depending on Sandbox or regular)
+      const oldHost = oldConfig.useSandbox ? (oldConfig.sandbox?.mysql?.host || '') : (oldConfig.mysql?.host || 'localhost');
+      const newHost = config.useSandbox ? (config.sandbox?.mysql?.host || '') : (config.mysql?.host || 'localhost');
+      if (oldHost !== newHost) {
+        await db.run(
+          `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), 'database', 'Host de Base de Datos', oldHost || '(vacío)', newHost || '(vacío)', auditUser, createdAt]
+        );
+      }
+
+      // 3. Database name
+      const oldDbName = oldConfig.useSandbox ? (oldConfig.sandbox?.mysql?.database || '') : (oldConfig.mysql?.database || '');
+      const newDbName = config.useSandbox ? (config.sandbox?.mysql?.database || '') : (config.mysql?.database || '');
+      if (oldDbName !== newDbName) {
+        await db.run(
+          `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), 'database', 'Nombre de Base de Datos', oldDbName || '(vacío)', newDbName || '(vacío)', auditUser, createdAt]
+        );
+      }
+
+      // 4. Port
+      const oldPort = String(oldConfig.useSandbox ? (oldConfig.sandbox?.mysql?.port || 3306) : (oldConfig.mysql?.port || 3306));
+      const newPort = String(config.useSandbox ? (config.sandbox?.mysql?.port || 3306) : (config.mysql?.port || 3306));
+      if (oldPort !== newPort) {
+        await db.run(
+          `INSERT INTO configAuditLogs (id, category, fieldName, oldValue, newValue, createdByName, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), 'database', 'Puerto de Base de Datos', oldPort, newPort, auditUser, createdAt]
+        );
+      }
       
       res.json({ 
         success: true, 
@@ -1430,6 +1518,17 @@ async function startServer() {
     } catch (e: any) {
       console.error("[Db Realtime Switcher] Fail:", e);
       res.status(500).json({ error: `Error al aplicar la configuración de la base de datos: ${e.message || e}` });
+    }
+  });
+
+  // Get configuration changes log history
+  apiRouter.get("/config-audit-logs", async (req, res) => {
+    try {
+      const logs = await db.all("SELECT * FROM configAuditLogs ORDER BY createdAt DESC LIMIT 100");
+      res.json(logs);
+    } catch (error) {
+      console.error("Error retrieving audit logs:", error);
+      res.json([]);
     }
   });
 
@@ -2317,8 +2416,10 @@ async function startServer() {
       await db.transaction(async () => {
         const branch = await db.get("SELECT abbreviation FROM branches WHERE id = ?", [branchId]) as any;
         const abbr = branch ? branch.abbreviation : 'S';
-        const year = new Date(createdAt).getFullYear().toString().slice(-2);
-        const prefix = `${abbr}${year}`;
+        const dateObj = new Date(createdAt);
+        const year = dateObj.getFullYear().toString().slice(-2);
+        const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+        const prefix = `${abbr}${year}${month}`;
         const lastPurchase = await db.get(`
           SELECT receiptNumber FROM goldPurchases 
           WHERE branchId = ? AND receiptNumber LIKE ? 
@@ -3356,9 +3457,34 @@ Por favor, proceda a revisar la conciliación física de la sucursal de inmediat
     });
   }
 
-  const httpServer = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  let httpServer: any;
+  const keyPath = path.join(process.cwd(), "key.pem");
+  const certPath = path.join(process.cwd(), "cert.pem");
+  const isHttps = fs.existsSync(keyPath) && fs.existsSync(certPath);
+
+  if (isHttps) {
+    try {
+      const options = {
+        key: fs.readFileSync(keyPath),
+        cert: fs.readFileSync(certPath),
+      };
+      httpServer = https.createServer(options, app);
+      httpServer.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running with HTTPS on https://localhost:${PORT}`);
+      });
+    } catch (err: any) {
+      console.error("Failed to start HTTPS server, falling back to HTTP:", err.message);
+      httpServer = http.createServer(app);
+      httpServer.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running with HTTP on http://localhost:${PORT}`);
+      });
+    }
+  } else {
+    httpServer = http.createServer(app);
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running with HTTP on http://localhost:${PORT}`);
+    });
+  }
 
   httpServer.on('error', (err: any) => {
     const errorMsg = `Server error: ${err.message}`;

@@ -1,5 +1,6 @@
 import * as React from "react";
 import CustomerDisplay from "./components/CustomerDisplay";
+import BranchCalendarClockPanel from "./components/BranchCalendarClockPanel";
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -101,6 +102,8 @@ import {
   ZoomIn,
   ZoomOut,
   RotateCw,
+  Network,
+  Globe,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { jsPDF } from "jspdf";
@@ -2662,6 +2665,27 @@ export default function App() {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [systemUsers, setSystemUsers] = useState<SystemUser[]>([]);
   const [branches, setBranches] = useState<Branch[]>([]);
+  const allBranchesWithCentral = useMemo(() => {
+    const centralBranchExists = branches.some(
+      (b) =>
+        b.id === "" ||
+        b.id === "sede_central" ||
+        b.id === "central" ||
+        b.name?.toLowerCase() === "sede central"
+    );
+    if (centralBranchExists) return branches;
+
+    const virtualCentral: Branch = {
+      id: "sede_central",
+      name: "Sede Central",
+      abbreviation: "ALM",
+      location: "Sede Central / Almacén Consolidado",
+      phone: "",
+      createdAt: new Date().toISOString(),
+      active: 1,
+    };
+    return [virtualCentral, ...branches];
+  }, [branches]);
   const [smeltingOperations, setSmeltingOperations] = useState<
     SmeltingOperation[]
   >([]);
@@ -2710,6 +2734,15 @@ export default function App() {
   );
   const [showClientHistoryModal, setShowClientHistoryModal] = useState(false);
   const [historyClient, setHistoryClient] = useState<Client | null>(null);
+  const [showBranchCalendar, setShowBranchCalendar] = useState(false);
+  const [headerTime, setHeaderTime] = useState<Date>(new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setHeaderTime(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
   const [clientHistoryFilter, setClientHistoryFilter] = useState<
     "todos" | "abiertos"
   >("todos");
@@ -2726,6 +2759,8 @@ export default function App() {
     bankName: "",
     accountNumber: "",
   });
+
+  const [expandedBranchPerformance, setExpandedBranchPerformance] = useState<string | null>(null);
 
   // Real-time notifications and material stay limit alerts
   const [stayLimitAlerts, setStayLimitAlerts] = useState<any[]>([]);
@@ -2849,6 +2884,7 @@ export default function App() {
     | "executive_dashboard"
     | "branch_inventory"
   >("inventory");
+  const [pettyCashSubTab, setPettyCashSubTab] = useState<"operations" | "auditing">("operations");
   const [branchInventorySearch, setBranchInventorySearch] = useState("");
   const [branchInventoryTypeFilter, setBranchInventoryTypeFilter] = useState<
     "all" | "pieza" | "barra"
@@ -3777,6 +3813,73 @@ export default function App() {
       })
       .sort((a, b) => b["Pérdida (g)"] - a["Pérdida (g)"]);
 
+    // 7. Gold Purity (Ley %) Distribution and Stats
+    let rangeUnder75Weight = 0;
+    let rangeUnder75Count = 0;
+    let range75to80Weight = 0;
+    let range75to80Count = 0;
+    let range80to90Weight = 0;
+    let range80to90Count = 0;
+    let range90to100Weight = 0;
+    let range90to100Count = 0;
+
+    let totalPuritySum = 0;
+    let purityItemCount = 0;
+    let highestPurity = 0;
+    let lowestPurity = 100;
+
+    filteredPurchases.forEach((p) => {
+      p.items?.forEach((item: any) => {
+        const purity = item.purity || 0;
+        const weight = item.initialWeight || 0;
+        
+        totalPuritySum += purity;
+        purityItemCount += 1;
+        if (purity > highestPurity) highestPurity = purity;
+        if (purity < lowestPurity && purity > 0) lowestPurity = purity;
+
+        if (purity < 75) {
+          rangeUnder75Weight += weight;
+          rangeUnder75Count += 1;
+        } else if (purity >= 75 && purity < 80) {
+          range75to80Weight += weight;
+          range75to80Count += 1;
+        } else if (purity >= 80 && purity < 90) {
+          range80to90Weight += weight;
+          range80to90Count += 1;
+        } else if (purity >= 90 && purity <= 100) {
+          range90to100Weight += weight;
+          range90to100Count += 1;
+        }
+      });
+    });
+
+    const purityDistribution = [
+      {
+        range: "Menos de 75% Ley",
+        "Gramos (g)": parseFloat(rangeUnder75Weight.toFixed(2)),
+        "Piezas": rangeUnder75Count,
+      },
+      {
+        range: "75% - 80% Ley",
+        "Gramos (g)": parseFloat(range75to80Weight.toFixed(2)),
+        "Piezas": range75to80Count,
+      },
+      {
+        range: "80% - 90% Ley",
+        "Gramos (g)": parseFloat(range80to90Weight.toFixed(2)),
+        "Piezas": range80to90Count,
+      },
+      {
+        range: "90% - 100% Ley",
+        "Gramos (g)": parseFloat(range90to100Weight.toFixed(2)),
+        "Piezas": range90to100Count,
+      },
+    ];
+
+    const avgPurity = purityItemCount > 0 ? totalPuritySum / purityItemCount : 0;
+    const highQualityGrams = range90to100Weight;
+
     // Summary KPIs
     const totalVolume = filteredPurchases.reduce((acc, p) => {
       const purchaseWeight =
@@ -3786,6 +3889,8 @@ export default function App() {
         ) || 0;
       return acc + purchaseWeight;
     }, 0);
+
+    const highQualityPercentage = totalVolume > 0 ? (highQualityGrams / totalVolume) * 100 : 0;
 
     const totalInversion = filteredPurchases.reduce(
       (acc, p) => acc + (p.total || 0),
@@ -3802,6 +3907,14 @@ export default function App() {
       availableYears,
       scatterDataGrouped,
       smeltingComparisonData,
+      purityDistribution,
+      purityStats: {
+        avgPurity: parseFloat(avgPurity.toFixed(2)),
+        highestPurity: parseFloat((purityItemCount > 0 ? highestPurity : 0).toFixed(2)),
+        lowestPurity: parseFloat((purityItemCount > 0 && lowestPurity !== 100 ? lowestPurity : 0).toFixed(2)),
+        highQualityGrams: parseFloat(highQualityGrams.toFixed(2)),
+        highQualityPercentage: parseFloat(highQualityPercentage.toFixed(2)),
+      },
       kpis: {
         totalVolume: parseFloat(totalVolume.toFixed(2)),
         totalInversion: parseFloat(totalInversion.toFixed(2)),
@@ -4749,7 +4862,12 @@ export default function App() {
 
   const filteredBranchClients = useMemo(() => {
     return clients
-      .filter((c) => c.branchId === branchMode)
+      .filter((c) => {
+        if (!branchMode) {
+          return !c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === "";
+        }
+        return c.branchId === branchMode;
+      })
       .filter(
         (c) =>
           c.name.toLowerCase().includes(clientSearch.toLowerCase()) ||
@@ -4769,7 +4887,12 @@ export default function App() {
 
   const filteredBranchReferrers = useMemo(() => {
     return referrers
-      .filter((r) => r.branchId === branchMode)
+      .filter((r) => {
+        if (!branchMode) {
+          return !r.branchId || r.branchId === "sede_central" || r.branchId === "central" || r.branchId === "";
+        }
+        return r.branchId === branchMode;
+      })
       .filter(
         (r) =>
           r.name.toLowerCase().includes(branchReferrerSearch.toLowerCase()) ||
@@ -5518,29 +5641,37 @@ export default function App() {
 
   // Validation state
   const isCiAlreadyUsed = useMemo(() => {
-    if (!clientFormData.ci || !branchMode) return false;
+    if (!clientFormData.ci) return false;
     const cleanedCi = (clientFormData.ci || "").trim().toLowerCase();
     if (!cleanedCi) return false;
 
-    return clients.some(
-      (c) =>
-        c.branchId === branchMode &&
+    return clients.some((c) => {
+      const isMatchBranch = !branchMode
+        ? (!c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === "")
+        : c.branchId === branchMode;
+      return (
+        isMatchBranch &&
         (c.ci || "").trim().toLowerCase() === cleanedCi &&
-        c.id !== editingClient?.id,
-    );
+        c.id !== editingClient?.id
+      );
+    });
   }, [clientFormData.ci, branchMode, clients, editingClient]);
 
   const isReferrerCiAlreadyUsed = useMemo(() => {
-    if (!referrerFormData.ci || !branchMode) return false;
+    if (!referrerFormData.ci) return false;
     const cleanedCi = (referrerFormData.ci || "").trim().toLowerCase();
     if (!cleanedCi) return false;
 
-    return referrers.some(
-      (r) =>
-        r.branchId === branchMode &&
+    return referrers.some((r) => {
+      const isMatchBranch = !branchMode
+        ? (!r.branchId || r.branchId === "sede_central" || r.branchId === "central" || r.branchId === "")
+        : r.branchId === branchMode;
+      return (
+        isMatchBranch &&
         (r.ci || "").trim().toLowerCase() === cleanedCi &&
-        r.id !== editingReferrer?.id,
-    );
+        r.id !== editingReferrer?.id
+      );
+    });
   }, [referrerFormData.ci, branchMode, referrers, editingReferrer]);
 
   // Auto-fill advancePayment for purchases
@@ -5634,16 +5765,104 @@ export default function App() {
     loginBgUrl: "",
     inactivityTimeout: 10,
     timezone: "America/La_Paz",
+    serverIp: "localhost",
     updatedAt: "",
   });
 
   // Database Management State
-  const [settingsSubTab, setSettingsSubTab] = useState<"company" | "database">(
-    "company",
-  );
+  const [settingsSubTab, setSettingsSubTab] = useState<
+    "company" | "database" | "network"
+  >("company");
   const [dbAccessPasswordInput, setDbAccessPasswordInput] = useState("");
   const [isDbUnlocked, setIsDbUnlocked] = useState(false);
   const [dbPasswordError, setDbPasswordError] = useState(false);
+  const [configAuditLogs, setConfigAuditLogs] = useState<any[]>([]);
+  const [isFetchingAuditLogs, setIsFetchingAuditLogs] = useState(false);
+
+  const fetchConfigAuditLogs = async () => {
+    setIsFetchingAuditLogs(true);
+    try {
+      const response = await fetch("/api/config-audit-logs");
+      if (response.ok) {
+        const data = await response.json();
+        setConfigAuditLogs(data || []);
+      }
+    } catch (err) {
+      console.error("Error fetching config audit logs:", err);
+    } finally {
+      setIsFetchingAuditLogs(false);
+    }
+  };
+
+  useEffect(() => {
+    if (settingsSubTab === "network" || settingsSubTab === "database") {
+      fetchConfigAuditLogs();
+    }
+  }, [settingsSubTab]);
+
+  const renderConfigAuditLogs = (category: "network" | "database") => {
+    const filteredLogs = configAuditLogs.filter(log => log.category === category);
+
+    return (
+      <div className="bg-zinc-950 p-6 rounded-2xl border border-white/5 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-bold text-zinc-100 flex items-center gap-2">
+            <History className="w-4 h-4 text-indigo-400" />
+            {category === "network" ? "Historial de Cambios de Dirección IP" : "Historial de Cambios de Base de Datos"}
+          </h3>
+          <button
+            onClick={fetchConfigAuditLogs}
+            disabled={isFetchingAuditLogs}
+            className="text-[10px] uppercase font-bold text-indigo-400 hover:text-indigo-300 disabled:opacity-40 transition-all"
+          >
+            {isFetchingAuditLogs ? "Actualizando..." : "Actualizar"}
+          </button>
+        </div>
+
+        {filteredLogs.length === 0 ? (
+          <p className="text-[11px] text-zinc-500 py-4 text-center">
+            No hay registros de auditoría para este módulo.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[11px] text-zinc-400 font-normal border-collapse">
+              <thead>
+                <tr className="border-b border-white/5 text-[10px] font-bold uppercase tracking-wider text-zinc-500">
+                  <th className="pb-2">Fecha y Hora</th>
+                  <th className="pb-2">Modificado Por</th>
+                  <th className="pb-2">Campo</th>
+                  <th className="pb-2">Valor Anterior</th>
+                  <th className="pb-2">Valor Nuevo</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.02]">
+                {filteredLogs.map((log) => (
+                  <tr key={log.id} className="hover:bg-white/[0.01]">
+                    <td className="py-2.5 pr-2 font-mono text-zinc-500">
+                      {new Date(log.createdAt).toLocaleString("es-ES")}
+                    </td>
+                    <td className="py-2.5 pr-2">
+                      <span className="px-2 py-0.5 rounded-full bg-zinc-900 border border-white/5 text-zinc-300 text-[10px] font-medium">
+                        {log.createdByName}
+                      </span>
+                    </td>
+                    <td className="py-2.5 pr-2 font-medium text-indigo-400">{log.fieldName}</td>
+                    <td className="py-2.5 pr-2 font-mono text-xs max-w-[150px] truncate" title={log.oldValue}>
+                      {log.oldValue || "—"}
+                    </td>
+                    <td className="py-2.5 pr-2 font-mono text-xs max-w-[150px] truncate text-emerald-400" title={log.newValue}>
+                      {log.newValue}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const [dbConfig, setDbConfig] = useState<any>({
     type: "sqlite",
     useSandbox: false,
@@ -7803,7 +8022,10 @@ export default function App() {
     try {
       const res = await fetch("/api/database/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Audit-User": user ? (user.name || user.username) : "Sistema"
+        },
         body: JSON.stringify(updatedConfig),
       });
       if (res.ok) {
@@ -7814,6 +8036,7 @@ export default function App() {
         );
         setImportedConfigPreview(null);
         fetchDatabaseStats();
+        fetchConfigAuditLogs();
       } else {
         const errData = await res.json();
         setImportError(
@@ -7833,7 +8056,10 @@ export default function App() {
     try {
       const res = await fetch("/api/database/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Audit-User": user ? (user.name || user.username) : "Sistema"
+        },
         body: JSON.stringify(dbConfig),
       });
       if (res.ok) {
@@ -7841,6 +8067,7 @@ export default function App() {
         alert(data.message || "Configuración guardada correctamente.");
         fetchDatabaseConfig();
         fetchDatabaseStats();
+        fetchConfigAuditLogs();
       } else {
         alert("Error al guardar la configuración.");
       }
@@ -8695,15 +8922,16 @@ export default function App() {
 
   const handleAddClient = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !branchMode) return;
+    if (!user) return;
 
     if (isCiAlreadyUsed) {
       alert("Error: Ya existe un cliente con este número de CI registrado en esta sucursal.");
       return;
     }
 
-    const branch = branches.find((b) => b.id === branchMode);
-    const branchName = branch ? branch.name : "";
+    const currentBranchMode = branchMode || "sede_central";
+    const branch = branches.find((b) => b.id === currentBranchMode) || { name: "Sede Central", id: "sede_central" };
+    const branchName = branch ? branch.name : "Sede Central";
 
     try {
       let savedClient = null;
@@ -8713,7 +8941,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...clientFormData,
-            branchId: branchMode,
+            branchId: currentBranchMode,
             branchName,
             registeredBy: user.name,
           }),
@@ -8724,7 +8952,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...clientFormData,
-            branchId: branchMode,
+            branchId: currentBranchMode,
             branchName,
             registeredBy: user.name,
           }),
@@ -8756,7 +8984,7 @@ export default function App() {
         if (savedClient.recommendedBy) {
           const matchedRef = referrers.find(
             (r) =>
-              r.branchId === branchMode &&
+              (r.branchId === branchMode || (branchMode === null && (!r.branchId || r.branchId === "sede_central"))) &&
               r.name.toLowerCase() === savedClient.recommendedBy.toLowerCase(),
           );
           if (matchedRef) {
@@ -8900,7 +9128,7 @@ export default function App() {
 
   const handleSaveReferrer = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !branchMode) return;
+    if (!user) return;
 
     if (isReferrerCiAlreadyUsed) {
       alert("Error: Ya existe un referido con este número de CI registrado en esta sucursal.");
@@ -8917,7 +9145,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...referrerFormData,
-            branchId: branchMode,
+            branchId: branchMode || "sede_central",
           }),
         },
       );
@@ -8971,7 +9199,6 @@ export default function App() {
   const handleAddReferrerPayout = async () => {
     if (
       !user ||
-      !branchMode ||
       !payoutReferrer ||
       selectedPurchasesForPayout.length === 0
     )
@@ -9010,7 +9237,7 @@ export default function App() {
           purchaseReceipts,
           totalAmount,
           paidBy: user.name,
-          branchId: branchMode,
+          branchId: branchMode || "sede_central",
           notes: payoutNotes,
           editedCommissions: selectedEditedCommissions,
         }),
@@ -9030,7 +9257,7 @@ export default function App() {
         totalAmount,
         paidAt: payoutData.paidAt,
         paidBy: user.name,
-        branchId: branchMode,
+        branchId: branchMode || "sede_central",
         notes: payoutNotes,
       });
 
@@ -12597,7 +12824,10 @@ export default function App() {
     try {
       const response = await fetch("/api/settings", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "X-Audit-User": user ? (user.name || user.username) : "Sistema"
+        },
         body: JSON.stringify(companyFormData),
       });
 
@@ -12608,6 +12838,7 @@ export default function App() {
 
       alert("Configuración guardada correctamente");
       fetchData();
+      fetchConfigAuditLogs();
     } catch (error: any) {
       console.error(error);
       alert(error.message || "Error al conectar con el servidor");
@@ -13452,6 +13683,29 @@ export default function App() {
                     <Building2 className="w-8 h-8 text-white" />
                   </div>
                   <div>
+                    {/* Estación de Tiempo Real: Visible Arriba del Nombre de Sucursal */}
+                    <div className="flex items-center gap-2 mb-2 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full w-fit">
+                      <Clock className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
+                      <span className="text-[10px] text-amber-400 uppercase font-extrabold tracking-wider">
+                        Estación de Tiempo Real:
+                      </span>
+                      <span className="text-xs font-mono font-black text-amber-300">
+                        {headerTime.toLocaleTimeString("es-ES", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
+                      </span>
+                      <span className="text-[10px] font-bold text-zinc-400 border-l border-white/10 pl-2">
+                        {headerTime.toLocaleDateString("es-ES", {
+                          weekday: "short",
+                          day: "numeric",
+                          month: "short",
+                        })}
+                      </span>
+                    </div>
+
                     <div className="flex items-center gap-3">
                       <h1 className="text-3xl font-bold text-zinc-100 italic">
                         {branches.find((b) => b.id === branchMode)?.name}
@@ -13466,12 +13720,23 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-                <div className="flex items-center gap-3 bg-zinc-900/50 p-2 rounded-2xl border border-white/5 backdrop-blur-sm">
+                <div className="flex flex-wrap items-center gap-3 bg-zinc-900/50 p-2 rounded-2xl border border-white/5 backdrop-blur-sm">
                   <button
                     onClick={() => setView("branch_dashboard")}
                     className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all ${view === "branch_dashboard" ? "bg-amber-500 text-white shadow-lg shadow-amber-500/20" : "text-zinc-500 hover:text-zinc-300"}`}
                   >
                     Panel de Control
+                  </button>
+                  <button
+                    onClick={() => setView("branch_calendar")}
+                    className={`px-5 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 ${
+                      view === "branch_calendar"
+                        ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                        : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+                    }`}
+                  >
+                    <Calendar className="w-4 h-4" />
+                    <span>Calendario Compras</span>
                   </button>
                   <button
                     onClick={() => setView("branch_purchases")}
@@ -13583,6 +13848,38 @@ export default function App() {
                       >
                         <Truck className="w-4 h-4" /> Tránsitos
                       </button>
+                      <button
+                        onClick={() => handleViewChange("branch_clients")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_clients" ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"}`}
+                      >
+                        <User className="w-4 h-4" />
+                        <span>Clientes</span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                            view === "branch_clients"
+                              ? "bg-blue-700 text-blue-100 border-blue-550"
+                              : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                          }`}
+                        >
+                          {clients.filter((c) => !c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === "").length}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleViewChange("branch_referrers")}
+                        className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2.5 whitespace-nowrap ${view === "branch_referrers" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"}`}
+                      >
+                        <Users className="w-4 h-4" />
+                        <span>Referidos</span>
+                        <span
+                          className={`px-2 py-0.5 text-[10px] font-black rounded-full border transition-all ${
+                            view === "branch_referrers"
+                              ? "bg-indigo-700 text-indigo-100 border-indigo-550"
+                              : "bg-zinc-950/60 text-zinc-400 border-white/5"
+                          }`}
+                        >
+                          {referrers.filter((r) => !r.branchId || r.branchId === "sede_central" || r.branchId === "central" || r.branchId === "").length}
+                        </span>
+                      </button>
                     </>
                   )}
 
@@ -13683,6 +13980,17 @@ export default function App() {
                   className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${view === "branch_dashboard" ? "bg-zinc-100 text-zinc-900 shadow-lg" : "text-zinc-500 hover:bg-zinc-800"}`}
                 >
                   Panel Sucursal
+                </button>
+                <button
+                  onClick={() => handleViewChange("branch_calendar")}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 whitespace-nowrap ${
+                    view === "branch_calendar"
+                      ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                      : "text-zinc-500 hover:bg-zinc-800"
+                  }`}
+                >
+                  <Calendar className="w-4 h-4" />
+                  <span>Calendario de Compras</span>
                 </button>
                 <button
                   onClick={() => handleViewChange("branch_clients")}
@@ -15957,6 +16265,232 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Distribución de Pureza y Calidad del Oro */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                    {/* Bar Chart section */}
+                    <div className="lg:col-span-8 bg-zinc-900 rounded-3xl border border-white/5 p-6 flex flex-col justify-between">
+                      <div>
+                        <h3 className="text-lg font-bold text-zinc-200">
+                          Distribución de Pureza del Oro (Ley %)
+                        </h3>
+                        <p className="text-xs text-zinc-400 mt-0.5">
+                          Distribución del volumen (g) y de transacciones (piezas) de oro recibido agrupado en rangos de ley/pureza.
+                        </p>
+                      </div>
+
+                      <div className="h-80 w-full mt-6">
+                        {executiveDashboardData.purityDistribution.some(item => item["Gramos (g)"] > 0) ? (
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart
+                              data={executiveDashboardData.purityDistribution}
+                              margin={{
+                                top: 15,
+                                right: 15,
+                                left: -10,
+                                bottom: 0,
+                              }}
+                            >
+                              <defs>
+                                <linearGradient id="purityGramsGrad" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.8} />
+                                  <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.1} />
+                                </linearGradient>
+                                <linearGradient id="purityPiecesGrad" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.8} />
+                                  <stop offset="95%" stopColor="#06b6d4" stopOpacity={0.1} />
+                                </linearGradient>
+                              </defs>
+                              <CartesianGrid
+                                strokeDasharray="3 3"
+                                stroke="#27272a"
+                                strokeOpacity={0.5}
+                              />
+                              <XAxis
+                                dataKey="range"
+                                stroke="#71717a"
+                                fontSize={10}
+                                tickLine={false}
+                              />
+                              <YAxis
+                                yAxisId="left"
+                                stroke="#f59e0b"
+                                fontSize={10}
+                                tickLine={false}
+                                axisLine={false}
+                                unit="g"
+                                label={{
+                                  value: "Peso Comprado (g)",
+                                  angle: -90,
+                                  position: "insideLeft",
+                                  fill: "#f59e0b",
+                                  fontSize: 10,
+                                  offset: 0,
+                                }}
+                              />
+                              <YAxis
+                                yAxisId="right"
+                                orientation="right"
+                                stroke="#06b6d4"
+                                fontSize={10}
+                                tickLine={false}
+                                axisLine={false}
+                                unit=" uds"
+                                label={{
+                                  value: "Piezas Recibidas",
+                                  angle: 90,
+                                  position: "insideRight",
+                                  fill: "#06b6d4",
+                                  fontSize: 10,
+                                  offset: 0,
+                                }}
+                              />
+                              <Tooltip
+                                contentStyle={{
+                                  backgroundColor: "#18181b",
+                                  borderColor: "#27272a",
+                                  borderRadius: "16px",
+                                  padding: "12px",
+                                }}
+                                labelStyle={{
+                                  color: "#f4f4f5",
+                                  fontWeight: "bold",
+                                  fontSize: "11px",
+                                  marginBottom: "4px",
+                                }}
+                                itemStyle={{
+                                  fontSize: "11px",
+                                  padding: "2px 0",
+                                }}
+                              />
+                              <Legend
+                                wrapperStyle={{
+                                  fontSize: "10px",
+                                  paddingTop: "10px",
+                                }}
+                              />
+                              <Bar
+                                yAxisId="left"
+                                dataKey="Gramos (g)"
+                                fill="url(#purityGramsGrad)"
+                                stroke="#f59e0b"
+                                strokeWidth={1}
+                                radius={[4, 4, 0, 0]}
+                                barSize={36}
+                              />
+                              <Bar
+                                yAxisId="right"
+                                dataKey="Piezas"
+                                fill="url(#purityPiecesGrad)"
+                                stroke="#06b6d4"
+                                strokeWidth={1}
+                                radius={[4, 4, 0, 0]}
+                                barSize={36}
+                              />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-2 font-medium">
+                            <TrendingUp className="w-10 h-10 opacity-30 text-zinc-500 animate-pulse" />
+                            <p className="text-xs">
+                              Sin información de purezas ni compras registradas en los filtros seleccionados.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Stats summary section */}
+                    <div className="lg:col-span-4 bg-zinc-900 rounded-3xl border border-white/5 p-6 flex flex-col justify-between">
+                      <div className="space-y-4">
+                        <div>
+                          <h3 className="text-lg font-bold text-amber-500 uppercase tracking-widest text-[10px] font-black">
+                            Indicadores de Calidad
+                          </h3>
+                          <h4 className="text-base font-bold text-zinc-200 mt-0.5">
+                            Resumen de Calidad del Oro
+                          </h4>
+                          <p className="text-xs text-zinc-500 mt-1">
+                            Análisis estadístico de la pureza promedio, ley máxima registrada y volumen de oro con calidad premium.
+                          </p>
+                        </div>
+
+                        <div className="space-y-3.5 pt-2">
+                          {/* Avg Purity Card */}
+                          <div className="p-3.5 bg-zinc-950 rounded-2xl border border-white/5 flex items-center justify-between">
+                            <div>
+                              <span className="text-[10px] uppercase font-bold text-zinc-400 block">
+                                Ley Promedio
+                              </span>
+                              <span className="text-xs font-medium text-zinc-400">
+                                Calidad media del material
+                              </span>
+                            </div>
+                            <span className="font-mono text-lg font-bold text-amber-450">
+                              {formatNumber(executiveDashboardData.purityStats.avgPurity)}%
+                            </span>
+                          </div>
+
+                          {/* Highest and Lowest Purity Card */}
+                          <div className="p-3.5 bg-zinc-950 rounded-2xl border border-white/5 grid grid-cols-2 gap-2 divide-x divide-white/5">
+                            <div className="text-center pr-2">
+                              <span className="text-[9px] uppercase font-bold text-zinc-500 block">
+                                Ley Máxima
+                              </span>
+                              <span className="font-mono text-base font-bold text-emerald-400 block mt-1">
+                                {formatNumber(executiveDashboardData.purityStats.highestPurity)}%
+                              </span>
+                            </div>
+                            <div className="text-center pl-2">
+                              <span className="text-[9px] uppercase font-bold text-zinc-500 block">
+                                Ley Mínima
+                              </span>
+                              <span className="font-mono text-base font-bold text-rose-400 block mt-1">
+                                {formatNumber(executiveDashboardData.purityStats.lowestPurity)}%
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Premium Gold Card (>=90%) */}
+                          <div className="p-4 bg-amber-500/5 rounded-2xl border border-amber-500/10 flex flex-col gap-2">
+                            <div className="flex justify-between items-center">
+                              <span className="text-[10px] uppercase font-black tracking-wider text-amber-500">
+                                Oro de Alta Calidad (90-100% Ley)
+                              </span>
+                              <span className="px-2 py-0.5 bg-amber-500/10 text-amber-500 text-[8px] font-extrabold uppercase rounded-full">
+                                Premium
+                              </span>
+                            </div>
+                            <p className="text-xs text-zinc-400 leading-snug">
+                              Representa el oro de mayor pureza recibido en el taller o sucursales, ideal para fundición de barras refinadas.
+                            </p>
+                            <div className="flex justify-between items-end mt-1">
+                              <div>
+                                <span className="text-[9px] text-zinc-500 block font-semibold uppercase">
+                                  Peso Recibido
+                                </span>
+                                <span className="font-mono text-sm font-bold text-zinc-250">
+                                  {formatNumber(executiveDashboardData.purityStats.highQualityGrams)} g
+                                </span>
+                              </div>
+                              <div className="text-right">
+                                <span className="text-[9px] text-zinc-500 block font-semibold uppercase">
+                                  Proporción Total
+                                </span>
+                                <span className="font-mono text-sm font-bold text-amber-500">
+                                  {formatNumber(executiveDashboardData.purityStats.highQualityPercentage)}%
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="pt-4 border-t border-white/5 text-[10px] text-zinc-500 italic leading-snug">
+                        💡 Un alto porcentaje de Oro Premium (90-100% Ley) reduce los tiempos y los costos del proceso de refinación química posterior.
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Quality Correlation Scatter plot section */}
                   <div className="bg-zinc-900 rounded-3xl border border-white/5 p-6 flex flex-col justify-between">
                     <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
@@ -16235,7 +16769,7 @@ export default function App() {
                   {branchesSubTab !== "audit" ? (
                     <>
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {branches
+                        {allBranchesWithCentral
                           .filter((b) =>
                             showHiddenBranches
                               ? b.active === 0
@@ -16388,16 +16922,247 @@ export default function App() {
                                     </div>
                                   );
                                 })()}
+                                
+                                {expandedBranchPerformance === b.id && (
+                                  <motion.div
+                                    initial={{ opacity: 0, height: 0 }}
+                                    animate={{ opacity: 1, height: "auto" }}
+                                    exit={{ opacity: 0, height: 0 }}
+                                    className="mt-4 pt-4 border-t border-white/5 space-y-4 overflow-hidden text-left font-sans"
+                                  >
+                                    {(() => {
+                                      const isCentralBranch = b.id === "sede_central" || b.id === "" || b.id === "central" || b.name?.toLowerCase().includes("central");
+
+                                      // Get users operating in this branch or with registered actions in this branch
+                                      const branchUsers = systemUsers.filter((u) => {
+                                        const isAssigned = u.branchId === b.id || (isCentralBranch && (!u.branchId || u.branchId === "sede_central" || u.branchId === "central" || u.branchId === ""));
+                                        if (isAssigned) return true;
+
+                                        const hasPurchases = goldPurchases.some(
+                                          (p) =>
+                                            (p.branchId === b.id || (isCentralBranch && (!p.branchId || p.branchId === "sede_central" || p.branchId === ""))) &&
+                                            (p.createdBy === u.id || p.createdBy === u.username || p.createdBy === u.email || p.createdBy === u.name)
+                                        );
+                                        if (hasPurchases) return true;
+
+                                        const hasClients = clients.some(
+                                          (c) =>
+                                            (c.branchId === b.id || (isCentralBranch && (!c.branchId || c.branchId === "sede_central" || c.branchId === ""))) &&
+                                            (c.registeredBy === u.name || c.registeredBy === u.username || c.registeredBy === u.id)
+                                        );
+                                        return hasClients;
+                                      });
+
+                                      // Clients in this branch
+                                      const branchClients = clients.filter(
+                                        (c) => c.branchId === b.id || (isCentralBranch && (!c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === ""))
+                                      );
+
+                                      return (
+                                        <div className="space-y-4">
+                                          {/* SECTION 1: SYSTEM USERS / OPERATORS */}
+                                          <div className="space-y-2">
+                                            <div className="flex justify-between items-center bg-zinc-950/40 p-2 rounded-xl border border-white/5">
+                                              <span className="text-[10px] font-black uppercase text-amber-500 tracking-wider">
+                                                Rendimiento de Operadores
+                                              </span>
+                                              <span className="text-[9px] text-zinc-500 font-bold">
+                                                Histórico consolidado
+                                              </span>
+                                            </div>
+
+                                            {branchUsers.length === 0 ? (
+                                              <p className="text-[11px] text-zinc-500 italic py-1 pl-1">
+                                                Sin operadores con actividad en esta sucursal.
+                                              </p>
+                                            ) : (
+                                              <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                                                {branchUsers.map((u) => {
+                                                  // Purchases registered by this user in this branch
+                                                  const uPurchases = goldPurchases.filter(
+                                                    (p) =>
+                                                      (p.branchId === b.id || (isCentralBranch && (!p.branchId || p.branchId === "sede_central" || p.branchId === ""))) &&
+                                                      (p.createdBy === u.id ||
+                                                        p.createdBy === u.username ||
+                                                        p.createdBy === u.email ||
+                                                        p.createdBy === u.name)
+                                                  );
+                                                  const totalWeight = uPurchases.reduce((acc, p) => {
+                                                    const weight = p.items?.reduce((innerAcc, item) => innerAcc + (item.finalWeight || 0), 0) || 0;
+                                                    return acc + weight;
+                                                  }, 0);
+                                                  const receiptCount = uPurchases.length;
+
+                                                  // Clients registered by this user in this branch
+                                                  const uClients = clients.filter(
+                                                    (c) =>
+                                                      (c.branchId === b.id || (isCentralBranch && (!c.branchId || c.branchId === "sede_central" || c.branchId === ""))) &&
+                                                      (c.registeredBy === u.name ||
+                                                        c.registeredBy === u.username ||
+                                                        c.registeredBy === u.id)
+                                                  );
+                                                  const registeredClientsCount = uClients.length;
+
+                                                  // Referrals (clients with a recommendation) introduced by this user
+                                                  const uReferredClients = uClients.filter(
+                                                    (c) => c.recommendedBy && c.recommendedBy.trim() !== ""
+                                                  );
+                                                  const referredClientsCount = uReferredClients.length;
+
+                                                  return (
+                                                    <div
+                                                      key={u.id || u.username}
+                                                      className="p-3 bg-zinc-950/70 rounded-xl border border-white/5 space-y-2 text-xs"
+                                                    >
+                                                      <div className="flex justify-between items-center">
+                                                        <span className="font-bold text-zinc-200">
+                                                          {u.name}
+                                                        </span>
+                                                        <span className="px-1.5 py-0.5 bg-white/5 border border-white/10 text-zinc-400 text-[8px] font-bold uppercase rounded">
+                                                          {u.role === "operator" ? "Operador" : u.role === "superadmin" ? "S-Admin" : "Admin"}
+                                                        </span>
+                                                      </div>
+
+                                                      <div className="grid grid-cols-3 gap-2">
+                                                        {/* Purchases */}
+                                                        <div className="p-2 bg-zinc-900/50 rounded-lg border border-white/5 flex flex-col justify-between">
+                                                          <span className="text-[8px] uppercase font-bold text-zinc-500 block">
+                                                            Recibos
+                                                          </span>
+                                                          <span className="font-mono font-black text-amber-500 text-xs mt-0.5 block">
+                                                            {receiptCount}
+                                                          </span>
+                                                          <span className="text-[8px] text-zinc-400 font-medium block">
+                                                            {formatNumber(totalWeight)} g
+                                                          </span>
+                                                        </div>
+
+                                                        {/* Customers Registered */}
+                                                        <div className="p-2 bg-zinc-900/50 rounded-lg border border-white/5 flex flex-col justify-between">
+                                                          <span className="text-[8px] uppercase font-bold text-zinc-500 block">
+                                                            Clientes Reg.
+                                                          </span>
+                                                          <span className="font-mono font-black text-blue-400 text-xs mt-0.5 block">
+                                                            {registeredClientsCount}
+                                                          </span>
+                                                          <span className="text-[8px] text-zinc-500 block">
+                                                            registrados
+                                                          </span>
+                                                        </div>
+
+                                                        {/* Referred Customers */}
+                                                        <div className="p-2 bg-zinc-900/50 rounded-lg border border-white/5 flex flex-col justify-between">
+                                                          <span className="text-[8px] uppercase font-bold text-zinc-500 block">
+                                                            Referidos
+                                                          </span>
+                                                          <span className="font-mono font-black text-emerald-400 text-xs mt-0.5 block">
+                                                            {referredClientsCount}
+                                                          </span>
+                                                          <span className="text-[8px] text-zinc-500 block">
+                                                            recomendados
+                                                          </span>
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                  );
+                                                })}
+                                              </div>
+                                            )}
+                                          </div>
+
+                                          {/* SECTION 2: CLIENT REFIAL PERFORMANCE */}
+                                          <div className="space-y-2">
+                                            <div className="flex justify-between items-center bg-zinc-950/40 p-2 rounded-xl border border-white/5">
+                                              <span className="text-[10px] font-black uppercase text-emerald-500 tracking-wider">
+                                                Recomendaciones de Socios (Referidos)
+                                              </span>
+                                              <span className="text-[9px] text-zinc-500 font-bold">
+                                                Clientes de la sucursal
+                                              </span>
+                                            </div>
+
+                                            {branchClients.length === 0 ? (
+                                              <p className="text-[11px] text-zinc-500 italic py-1 pl-1">
+                                                Sin clientes registrados en esta sucursal.
+                                              </p>
+                                            ) : (
+                                              <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                                                {(() => {
+                                                  // Filter clients who have successfully referred others or made purchases
+                                                  const activeReferrerClients = branchClients.map((c) => {
+                                                    // Count people who list this client's name as their referrer
+                                                    const referCount = clients.filter(
+                                                      (other) =>
+                                                        other.recommendedBy?.trim().toLowerCase() === c.name.trim().toLowerCase()
+                                                    ).length;
+
+                                                    // Purchase counts
+                                                    const pCount = goldPurchases.filter((p) => p.clientId === c.id).length;
+
+                                                    return { client: c, referCount, pCount };
+                                                  }).filter((item) => item.referCount > 0 || item.pCount > 0);
+
+                                                  if (activeReferrerClients.length === 0) {
+                                                    return (
+                                                      <p className="text-[11px] text-zinc-600 italic py-1 pl-1">
+                                                        Ningún socio con recomendaciones registradas aún.
+                                                      </p>
+                                                    );
+                                                  }
+
+                                                  return activeReferrerClients.map(({ client, referCount, pCount }) => (
+                                                    <div
+                                                      key={client.id}
+                                                      className="p-2.5 bg-zinc-900/40 rounded-xl border border-white/5 flex items-center justify-between text-xs"
+                                                    >
+                                                      <div className="flex flex-col">
+                                                        <span className="font-bold text-zinc-300">
+                                                          {client.name}
+                                                        </span>
+                                                        <span className="text-[9px] text-zinc-500">
+                                                          CI: {client.ci || "N/A"}
+                                                        </span>
+                                                      </div>
+
+                                                      <div className="flex gap-3 text-right">
+                                                        <div className="flex flex-col">
+                                                          <span className="text-[8px] uppercase font-extrabold text-zinc-500">
+                                                            Transacciones
+                                                          </span>
+                                                          <span className="font-bold text-amber-500">
+                                                            {pCount} compras
+                                                          </span>
+                                                        </div>
+                                                        <div className="flex flex-col border-l border-white/5 pl-3">
+                                                          <span className="text-[8px] uppercase font-extrabold text-emerald-500">
+                                                            Referidos Tr.
+                                                          </span>
+                                                          <span className="font-black text-emerald-400">
+                                                            {referCount} socios
+                                                          </span>
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                  ));
+                                                })()}
+                                              </div>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })()}
+                                  </motion.div>
+                                )}
                               </div>
 
-                              <div className="flex justify-end gap-2 pt-4 border-t border-white/5">
+                              <div className="flex justify-end gap-2 pt-4 border-t border-white/5 flex-wrap">
                                 {b.active === 0 ? (
                                   <>
                                     {user.role === "superadmin" && (
                                       <button
                                         type="button"
                                         onClick={() => handleActivateBranch(b)}
-                                        className="text-[10px] font-bold text-green-400 hover:bg-green-500/20 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1 bg-green-500/5 border border-green-500/10"
+                                        className="text-[10px] font-bold text-green-400 hover:bg-green-500/20 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1 bg-green-500/5 border border-green-500/10 whitespace-nowrap"
                                       >
                                         <Check className="w-3.5 h-3.5" />{" "}
                                         Activar Sucursal
@@ -16407,7 +17172,7 @@ export default function App() {
                                       <button
                                         type="button"
                                         onClick={() => handleDeleteBranch(b)}
-                                        className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-3 py-1.5 rounded-lg transition-colors"
+                                        className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
                                       >
                                         Eliminar Físico
                                       </button>
@@ -16415,27 +17180,44 @@ export default function App() {
                                   </>
                                 ) : (
                                   <>
+                                    {b.id !== "sede_central" && (
+                                      <button
+                                        onClick={() => {
+                                          setSelectedBranchForBanks(b);
+                                          setShowBranchBankAccountsModal(true);
+                                        }}
+                                        className="text-[10px] font-bold text-blue-400 hover:bg-blue-500/10 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1 whitespace-nowrap"
+                                      >
+                                        <Building2 className="w-3 h-3" /> Cuentas
+                                      </button>
+                                    )}
                                     <button
+                                      type="button"
                                       onClick={() => {
-                                        setSelectedBranchForBanks(b);
-                                        setShowBranchBankAccountsModal(true);
+                                        setExpandedBranchPerformance(
+                                          expandedBranchPerformance === b.id ? null : b.id
+                                        );
                                       }}
-                                      className="text-[10px] font-bold text-blue-400 hover:bg-blue-500/10 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1"
+                                      className={`text-[10px] font-bold px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1 whitespace-nowrap ${
+                                        expandedBranchPerformance === b.id
+                                          ? "bg-amber-500/20 text-amber-400 font-extrabold border border-amber-500/30"
+                                          : "text-amber-500 hover:bg-amber-500/10"
+                                      }`}
                                     >
-                                      <Building2 className="w-3 h-3" /> Cuentas
+                                      <TrendingUp className="w-3" /> Rendimiento
                                     </button>
-                                    {user.role === "superadmin" && (
+                                    {b.id !== "sede_central" && user.role === "superadmin" && (
                                       <button
                                         onClick={() => handleEditBranch(b)}
-                                        className="text-[10px] font-bold text-orange-400 hover:bg-orange-500/10 px-3 py-1.5 rounded-lg transition-colors"
+                                        className="text-[10px] font-bold text-orange-400 hover:bg-orange-500/10 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
                                       >
                                         Editar
                                       </button>
                                     )}
-                                    {user.role === "superadmin" && (
+                                    {b.id !== "sede_central" && user.role === "superadmin" && (
                                       <button
                                         onClick={() => handleDeleteBranch(b)}
-                                        className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-3 py-1.5 rounded-lg transition-colors"
+                                        className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
                                       >
                                         Eliminar
                                       </button>
@@ -17670,6 +18452,27 @@ export default function App() {
               </motion.div>
             )}
 
+            {view === "branch_calendar" && (
+              <motion.div
+                key="branch_calendar"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
+              >
+                {/* Calendario y Reloj de Operaciones */}
+                <BranchCalendarClockPanel
+                  branchMode={branchMode}
+                  goldPurchases={goldPurchases}
+                  clients={clients}
+                  onViewPurchase={(purchase) => {
+                    setViewingPurchase(purchase);
+                    setShowViewPurchaseModal(true);
+                  }}
+                />
+              </motion.div>
+            )}
+
             {view === "branch_clients" && (
               <motion.div
                 key="branch_clients"
@@ -18173,7 +18976,7 @@ export default function App() {
                                         if (c.recommendedBy) {
                                           const matchedRef = referrers.find(
                                             (r) =>
-                                              r.branchId === branchMode &&
+                                              (r.branchId === branchMode || (branchMode === null && (!r.branchId || r.branchId === "sede_central" || r.branchId === "" || r.branchId === "central"))) &&
                                               r.name.toLowerCase() ===
                                                 c.recommendedBy!.toLowerCase(),
                                           );
@@ -18783,8 +19586,51 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Sub-tabs Selector for Caja Chica */}
+                <div className="flex border-b border-white/5 pb-1 gap-2">
+                  <button
+                    onClick={() => setPettyCashSubTab("operations")}
+                    className={`pb-3 px-6 text-sm font-bold relative transition-all ${
+                      pettyCashSubTab === "operations"
+                        ? "text-amber-500 font-extrabold"
+                        : "text-zinc-500 hover:text-zinc-300"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <Coins className="w-4 h-4" />
+                      Operaciones y Movimientos
+                    </span>
+                    {pettyCashSubTab === "operations" && (
+                      <motion.div
+                        layoutId="activePettyCashTabLine"
+                        className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500"
+                      />
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setPettyCashSubTab("auditing")}
+                    className={`pb-3 px-6 text-sm font-bold relative transition-all ${
+                      pettyCashSubTab === "auditing"
+                        ? "text-amber-500 font-extrabold"
+                        : "text-zinc-500 hover:text-zinc-300"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <TrendingUp className="w-4 h-4" />
+                      Auditoría y Fluctuaciones de Caja
+                    </span>
+                    {pettyCashSubTab === "auditing" && (
+                      <motion.div
+                        layoutId="activePettyCashTabLine"
+                        className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500"
+                      />
+                    )}
+                  </button>
+                </div>
+
                 {/* Cash Stats */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {pettyCashSubTab === "operations" && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {(() => {
                     const latestClosure = [...branchClosures]
                       .filter((c) => c.branchId === branchMode)
@@ -19009,9 +19855,13 @@ export default function App() {
                     );
                   })()}
                 </div>
+                )}
 
-                {/* Cash Flow Weekly Dashboard Summary */}
-                <div className="bg-zinc-900/50 p-6 md:p-8 rounded-[32px] border border-white/5 relative overflow-hidden">
+                {/* Auditing & Fluctuation Sub-tab View */}
+                {pettyCashSubTab === "auditing" && (
+                  <div className="space-y-8">
+                    {/* Cash Flow Weekly Dashboard Summary */}
+                    <div className="bg-zinc-900/50 p-6 md:p-8 rounded-[32px] border border-white/5 relative overflow-hidden shadow-2xl">
                   <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mb-8">
                     <div>
                       <div className="flex items-center gap-2 mb-1">
@@ -19056,19 +19906,56 @@ export default function App() {
                   </div>
 
                   {/* Summary Metric Counters */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Total Ingresos</p>
-                      <p className="text-xl font-mono font-black text-emerald-400">+{formatNumber(chartTotals.totalIn)} BS</p>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div className="bg-emerald-500/[0.02] border border-emerald-500/10 p-5 rounded-2xl relative overflow-hidden group hover:border-emerald-500/20 hover:bg-emerald-500/[0.04] transition-all">
+                      <div className="absolute top-2 right-2 p-1.5 bg-emerald-500/10 rounded-lg">
+                        <ArrowUpRight className="w-4 h-4 text-emerald-400 animate-pulse" />
+                      </div>
+                      <p className="text-[10px] text-emerald-400/70 uppercase font-black tracking-widest mb-1">
+                        Total Ingresos
+                      </p>
+                      <p className="text-2xl font-mono font-black text-emerald-400">
+                        +{formatNumber(chartTotals.totalIn)}{" "}
+                        <span className="text-xs font-normal">BS</span>
+                      </p>
+                      <p className="text-[9px] text-zinc-500 mt-2 font-medium">
+                        Entradas acumuladas en el período seleccionado
+                      </p>
                     </div>
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Total Egresos</p>
-                      <p className="text-xl font-mono font-black text-red-400">-{formatNumber(chartTotals.totalOut)} BS</p>
+
+                    <div className="bg-rose-500/[0.02] border border-rose-500/10 p-5 rounded-2xl relative overflow-hidden group hover:border-rose-500/20 hover:bg-rose-500/[0.04] transition-all">
+                      <div className="absolute top-2 right-2 p-1.5 bg-rose-500/10 rounded-lg">
+                        <ArrowDownRight className="w-4 h-4 text-rose-400" />
+                      </div>
+                      <p className="text-[10px] text-rose-400/70 uppercase font-black tracking-widest mb-1">
+                        Total Egresos
+                      </p>
+                      <p className="text-2xl font-mono font-black text-rose-400">
+                        -{formatNumber(chartTotals.totalOut)}{" "}
+                        <span className="text-xs font-normal">BS</span>
+                      </p>
+                      <p className="text-[9px] text-zinc-500 mt-2 font-medium">
+                        Salidas acumuladas en el período seleccionado
+                      </p>
                     </div>
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Flujo Neto</p>
-                      <p className={`text-xl font-mono font-black ${chartTotals.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                        {chartTotals.net >= 0 ? "+" : ""}{formatNumber(chartTotals.net)} BS
+
+                    <div className={`border p-5 rounded-2xl relative overflow-hidden group transition-all ${
+                      chartTotals.net >= 0 
+                        ? "bg-emerald-500/[0.01] border-emerald-500/10 hover:border-emerald-500/20" 
+                        : "bg-rose-500/[0.01] border-rose-500/10 hover:border-rose-500/20"
+                    }`}>
+                      <div className={`absolute top-2 right-2 p-1.5 rounded-lg ${chartTotals.net >= 0 ? "bg-emerald-500/10" : "bg-rose-500/10"}`}>
+                        <Scale className={`w-4 h-4 ${chartTotals.net >= 0 ? "text-emerald-400" : "text-rose-400"}`} />
+                      </div>
+                      <p className={`text-[10px] uppercase font-black tracking-widest mb-1 ${chartTotals.net >= 0 ? "text-emerald-400/70" : "text-rose-400/70"}`}>
+                        Flujo Neto de Caja
+                      </p>
+                      <p className={`text-2xl font-mono font-black ${chartTotals.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {chartTotals.net >= 0 ? "+" : ""}{formatNumber(chartTotals.net)}{" "}
+                        <span className="text-xs font-normal">BS</span>
+                      </p>
+                      <p className="text-[9px] text-zinc-500 mt-2 font-medium">
+                        Balance neto para toma de decisiones tácticas
                       </p>
                     </div>
                   </div>
@@ -19181,41 +20068,64 @@ export default function App() {
                   </div>
 
                   {/* Micro stats boxes */}
-                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Cierres Analizados</p>
-                      <p className="text-xl font-mono font-black text-zinc-350">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <div className="bg-zinc-900/60 p-4 rounded-2xl border border-white/5 hover:border-white/10 transition-colors">
+                      <div className="flex justify-between items-start mb-2">
+                        <p className="text-[10px] text-zinc-500 uppercase font-black tracking-wider">Cierres Analizados</p>
+                        <span className="p-1 bg-zinc-800/80 rounded mt-0.5"><Clock className="w-3 h-3 text-zinc-400" /></span>
+                      </div>
+                      <p className="text-2xl font-mono font-black text-white">
                         {closureDifferencesTrendData.stats.totalClosuresCount}
                       </p>
+                      <p className="text-[9px] text-zinc-500 mt-1">Historial completo medido</p>
                     </div>
                     
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Tasa de Desviación</p>
-                      <p className="text-xl font-mono font-black text-amber-500">
+                    <div className={`p-4 rounded-2xl border transition-colors ${
+                      closureDifferencesTrendData.stats.errorPercentage > 0
+                        ? "bg-amber-500/[0.01] border-amber-500/10 hover:border-amber-500/20"
+                        : "bg-zinc-900/60 border-white/5 hover:border-white/10"
+                    }`}>
+                      <div className="flex justify-between items-start mb-2">
+                        <p className="text-[10px] text-zinc-500 uppercase font-black tracking-wider">Tasa de Desviación</p>
+                        <span className="p-1 bg-amber-500/10 rounded mt-0.5"><AlertTriangle className="w-3 h-3 text-amber-500" /></span>
+                      </div>
+                      <p className="text-2xl font-mono font-black text-amber-500">
                         {formatNumber(closureDifferencesTrendData.stats.errorPercentage)}% 
-                        <span className="text-[9px] text-zinc-500 font-sans font-normal ml-1">
-                          ({closureDifferencesTrendData.stats.errorCount} cierres)
-                        </span>
+                      </p>
+                      <p className="text-[9px] text-zinc-500 mt-1">
+                        {closureDifferencesTrendData.stats.errorCount} cierres con descuadre
                       </p>
                     </div>
 
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Diferencia Promedio</p>
-                      <p className={`text-xl font-mono font-black ${closureDifferencesTrendData.stats.average < 0 ? "text-rose-400" : closureDifferencesTrendData.stats.average > 0 ? "text-emerald-400" : "text-zinc-400"}`}>
+                    <div className={`p-4 rounded-2xl border transition-colors ${
+                      closureDifferencesTrendData.stats.average < 0
+                        ? "bg-rose-500/[0.01] border-rose-500/10 hover:border-rose-500/20"
+                        : closureDifferencesTrendData.stats.average > 0
+                        ? "bg-emerald-500/[0.01] border-emerald-500/10 hover:border-emerald-500/20"
+                        : "bg-zinc-900/60 border-white/5 hover:border-white/10"
+                    }`}>
+                      <div className="flex justify-between items-start mb-2">
+                        <p className="text-[10px] text-zinc-500 uppercase font-black tracking-wider">Diferencia Promedio</p>
+                        <span className="p-1 bg-zinc-800/80 rounded mt-0.5"><Scale className="w-3 h-3 text-zinc-400" /></span>
+                      </div>
+                      <p className={`text-2xl font-mono font-black ${closureDifferencesTrendData.stats.average < 0 ? "text-rose-450" : closureDifferencesTrendData.stats.average > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
                         {closureDifferencesTrendData.stats.average > 0 ? "+" : ""}
-                        {formatNumber(closureDifferencesTrendData.stats.average)} BS
+                        {formatNumber(closureDifferencesTrendData.stats.average)}<span className="text-[10px] font-sans font-normal ml-0.5"> BS</span>
                       </p>
+                      <p className="text-[9px] text-zinc-500 mt-1">Promedio de descuadres reales</p>
                     </div>
 
-                    <div className="bg-zinc-950/40 p-4 rounded-2xl border border-white/5">
-                      <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">Máximos Registrados</p>
-                      <div className="flex flex-col text-[10px] font-mono mt-0.5">
-                        <span className="text-emerald-400 flex justify-between">
-                          Sobrante: <span className="font-extrabold">+{formatNumber(closureDifferencesTrendData.stats.bestSobrante)} BS</span>
-                        </span>
-                        <span className="text-rose-450 flex justify-between mt-0.5">
-                          Faltante: <span className="font-extrabold">{formatNumber(closureDifferencesTrendData.stats.worstFaltante)} BS</span>
-                        </span>
+                    <div className="bg-zinc-900/60 p-4 rounded-2xl border border-white/5 hover:border-white/10 transition-colors">
+                      <p className="text-[10px] text-zinc-500 uppercase font-black tracking-wider mb-2">Máximos Históricos</p>
+                      <div className="space-y-1.5 font-mono text-[10px]">
+                        <div className="flex justify-between items-center bg-emerald-500/5 px-2 py-1 rounded">
+                          <span className="text-zinc-400">Sobrante:</span>
+                          <span className="text-emerald-400 font-extrabold font-mono">+{formatNumber(closureDifferencesTrendData.stats.bestSobrante)} BS</span>
+                        </div>
+                        <div className="flex justify-between items-center bg-rose-500/5 px-2 py-1 rounded">
+                          <span className="text-zinc-400">Faltante:</span>
+                          <span className="text-rose-450 font-extrabold font-mono">{formatNumber(closureDifferencesTrendData.stats.worstFaltante)} BS</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -19328,9 +20238,12 @@ export default function App() {
                     )}
                   </div>
                 </div>
+                </div>
+                )}
 
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                  {/* Moves List */}
+                {pettyCashSubTab === "operations" && (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    {/* Moves List */}
                   <div className="bg-zinc-900 rounded-[32px] border border-white/5 overflow-hidden flex flex-col h-[600px]">
                     <div className="p-6 border-b border-white/5 bg-zinc-900/50 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                       <h3 className="font-bold text-zinc-100 flex items-center gap-2">
@@ -19605,6 +20518,7 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+                )}
               </motion.div>
             )}
 
@@ -21913,6 +22827,8 @@ export default function App() {
                         <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
                           {settingsSubTab === "company" ? (
                             <Building2 className="w-6 h-6" />
+                          ) : settingsSubTab === "network" ? (
+                            <Network className="w-6 h-6" />
                           ) : (
                             <Database className="w-6 h-6" />
                           )}
@@ -21921,11 +22837,15 @@ export default function App() {
                           <h2 className="text-xl font-bold text-zinc-100">
                             {settingsSubTab === "company"
                               ? "Configuración de Empresa"
+                              : settingsSubTab === "network"
+                              ? "Configuración de Red / Servidor"
                               : "Administrar Base de Datos"}
                           </h2>
                           <p className="text-sm text-zinc-400">
                             {settingsSubTab === "company"
                               ? "Estos datos aparecerán en los reportes y el encabezado."
+                              : settingsSubTab === "network"
+                              ? "Establezca la IP local estática o de red para acceso inalámbrico desde tabletas o celulares."
                               : "Configuración de conexión, copias de seguridad de SQLite/MySQL y operaciones de limpieza."}
                           </p>
                         </div>
@@ -21942,6 +22862,16 @@ export default function App() {
                           }`}
                         >
                           Empresa
+                        </button>
+                        <button
+                          onClick={() => setSettingsSubTab("network")}
+                          className={`px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${
+                            settingsSubTab === "network"
+                              ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+                              : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.02] border border-transparent"
+                          }`}
+                        >
+                          <span>Red / IP</span>
                         </button>
                         <button
                           onClick={() => setSettingsSubTab("database")}
@@ -22813,6 +23743,158 @@ export default function App() {
                           </button>
                         </div>
                       </form>
+                    )}
+
+                    {settingsSubTab === "network" && (
+                      <div className="space-y-6">
+                        <div className="bg-zinc-950/40 p-6 rounded-2xl border border-white/5 space-y-4">
+                          <h3 className="text-md font-bold text-indigo-400 flex items-center gap-2">
+                            <Globe className="w-5 h-5 text-indigo-400" /> Dirección de Red del Servidor (IP Estática)
+                          </h3>
+                          <p className="text-xs text-zinc-400">
+                            Configure la dirección IP estática/localhost asignada a esta computadora en su red de área local (LAN). Esto actualizará los enlaces generados de acceso y permitirá que otros terminales de caja, tablets y smartphones accedan escribiendo o escaneando esta dirección.
+                          </p>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start pt-2">
+                            <form 
+                              onSubmit={handleSaveCompanySettings}
+                              className="space-y-4"
+                            >
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">
+                                  Dirección IP o Host del Servidor
+                                </label>
+                                <div className="relative">
+                                  <Network className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                                  <input
+                                    type="text"
+                                    required
+                                    value={companyFormData.serverIp || ""}
+                                    onChange={(e) =>
+                                      setCompanyFormData((prev) => ({
+                                        ...prev,
+                                        serverIp: e.target.value.trim(),
+                                      }))
+                                    }
+                                    className="w-full pl-11 pr-4 py-3 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 font-mono"
+                                    placeholder="Ej. 192.168.1.150 o localhost"
+                                  />
+                                </div>
+                                <p className="text-[10px] text-zinc-500">
+                                  Use <code className="text-indigo-400 font-mono">localhost</code> si solo accede desde este equipo, o una IP como <code className="text-indigo-400 font-mono">192.168.1.150</code> para acceso en red local.
+                                </p>
+                              </div>
+
+                              <div className="space-y-2">
+                                <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">
+                                  Puerto de Comunicación
+                                </label>
+                                <input
+                                  type="text"
+                                  disabled
+                                  value="3000"
+                                  className="w-full p-3 bg-zinc-950/60 rounded-xl border border-white/5 text-sm text-zinc-500 font-mono cursor-not-allowed"
+                                />
+                                <p className="text-[9px] text-zinc-600">
+                                  El puerto por defecto de la aplicación es el 3000.
+                                </p>
+                              </div>
+
+                              <div className="pt-2">
+                                <button
+                                  type="submit"
+                                  className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-indigo-600/10"
+                                >
+                                  <CheckCircle2 className="w-4 h-4" /> Guardar IP Estática
+                                </button>
+                              </div>
+                            </form>
+
+                            {/* Connection card and QR code */}
+                            <div className="bg-zinc-950 p-6 rounded-2xl border border-white/5 flex flex-col items-center justify-center text-center space-y-4">
+                              <p className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider">
+                                Enlace de Acceso en Red Local
+                              </p>
+                              
+                              <div className="bg-zinc-90 w-full p-3 bg-zinc-900 border border-white/5 rounded-xl font-mono text-xs text-indigo-400 select-all truncate text-center">
+                                http://{companyFormData.serverIp || "localhost"}:3000
+                              </div>
+
+                              {companyFormData.serverIp && companyFormData.serverIp !== "localhost" ? (
+                                <div className="space-y-3 flex flex-col items-center">
+                                  <div className="p-3 bg-white rounded-2xl">
+                                    <img
+                                      src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=http://${companyFormData.serverIp}:3000`}
+                                      alt="QR Code de Acceso"
+                                      className="w-32 h-32"
+                                      referrerPolicy="no-referrer"
+                                    />
+                                  </div>
+                                  <p className="text-[10px] text-zinc-500 max-w-[200px]">
+                                    Escanee este código con su smartphone o tablet en la misma red local Wi-Fi para ingresar al sistema.
+                                  </p>
+                                </div>
+                              ) : (
+                                <div className="py-8 flex flex-col items-center justify-center text-zinc-600 border border-dashed border-white/5 rounded-xl px-4 w-full">
+                                  <Globe className="w-10 h-10 opacity-20 mb-2" />
+                                  <p className="text-[10px] leading-relaxed max-w-[200px]">
+                                    Configure una IP de red (ej. 192.168.1.x) para habilitar el código QR de acceso móvil.
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Informative Steps for Windows Configuration */}
+                        <div className="bg-zinc-900 border border-white/5 p-6 rounded-3xl space-y-4">
+                          <h4 className="text-xs font-bold text-zinc-200 uppercase tracking-wider flex items-center gap-1.5">
+                            <Info className="w-4 h-4 text-amber-500" /> Guía para configurar IP Estática & Acceso en Windows
+                          </h4>
+                          
+                          <div className="space-y-4 text-xs text-zinc-400 leading-relaxed font-normal">
+                            <div className="space-y-1">
+                              <p className="text-zinc-300 font-extrabold flex items-center gap-1.5">
+                                <span className="bg-zinc-800 text-zinc-400 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono">1</span>
+                                Obtener la IP actual de su computadora:
+                              </p>
+                              <p className="pl-6.5 text-zinc-400 leading-normal">
+                                Presione la tecla <kbd className="bg-zinc-950 px-1.5 py-0.5 rounded border border-white/5 text-zinc-300 font-mono text-[10px]">Windows + R</kbd>, escriba <code className="text-zinc-200 font-mono bg-zinc-950 px-1 py-0.5 rounded border border-white/5">cmd</code> y presione Enter. En la terminal negra escriba <code className="text-zinc-200 font-mono bg-zinc-950 px-1 py-0.5 rounded border border-white/5">ipconfig</code> y busque la línea <strong className="text-zinc-300">"Dirección IPv4"</strong> o <strong className="text-zinc-300">"IPv4 Address"</strong> (suele ser similar a <code className="text-zinc-200 font-mono bg-zinc-950 px-1 py-0.5 rounded border border-white/5">192.168.1.X</code> o <code className="text-zinc-200 font-mono bg-zinc-950 px-1 py-0.5 rounded border border-white/5">192.168.0.X</code>).
+                              </p>
+                            </div>
+
+                            <div className="space-y-1">
+                              <p className="text-zinc-300 font-extrabold flex items-center gap-1.5">
+                                <span className="bg-zinc-800 text-zinc-400 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono">2</span>
+                                Fijar la IP estática en Windows:
+                              </p>
+                              <p className="pl-6.5 text-zinc-400 leading-normal">
+                                Vaya al Panel de Control → Centro de redes y recursos compartidos → Cambiar configuración del adaptador. Haga clic derecho en su adaptador de red (Wi-Fi o Ethernet) → <strong className="text-zinc-300">Propiedades</strong>. Seleccione <strong className="text-zinc-300">"Protocolo de Internet versión 4 (TCP/IPv4)"</strong> y de clic en Propiedades. Seleccione "Usar la siguiente dirección IP" y complete la dirección IPv4 obtenida anteriormente para fijarla permanentemente.
+                              </p>
+                            </div>
+
+                            <div className="space-y-1">
+                              <p className="text-zinc-300 font-extrabold flex items-center gap-1.5">
+                                <span className="bg-zinc-800 text-zinc-400 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono">3</span>
+                                Abrir el Puerto 3000 en el Firewall de Windows (¡Crucial!):
+                              </p>
+                              <div className="pl-6.5 text-zinc-400 leading-normal space-y-1">
+                                <p>Para que otros equipos puedan conectarse, Windows necesita permitir tráfico entrante en el puerto 3000:</p>
+                                <ul className="list-disc pl-5 space-y-1">
+                                  <li>Abra el Firewall de Windows Defender con Seguridad Avanzada.</li>
+                                  <li>Haga clic en <strong className="text-zinc-300">Reglas de entrada (Inbound Rules)</strong> y luego en "Nueva Regla".</li>
+                                  <li>Seleccione <strong className="text-zinc-300">Puerto (Port)</strong> y haga clic en Siguiente.</li>
+                                  <li>Seleccione TCP e ingrese <code className="text-zinc-200 font-mono bg-zinc-950 px-1 py-0.5 rounded border border-white/5">3000</code> en puertos locales específicos.</li>
+                                  <li>Seleccione "Permitir la conexión", marque los tres perfiles (Dominio, Privado, Público), y asígnele un nombre como <code className="text-emerald-400 font-bold">Aurum 3000</code>.</li>
+                                </ul>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Audit log for network adjustments */}
+                        {renderConfigAuditLogs("network")}
+                      </div>
                     )}
 
                     {settingsSubTab === "database" && !isDbUnlocked && (
@@ -24162,6 +25244,9 @@ DB_NAME=aurum_gestor
                             </div>
                           </div>
                         </div>
+
+                        {/* Audit log for database configurations */}
+                        {renderConfigAuditLogs("database")}
                       </div>
                     )}
                   </div>
@@ -25373,7 +26458,7 @@ DB_NAME=aurum_gestor
                               ) {
                                 const matchedRef = referrers.find(
                                   (r) =>
-                                    r.branchId === branchMode &&
+                                    (r.branchId === branchMode || (branchMode === null && (!r.branchId || r.branchId === "sede_central" || r.branchId === "" || r.branchId === "central"))) &&
                                     r.name.toLowerCase() ===
                                       selectedClient.recommendedBy!.toLowerCase(),
                                 );
@@ -25426,7 +26511,12 @@ DB_NAME=aurum_gestor
                           {(() => {
                             const query = clientSearch.toLowerCase().trim();
                             const filtered = clients
-                              .filter((c) => c.branchId === branchMode)
+                              .filter((c) => {
+                                if (!branchMode) {
+                                  return !c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === "";
+                                }
+                                return c.branchId === branchMode;
+                              })
                               .filter(
                                 (c) =>
                                   c.name.toLowerCase().includes(query) ||
@@ -33910,12 +35000,11 @@ DB_NAME=aurum_gestor
               initial={{ scale: 0.95, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.95, opacity: 0, y: 20 }}
-              className="relative w-full max-w-lg bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
+              className="relative w-full max-w-5xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
             >
               <div className="p-8 border-b border-white/5 bg-zinc-900/50 flex justify-between items-center">
                 <h3 className="text-xl font-bold text-white flex items-center gap-2">
-                  <Lock className="w-5 h-5 text-blue-500" /> Realizar Cierre de
-                  Sucursal
+                  <Lock className="w-5 h-5 text-blue-500" /> Realizar Cierre de Sucursal
                 </h3>
                 <button
                   onClick={() => setShowAddClosureModal(false)}
@@ -33925,392 +35014,384 @@ DB_NAME=aurum_gestor
                 </button>
               </div>
 
-              <form onSubmit={handleCreateClosure} className="p-8 space-y-6">
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5 space-y-1">
-                    <p className="text-[10px] text-zinc-500 uppercase font-bold">
-                      Saldo Inicial
-                    </p>
-                    <p className="text-xl font-mono font-bold text-zinc-300">
-                      {formatNumber(closureFormData.initialBalance || 0)} BS
-                    </p>
-                  </div>
-                  <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5 space-y-1">
-                    <p className="text-[10px] text-emerald-500/70 uppercase font-bold">
-                      Saldo Final (Calculado)
-                    </p>
-                    <p className="text-xl font-mono font-bold text-emerald-500">
-                      {formatNumber(closureFormData.finalBalance || 0)} BS
-                    </p>
-                  </div>
-                </div>
+              {(() => {
+                const calculatedBal = closureFormData.finalBalance || 0;
+                const physical =
+                  closureFormData.physicalBalance !== undefined
+                    ? closureFormData.physicalBalance
+                    : calculatedBal;
+                const pdiff = parseFloat(
+                  (physical - calculatedBal).toFixed(2),
+                );
+                const hasDifference = pdiff !== 0;
 
-                {/* Arqueo de efectivo físico */}
-                {(() => {
-                  const calculatedBal = closureFormData.finalBalance || 0;
-                  const physical =
-                    closureFormData.physicalBalance !== undefined
-                      ? closureFormData.physicalBalance
-                      : calculatedBal;
-                  const pdiff = parseFloat(
-                    (physical - calculatedBal).toFixed(2),
-                  );
-                  const hasDifference = pdiff !== 0;
+                const denoms = getDenominations(
+                  companySettings?.cashDenominations,
+                );
+                const detailedSum = Object.entries(closureCashCounts).reduce(
+                  (acc, [d, q]) => acc + parseFloat(d) * ((q as number) || 0),
+                  0,
+                );
+                const hasDetailedCounts = Object.values(
+                  closureCashCounts,
+                ).some((v) => (v as number) > 0);
 
-                  const denoms = getDenominations(
-                    companySettings?.cashDenominations,
-                  );
-                  const detailedSum = Object.entries(closureCashCounts).reduce(
-                    (acc, [d, q]) => acc + parseFloat(d) * ((q as number) || 0),
-                    0,
-                  );
-                  const hasDetailedCounts = Object.values(
-                    closureCashCounts,
-                  ).some((v) => (v as number) > 0);
-
-                  return (
-                    <div className="space-y-4">
-                      {/* Desglose de Billetes y Monedas */}
-                      <div className="bg-zinc-950 p-5 rounded-2xl border border-white/5 space-y-4">
-                        <div className="flex justify-between items-center pb-2 border-b border-white/5">
-                          <span className="text-[10px] font-bold uppercase text-indigo-400 tracking-wider flex items-center gap-1.5">
-                            <Coins className="w-4 h-4 text-indigo-400" />{" "}
-                            Desglose de Monedas y Billetes (Corte de Caja)
-                          </span>
-                          {hasDetailedCounts && (
-                            <span className="text-[10px] font-mono font-bold bg-indigo-500/10 text-indigo-400 px-2 py-0.5 rounded-lg border border-indigo-500/20">
-                              Total Detallado: {formatNumber(detailedSum)} BS
+                return (
+                  <form onSubmit={handleCreateClosure} className="p-8">
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                      {/* Left Column: Cash breakdown pane */}
+                      <div className="lg:col-span-5 space-y-4">
+                        <div className="bg-zinc-950 p-6 rounded-2xl border border-white/5 space-y-4">
+                          <div className="flex justify-between items-center pb-2 border-b border-white/5">
+                            <span className="text-[11px] font-bold uppercase text-indigo-400 tracking-wider flex items-center gap-1.5">
+                              <Coins className="w-4 h-4 text-indigo-400" />{" "}
+                              Detalle del Efectivo (Diferenciado)
                             </span>
-                          )}
-                        </div>
+                          </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                          {/* Billetes Column */}
-                          <div className="space-y-2">
-                            <h5 className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-white/5 pb-1">
-                              Billetes
-                            </h5>
-                            <div className="max-h-[160px] overflow-y-auto custom-scrollbar space-y-1.5 pr-1">
-                              {denoms
-                                .filter((d) => d >= 10)
-                                .map((denom) => (
-                                  <div
-                                    key={denom}
-                                    className="flex items-center justify-between text-xs py-0.5"
-                                  >
-                                    <span className="text-zinc-300 font-medium font-mono min-w-[50px]">
-                                      {denom} BS
-                                    </span>
-                                    <div className="flex items-center gap-1.5">
-                                      <input
-                                        type="number"
-                                        min="0"
-                                        placeholder="0"
-                                        value={closureCashCounts[denom] || ""}
-                                        onChange={(e) => {
-                                          const qty = parseInt(
-                                            e.target.value,
-                                            10,
-                                          );
-                                          const updatedQty = isNaN(qty)
-                                            ? 0
-                                            : qty;
-                                          const newCounts = {
-                                            ...closureCashCounts,
-                                            [denom]: updatedQty,
-                                          };
-                                          setClosureCashCounts(newCounts);
-                                          const sum = Object.entries(
-                                            newCounts,
-                                          ).reduce(
-                                            (acc, [d, q]) =>
-                                              acc +
-                                              parseFloat(d) *
-                                                ((q as number) || 0),
-                                            0,
-                                          );
-                                          const roundedSum = parseFloat(
-                                            sum.toFixed(2),
-                                          );
-                                          const diff = parseFloat(
-                                            (
-                                              roundedSum - calculatedBal
-                                            ).toFixed(2),
-                                          );
-                                          setClosureFormData((prev) => ({
-                                            ...prev,
-                                            physicalBalance: roundedSum,
-                                            differenceAmount: diff,
-                                            cashCountBreakdown:
-                                              JSON.stringify(newCounts),
-                                          }));
-                                        }}
-                                        className="w-14 p-1 bg-zinc-900 border border-white/10 rounded text-center text-xs font-mono text-zinc-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                                      />
-                                      <span className="text-[10px] text-zinc-500 font-mono w-14 text-right">
-                                        {formatNumber(
-                                          (closureCashCounts[denom] || 0) *
-                                            denom,
-                                        )}{" "}
-                                        BS
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            {/* Billetes Column */}
+                            <div className="space-y-2">
+                              <h5 className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-b border-white/5 pb-1">
+                                Billetes
+                              </h5>
+                              <div className="max-h-[280px] overflow-y-auto custom-scrollbar space-y-2 pr-1">
+                                {denoms
+                                  .filter((d) => d >= 10)
+                                  .map((denom) => (
+                                    <div
+                                      key={denom}
+                                      className="flex items-center justify-between text-xs py-1 hover:bg-zinc-900/50 rounded px-1 transition-colors"
+                                    >
+                                      <span className="text-zinc-300 font-medium font-mono min-w-[50px]">
+                                        {denom} BS
                                       </span>
+                                      <div className="flex items-center gap-1.5">
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          placeholder="0"
+                                          value={closureCashCounts[denom] || ""}
+                                          onChange={(e) => {
+                                            const qty = parseInt(
+                                              e.target.value,
+                                              10,
+                                            );
+                                            const updatedQty = isNaN(qty)
+                                              ? 0
+                                              : qty;
+                                            const newCounts = {
+                                              ...closureCashCounts,
+                                              [denom]: updatedQty,
+                                            };
+                                            setClosureCashCounts(newCounts);
+                                            const sum = Object.entries(
+                                              newCounts,
+                                            ).reduce(
+                                              (acc, [d, q]) =>
+                                                acc +
+                                                parseFloat(d) *
+                                                  ((q as number) || 0),
+                                              0,
+                                            );
+                                            const roundedSum = parseFloat(
+                                              sum.toFixed(2),
+                                            );
+                                            const diff = parseFloat(
+                                              (
+                                                roundedSum - calculatedBal
+                                              ).toFixed(2),
+                                            );
+                                            setClosureFormData((prev) => ({
+                                              ...prev,
+                                              physicalBalance: roundedSum,
+                                              differenceAmount: diff,
+                                              cashCountBreakdown:
+                                                JSON.stringify(newCounts),
+                                            }));
+                                          }}
+                                          className="w-14 p-1 bg-zinc-900 border border-white/10 rounded text-center text-xs font-mono text-zinc-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                        />
+                                        <span className="text-[10px] text-zinc-500 font-mono w-14 text-right">
+                                          {formatNumber(
+                                            (closureCashCounts[denom] || 0) *
+                                              denom,
+                                          )}{" "}
+                                          BS
+                                        </span>
+                                      </div>
                                     </div>
-                                  </div>
-                                ))}
+                                  ))}
+                              </div>
                             </div>
-                          </div>
 
-                          {/* Monedas Column */}
-                          <div className="space-y-2">
-                            <h5 className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest border-b border-white/5 pb-1">
-                              Monedas
-                            </h5>
-                            <div className="max-h-[160px] overflow-y-auto custom-scrollbar space-y-1.5 pr-1">
-                              {denoms
-                                .filter((d) => d < 10)
-                                .map((denom) => (
-                                  <div
-                                    key={denom}
-                                    className="flex items-center justify-between text-xs py-0.5"
-                                  >
-                                    <span className="text-zinc-300 font-medium font-mono min-w-[50px]">
-                                      {denom >= 1
-                                        ? `${denom} BS`
-                                        : `${(denom * 100).toFixed(0)} C`}
-                                    </span>
-                                    <div className="flex items-center gap-1.5">
-                                      <input
-                                        type="number"
-                                        min="0"
-                                        placeholder="0"
-                                        value={closureCashCounts[denom] || ""}
-                                        onChange={(e) => {
-                                          const qty = parseInt(
-                                            e.target.value,
-                                            10,
-                                          );
-                                          const updatedQty = isNaN(qty)
-                                            ? 0
-                                            : qty;
-                                          const newCounts = {
-                                            ...closureCashCounts,
-                                            [denom]: updatedQty,
-                                          };
-                                          setClosureCashCounts(newCounts);
-                                          const sum = Object.entries(
-                                            newCounts,
-                                          ).reduce(
-                                            (acc, [d, q]) =>
-                                              acc +
-                                              parseFloat(d) *
-                                                ((q as number) || 0),
-                                            0,
-                                          );
-                                          const roundedSum = parseFloat(
-                                            sum.toFixed(2),
-                                          );
-                                          const diff = parseFloat(
-                                            (
-                                              roundedSum - calculatedBal
-                                            ).toFixed(2),
-                                          );
-                                          setClosureFormData((prev) => ({
-                                            ...prev,
-                                            physicalBalance: roundedSum,
-                                            differenceAmount: diff,
-                                            cashCountBreakdown:
-                                              JSON.stringify(newCounts),
-                                          }));
-                                        }}
-                                        className="w-14 p-1 bg-zinc-900 border border-white/10 rounded text-center text-xs font-mono text-zinc-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                                      />
-                                      <span className="text-[10px] text-zinc-500 font-mono w-14 text-right">
-                                        {formatNumber(
-                                          (closureCashCounts[denom] || 0) *
-                                            denom,
-                                        )}{" "}
-                                        BS
+                            {/* Monedas Column */}
+                            <div className="space-y-2">
+                              <h5 className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-b border-white/5 pb-1">
+                                Monedas
+                              </h5>
+                              <div className="max-h-[280px] overflow-y-auto custom-scrollbar space-y-2 pr-1">
+                                {denoms
+                                  .filter((d) => d < 10)
+                                  .map((denom) => (
+                                    <div
+                                      key={denom}
+                                      className="flex items-center justify-between text-xs py-1 hover:bg-zinc-900/50 rounded px-1 transition-colors"
+                                    >
+                                      <span className="text-zinc-300 font-medium font-mono min-w-[50px]">
+                                        {denom >= 1
+                                          ? `${denom} BS`
+                                          : `${(denom * 100).toFixed(0)} C`}
                                       </span>
+                                      <div className="flex items-center gap-1.5">
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          placeholder="0"
+                                          value={closureCashCounts[denom] || ""}
+                                          onChange={(e) => {
+                                            const qty = parseInt(
+                                              e.target.value,
+                                              10,
+                                            );
+                                            const updatedQty = isNaN(qty)
+                                              ? 0
+                                              : qty;
+                                            const newCounts = {
+                                              ...closureCashCounts,
+                                              [denom]: updatedQty,
+                                            };
+                                            setClosureCashCounts(newCounts);
+                                            const sum = Object.entries(
+                                              newCounts,
+                                            ).reduce(
+                                              (acc, [d, q]) =>
+                                                acc +
+                                                parseFloat(d) *
+                                                  ((q as number) || 0),
+                                              0,
+                                            );
+                                            const roundedSum = parseFloat(
+                                              sum.toFixed(2),
+                                            );
+                                            const diff = parseFloat(
+                                              (
+                                                roundedSum - calculatedBal
+                                              ).toFixed(2),
+                                            );
+                                            setClosureFormData((prev) => ({
+                                              ...prev,
+                                              physicalBalance: roundedSum,
+                                              differenceAmount: diff,
+                                              cashCountBreakdown:
+                                                JSON.stringify(newCounts),
+                                            }));
+                                          }}
+                                          className="w-14 p-1 bg-zinc-900 border border-white/10 rounded text-center text-xs font-mono text-zinc-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                        />
+                                        <span className="text-[10px] text-zinc-500 font-mono w-14 text-right">
+                                          {formatNumber(
+                                            (closureCashCounts[denom] || 0) *
+                                              denom,
+                                          )}{" "}
+                                          BS
+                                        </span>
+                                      </div>
                                     </div>
-                                  </div>
-                                ))}
-                            </div>
-                          </div>
-                        </div>
-
-                        {hasDetailedCounts && (
-                          <div className="pt-2 border-t border-white/5 flex justify-between items-center text-[10px]">
-                            <span className="text-zinc-500">
-                              ¿Utilizar este desglose para sumarizar el efectivo
-                              real?
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const roundedSum = parseFloat(
-                                  detailedSum.toFixed(2),
-                                );
-                                const diff = parseFloat(
-                                  (roundedSum - calculatedBal).toFixed(2),
-                                );
-                                setClosureFormData((prev) => ({
-                                  ...prev,
-                                  physicalBalance: roundedSum,
-                                  differenceAmount: diff,
-                                  cashCountBreakdown:
-                                    JSON.stringify(closureCashCounts),
-                                }));
-                              }}
-                              className="px-2.5 py-1 bg-indigo-500/10 text-indigo-400 rounded hover:bg-indigo-500/25 transition-colors border border-indigo-500/20 font-bold"
-                            >
-                              Sincronizar Conteo
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="space-y-2.5 bg-zinc-950 p-5 rounded-2xl border border-white/5">
-                        <div className="flex justify-between items-center">
-                          <label className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider">
-                            Efectivo Real / Físico en Caja (Arqueo){" "}
-                            <span className="text-red-400">*</span>
-                          </label>
-                          <span className="text-[10px] font-mono text-zinc-500">
-                            Formato: 0.00 BS
-                          </span>
-                        </div>
-                        <input
-                          type="number"
-                          step="0.01"
-                          required
-                          min={0}
-                          placeholder="Ingrese la cantidad de efectivo físico"
-                          value={
-                            closureFormData.physicalBalance !== undefined
-                              ? closureFormData.physicalBalance
-                              : closureFormData.finalBalance || 0
-                          }
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            const updatedPhysical = isNaN(val) ? 0 : val;
-                            const diff = parseFloat(
-                              (updatedPhysical - calculatedBal).toFixed(2),
-                            );
-                            setClosureFormData((prev) => ({
-                              ...prev,
-                              physicalBalance: updatedPhysical,
-                              differenceAmount: diff,
-                            }));
-                          }}
-                          className="w-full p-4 bg-zinc-900 rounded-xl border border-white/10 text-base font-bold font-mono text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/30"
-                        />
-                        <p className="text-[9px] text-zinc-500 leading-normal">
-                          Indique la cantidad exacta de efectivo físico en caja
-                          al momento de cerrar. Por defecto se pre-llena con la
-                          suma del desglose o el calculado por el sistema
-                          (cierre a mano).
-                        </p>
-                      </div>
-
-                      {hasDifference && (
-                        <div className="bg-red-500/10 border border-red-500/20 p-5 rounded-2xl space-y-4 transition-all duration-300">
-                          <div className="flex items-center gap-3">
-                            <span className="p-1.5 rounded-lg bg-red-500/20 text-red-400 shrink-0">
-                              <AlertCircle className="w-5 h-5 bg-transparent" />
-                            </span>
-                            <div>
-                              <h4 className="text-xs font-black uppercase tracking-wider text-red-400">
-                                Diferencia de Caja Detectada (
-                                {pdiff > 0 ? "Sobrante" : "Faltante"})
-                              </h4>
-                              <p className="text-[10px] text-zinc-400 mt-0.5">
-                                Físico:{" "}
-                                <span className="font-mono font-bold text-zinc-300">
-                                  {formatNumber(physical)} BS
-                                </span>{" "}
-                                vs. Calculado:{" "}
-                                <span className="font-mono font-bold text-zinc-300">
-                                  {formatNumber(calculatedBal)} BS
-                                </span>
-                                .
-                              </p>
-                              <p className="text-sm font-black font-mono text-red-400 mt-1">
-                                Diferencia: {pdiff > 0 ? "+" : ""}
-                                {formatNumber(pdiff)} BS
-                              </p>
+                                  ))}
+                              </div>
                             </div>
                           </div>
 
-                          <div className="space-y-2">
-                            <label className="text-[10px] font-black uppercase text-red-400 tracking-widest flex items-center gap-1">
-                              <span>Justificación del Sobrante/Faltante</span>
-                              <span className="text-xs font-bold text-red-500">
-                                * (Obligatorio)
+                          <div className="mt-4 pt-4 border-t border-white/5 flex flex-col gap-2">
+                            <div className="flex justify-between items-center text-xs bg-zinc-900/40 p-2.5 rounded-xl border border-white/5">
+                              <span className="text-zinc-400">Total Desglosado:</span>
+                              <span className="font-mono font-black text-indigo-400 text-sm">
+                                {formatNumber(detailedSum)} BS
                               </span>
-                            </label>
-                            <textarea
-                              rows={3}
-                              required={hasDifference}
-                              placeholder="Escriba la justificación detallada de la diferencia antes de poder confirmar el cierre diario..."
-                              value={
-                                closureFormData.differenceJustification || ""
-                              }
-                              onChange={(e) =>
-                                setClosureFormData((prev) => ({
-                                  ...prev,
-                                  differenceJustification: e.target.value,
-                                }))
-                              }
-                              className="w-full p-4 bg-zinc-900 rounded-xl border border-red-500/30 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-red-500/30 placeholder-zinc-650 resize-none"
-                            />
-                            <p className="text-[9px] text-red-400/80 leading-relaxed italic">
-                              Es requisito obligatorio justificar la
-                              discrepancia para registrar e imprimir el cierre.
+                            </div>
+
+                            {hasDetailedCounts && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const roundedSum = parseFloat(
+                                    detailedSum.toFixed(2),
+                                  );
+                                  const diff = parseFloat(
+                                    (roundedSum - calculatedBal).toFixed(2),
+                                  );
+                                  setClosureFormData((prev) => ({
+                                    ...prev,
+                                    physicalBalance: roundedSum,
+                                    differenceAmount: diff,
+                                    cashCountBreakdown:
+                                      JSON.stringify(closureCashCounts),
+                                  }));
+                                }}
+                                className="w-full py-2.5 bg-indigo-600/20 hover:bg-indigo-600/35 text-indigo-400 rounded-xl transition-all border border-indigo-500/20 font-bold text-xs uppercase tracking-wider text-center"
+                              >
+                                Sincronizar Conteo con Efectivo Real
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Right Column: Calculations & Submit control */}
+                      <div className="lg:col-span-7 space-y-5">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="bg-zinc-950 p-4 rounded-2xl border border-white/5 space-y-1 hover:border-white/10 transition-colors">
+                            <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">
+                              Saldo Inicial
+                            </p>
+                            <p className="text-xl font-mono font-extrabold text-zinc-300">
+                              {formatNumber(closureFormData.initialBalance || 0)} <span className="text-xs">BS</span>
+                            </p>
+                          </div>
+                          <div className="bg-emerald-500/[0.02] border border-emerald-500/25 p-4 rounded-2xl space-y-1 hover:bg-emerald-500/[0.04] transition-all">
+                            <p className="text-[10px] text-emerald-400 uppercase font-bold tracking-wider">
+                              Saldo Final (Calculado)
+                            </p>
+                            <p className="text-xl font-mono font-extrabold text-emerald-400">
+                              {formatNumber(closureFormData.finalBalance || 0)} <span className="text-xs">BS</span>
                             </p>
                           </div>
                         </div>
-                      )}
+
+                        <div className="space-y-2.5 bg-zinc-950 p-5 rounded-2xl border border-white/5">
+                          <div className="flex justify-between items-center">
+                            <label className="text-[11px] font-black uppercase text-zinc-300 tracking-wider flex items-center gap-1.5">
+                              <Coins className="w-4 h-4 text-amber-500 shrink-0" />
+                              Efectivo Real / Físico en Caja (Arqueo){" "}
+                              <span className="text-red-400">*</span>
+                            </label>
+                            <span className="text-[10px] font-mono text-zinc-500">
+                              Formato: 0.00 BS
+                            </span>
+                          </div>
+                          <input
+                            type="number"
+                            step="0.01"
+                            required
+                            min={0}
+                            placeholder="Ingrese la cantidad de efectivo físico"
+                            value={
+                              closureFormData.physicalBalance !== undefined
+                                ? closureFormData.physicalBalance
+                                : closureFormData.finalBalance || 0
+                            }
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              const updatedPhysical = isNaN(val) ? 0 : val;
+                              const diff = parseFloat(
+                                (updatedPhysical - calculatedBal).toFixed(2),
+                              );
+                              setClosureFormData((prev) => ({
+                                ...prev,
+                                physicalBalance: updatedPhysical,
+                                differenceAmount: diff,
+                              }));
+                            }}
+                            className="w-full p-4 bg-zinc-900 rounded-xl border border-white/10 text-xl font-black font-mono text-white focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+                          />
+                          <p className="text-[10px] text-zinc-500 leading-normal">
+                            Indique con precisión el efectivo físico verificado en el sistema. Se pre-llena de forma asistida mediante el desglose.
+                          </p>
+                        </div>
+
+                        {hasDifference && (
+                          <div className="bg-rose-500/[0.02] border border-rose-500/20 p-5 rounded-2xl space-y-4 transition-all duration-300 shadow-lg">
+                            <div className="flex items-start gap-3">
+                              <span className="p-2 rounded-lg bg-rose-500/20 text-rose-400 shrink-0 mt-0.5">
+                                <AlertTriangle className="w-5 h-5 bg-transparent" />
+                              </span>
+                              <div className="flex-1">
+                                <h4 className="text-xs font-black uppercase tracking-wider text-rose-400">
+                                  Diferencia de Caja Detectada ({pdiff > 0 ? "Sobrante" : "Faltante"})
+                                </h4>
+                                <p className="text-[11px] text-zinc-400 mt-0.5">
+                                  Remanente calculado de{" "}
+                                  <span className="font-mono font-bold text-zinc-300">
+                                    {formatNumber(calculatedBal)} BS
+                                  </span>{" "}
+                                  frente a un arqueo físico de{" "}
+                                  <span className="font-mono font-bold text-white">
+                                    {formatNumber(physical)} BS
+                                  </span>.
+                                </p>
+                                <p className="text-base font-black font-mono text-rose-400 mt-1">
+                                  Diferencia: {pdiff > 0 ? "+" : ""}
+                                  {formatNumber(pdiff)} BS
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-black uppercase text-rose-455 tracking-widest flex items-center gap-1">
+                                <span>Justificación del Sobrante/Faltante</span>
+                                <span className="text-xs font-bold text-rose-500">
+                                  * (Obligatorio)
+                                </span>
+                              </label>
+                              <textarea
+                                rows={2}
+                                required={hasDifference}
+                                placeholder="Escriba el motivo detallado de la discrepancia (ej. error en vuelto, egreso no registrado, etc.)..."
+                                value={
+                                  closureFormData.differenceJustification || ""
+                                }
+                                onChange={(e) =>
+                                  setClosureFormData((prev) => ({
+                                    ...prev,
+                                    differenceJustification: e.target.value,
+                                  }))
+                                }
+                                className="w-full p-3 bg-zinc-900 rounded-xl border border-rose-500/30 text-sm text-zinc-100 placeholder-zinc-650 focus:outline-none focus:ring-2 focus:ring-rose-500/30 resize-none"
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="space-y-1.5">
+                          <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest px-1">
+                            Observaciones de Turno
+                          </label>
+                          <textarea
+                            rows={2}
+                            placeholder="Notas generales sobre anomalías u observaciones en esta jornada de la sucursal..."
+                            value={closureFormData.notes || ""}
+                            onChange={(e) =>
+                              setClosureFormData({
+                                ...closureFormData,
+                                notes: e.target.value,
+                              })
+                            }
+                            className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500/40 resize-none placeholder-zinc-650"
+                          />
+                        </div>
+
+                        <div className="bg-amber-500/5 p-4 rounded-xl border border-amber-500/10 flex gap-3">
+                          <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                          <p className="text-[10px] text-amber-500/75 font-medium leading-normal italic">
+                            Al confirmar esta acción se registrará el Cierre Diario y se guardará de forma inalterable el historial actual de movimientos para prevenir manipulaciones.
+                          </p>
+                        </div>
+
+                        <div className="pt-2">
+                          <button
+                            type="submit"
+                            className="w-full py-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl font-black uppercase tracking-widest transition-all shadow-xl shadow-indigo-600/15"
+                          >
+                            Confirmar Cierre Diario
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  );
-                })()}
-
-                <div className="space-y-1">
-                  <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest px-1">
-                    Observaciones
-                  </label>
-                  <textarea
-                    rows={3}
-                    placeholder="Notas adicionales generales sobre el cierre de hoy (opcional)..."
-                    value={closureFormData.notes || ""}
-                    onChange={(e) =>
-                      setClosureFormData({
-                        ...closureFormData,
-                        notes: e.target.value,
-                      })
-                    }
-                    className="w-full p-4 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none"
-                  />
-                </div>
-
-                <div className="bg-amber-500/5 p-4 rounded-2xl border border-amber-500/10 flex gap-3">
-                  <AlertCircle className="w-5 h-5 text-amber-500 shrink-0" />
-                  <p className="text-[10px] text-amber-500/70 font-medium leading-relaxed italic">
-                    Al realizar el cierre, se registrará el balance final de la
-                    caja para la sucursal. Asegúrese de haber conciliado todos
-                    los de movimientos del día.
-                  </p>
-                </div>
-
-                <div className="pt-4">
-                  <button
-                    type="submit"
-                    className="w-full py-4 bg-blue-600 text-white rounded-2xl font-black uppercase tracking-widest hover:bg-blue-500 transition-all shadow-xl shadow-blue-600/20"
-                  >
-                    Confirmar Cierre Diario
-                  </button>
-                </div>
-              </form>
-            </motion.div>
+                  </form>
+                );
+              })()}
+             </motion.div>
           </div>
         )}
       </AnimatePresence>

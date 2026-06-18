@@ -131,6 +131,7 @@ export interface CompanySettings {
   lowPurityThreshold_pieza?: number;
   lowPurityThreshold_barra?: number;
   notifyEmailOnClosureDifference?: boolean | number;
+  serverIp?: string;
   updatedAt: string;
 }
 
