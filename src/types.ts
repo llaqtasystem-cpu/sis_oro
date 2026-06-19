@@ -1,4 +1,4 @@
-export type MaterialType = 'pieza' | 'barra';
+export type MaterialType = 'pieza' | 'barra' | 'puro' | 'cerrado';
 export type MaterialStatus = 'disponible' | 'fundido' | 'exportado' | 'eliminado' | 'no disponible';
 
 export type UserRole = 'superadmin' | 'admin' | 'operator';

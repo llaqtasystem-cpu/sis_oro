@@ -1,6 +1,8 @@
 import * as React from "react";
 import CustomerDisplay from "./components/CustomerDisplay";
 import BranchCalendarClockPanel from "./components/BranchCalendarClockPanel";
+import { BranchSmeltingAuditPanel } from "./components/BranchSmeltingAuditPanel";
+import jsQR from "jsqr";
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -58,6 +60,7 @@ import {
   FileText,
   FileJson,
   FileCode,
+  QrCode,
   Printer,
   Edit,
   Edit2,
@@ -104,6 +107,8 @@ import {
   RotateCw,
   Network,
   Globe,
+  LayoutGrid,
+  List,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { jsPDF } from "jspdf";
@@ -243,6 +248,9 @@ async function apiFetch(url: string, options?: RequestInit): Promise<any> {
           trimmed.startsWith("<") ||
           trimmed.toLowerCase().includes("<!doctype html>")
         ) {
+          if (method !== "GET") {
+            throw new Error(trimmed.startsWith("<") ? "Error en el servidor backend" : `Límite de peticiones excedido (HTTP ${res.status})`);
+          }
           attempts++;
           if (attempts >= maxAttempts) {
             throw new Error(
@@ -266,7 +274,10 @@ async function apiFetch(url: string, options?: RequestInit): Promise<any> {
           } catch {
             errorMessage = `${errorMessage}: ${text.slice(0, 100)}`;
           }
-          throw new Error(`${errorMessage} (${url})`);
+          const responseError = new Error(errorMessage);
+          (responseError as any).isResponseError = true;
+          (responseError as any).status = res.status;
+          throw responseError;
         }
 
         const data = JSON.parse(text);
@@ -283,11 +294,17 @@ async function apiFetch(url: string, options?: RequestInit): Promise<any> {
         }
         return data;
       } catch (err: any) {
+        if (err.isResponseError) {
+          throw err;
+        }
         if (
           err.message &&
           (err.message.includes("HTTP 429") ||
             err.message.includes("HTML Fallback"))
         ) {
+          throw err;
+        }
+        if (method !== "GET") {
           throw err;
         }
         // For other potential transient network errors while fetching, retry up to maxAttempts
@@ -635,14 +652,21 @@ const Auth = ({
 }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showErrorModal, setShowErrorModal] = useState(false);
   const [username, setUsername] = useState("");
   const [pin, setPin] = useState("");
   const [terminalId] = useState(() =>
     Math.random().toString(36).substring(7).toUpperCase(),
   );
 
-  // Facial Recognition State Variables
-  const [loginMode, setLoginMode] = useState<"pin" | "face">("pin");
+  // Facial Recognition and QR Login State Variables
+  const [loginMode, setLoginMode] = useState<"pin" | "face" | "qr">("pin");
+  
+  // QR Login State Variables
+  const qrVideoRef = useRef<HTMLVideoElement | null>(null);
+  const qrStreamRef = useRef<MediaStream | null>(null);
+  const qrAnimationFrameRef = useRef<number | null>(null);
+
   const [availableUsers, setAvailableUsers] = useState<SystemUser[]>([]);
   const [selectedUser, setSelectedUser] = useState<SystemUser | null>(null);
 
@@ -809,6 +833,8 @@ const Auth = ({
     } catch (err: any) {
       console.error(err);
       setError(err.message || "PIN o usuario incorrecto");
+      setShowErrorModal(true);
+      setPin(""); // Clear the incorrect PIN input so it doesn't stay "colgado"
       playBeep(280, "sawtooth", 0.25);
     } finally {
       setLoading(false);
@@ -1220,6 +1246,162 @@ const Auth = ({
     handleFaceSuccess();
   };
 
+  // Start webcam for QR code detection
+  const startQrCamera = async () => {
+    setError("");
+    setLoginMode("qr");
+  };
+
+  // Stop QR camera stream
+  const stopQrCamera = () => {
+    if (qrAnimationFrameRef.current) {
+      cancelAnimationFrame(qrAnimationFrameRef.current);
+      qrAnimationFrameRef.current = null;
+    }
+    if (qrStreamRef.current) {
+      try {
+        qrStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {
+        console.warn("Error stopping tracks:", e);
+      }
+      qrStreamRef.current = null;
+    }
+    if (qrVideoRef.current) {
+      qrVideoRef.current.srcObject = null;
+    }
+  };
+
+  // Scanning loop for QR code extraction
+  const scanQrFrame = () => {
+    // If we're not scanning or QR stream has been stopped, don't request another frame/loop
+    if (!qrStreamRef.current) {
+      return;
+    }
+
+    if (qrVideoRef.current) {
+      const video = qrVideoRef.current;
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth || 400;
+        canvas.height = video.videoHeight || 400;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          try {
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: "dontInvert",
+            });
+            if (code && code.data.startsWith("AURUM_QR_AUTH:")) {
+              const qrValue = code.data;
+              const parts = qrValue.split(":");
+              if (parts.length >= 3) {
+                const uName = parts[1];
+                const uPin = parts[2];
+                // Success feedback sound!
+                playBeep(980, "sine", 0.08);
+                setTimeout(() => playBeep(1200, "sine", 0.15), 70);
+                
+                stopQrCamera();
+                handleQrLogin(uName, uPin);
+                return;
+              }
+            }
+          } catch (err) {
+            console.warn("jsQR exception inside parser loop:", err);
+          }
+        }
+      }
+    }
+    
+    // Check again before requesting animation frame to avoid any race conditions
+    if (qrStreamRef.current) {
+      qrAnimationFrameRef.current = requestAnimationFrame(scanQrFrame);
+    }
+  };
+
+  // Login handler using credential tuple
+  const handleQrLogin = async (uName: string, uPin: string) => {
+    setLoading(true);
+    setError("");
+    try {
+      const user = await apiFetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: uName, pin: uPin }),
+      });
+      playBeep(880, "sine", 0.08);
+      setTimeout(() => playBeep(1100, "sine", 0.15), 80);
+      onLogin(user);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "La credencial QR escaneada ya no es válida para iniciar sesión.");
+      setShowErrorModal(true);
+      setUsername(uName);
+      setPin(""); // Reset any stale input pins
+      playBeep(280, "sawtooth", 0.25);
+      setLoginMode("pin");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Add listener triggers to clear scan loops on mode changes/unmounts
+  useEffect(() => {
+    let active = true;
+
+    if (loginMode === "qr") {
+      const initCamera = async () => {
+        try {
+          setError("");
+          playBeep(440, "sine", 0.1);
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 400, height: 400, facingMode: "user" },
+          });
+
+          if (!active) {
+            stream.getTracks().forEach((t) => t.stop());
+            return;
+          }
+
+          qrStreamRef.current = stream;
+
+          // Double check if ref exists, if not, wait for a short layout microtask/timeout
+          if (qrVideoRef.current) {
+            qrVideoRef.current.srcObject = stream;
+            qrVideoRef.current.play().catch((e) => console.warn("Video auto-play failed", e));
+          } else {
+            setTimeout(() => {
+              if (active && qrVideoRef.current && qrStreamRef.current) {
+                qrVideoRef.current.srcObject = qrStreamRef.current;
+                qrVideoRef.current.play().catch((e) => console.warn("Video auto-play delayed failed", e));
+              }
+            }, 150);
+          }
+
+          if (qrAnimationFrameRef.current) {
+            cancelAnimationFrame(qrAnimationFrameRef.current);
+          }
+          qrAnimationFrameRef.current = requestAnimationFrame(scanQrFrame);
+        } catch (err) {
+          console.error("QR Camera access denied or failed:", err);
+          setError("No se pudo iniciar la cámara para escaneo QR. Comprueba los permisos de tu navegador o cámara.");
+          setLoginMode("pin");
+        }
+      };
+
+      initCamera();
+    } else {
+      stopQrCamera();
+    }
+
+    return () => {
+      active = false;
+      stopQrCamera();
+    };
+  }, [loginMode]);
+
   // WebAuthn Biometric Registration process
   const registerWebAuthnBiometrics = async (confirmPin: string) => {
     if (!selectedUser) return;
@@ -1395,6 +1577,7 @@ const Auth = ({
           "El visualizador de desarrollo (iframe) restringe la biometría nativa. Para iniciar sesión usando su huella digital/rostro físico de este equipo, abra la aplicación en una Pestaña Nueva haciendo clic en el banner superior.";
       }
       setError(errMsg);
+      setShowErrorModal(true);
       playBeep(280, "sawtooth", 0.25);
     } finally {
       setIsWebAuthnAuthenticating(false);
@@ -1585,11 +1768,39 @@ const Auth = ({
             {/* Application Branding */}
             <div>
               <h1 className="text-4xl font-serif italic text-zinc-100 mb-1 leading-none tracking-tight">
-                Aurum Manager
+                {companySettings?.name || "Aurum Manager"}
               </h1>
               <p className="text-xs font-light text-zinc-500">
-                Portal de acceso seguro con PIN
+                {loginMode === "qr" ? "Portal de acceso rápido con Credencial QR" : "Portal de acceso seguro con PIN"}
               </p>
+            </div>
+
+            {/* Login Mode Selector Tabs */}
+            <div className="grid grid-cols-2 gap-3 p-1 bg-zinc-950/60 rounded-[20px] border border-white/5">
+              <button
+                type="button"
+                onClick={() => setLoginMode("pin")}
+                className={`py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 ${
+                  loginMode === "pin"
+                    ? "bg-zinc-850 text-zinc-100 shadow border border-white/5"
+                    : "text-zinc-500 hover:text-zinc-350"
+                }`}
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>Acceso por PIN</span>
+              </button>
+              <button
+                type="button"
+                onClick={startQrCamera}
+                className={`py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 ${
+                  loginMode === "qr"
+                    ? "bg-blue-600/20 border border-blue-500/20 text-blue-400 shadow shadow-blue-500/5 font-black"
+                    : "text-zinc-500 hover:text-zinc-350"
+                }`}
+              >
+                <QrCode className="w-3.5 h-3.5" />
+                <span>Acceso por QR</span>
+              </button>
             </div>
 
             {/* Error alerts */}
@@ -1607,62 +1818,108 @@ const Auth = ({
               )}
             </AnimatePresence>
 
-            {/* PIN Login Mode Panel */}
-            <form onSubmit={handleSubmit} className="space-y-6">
-              <div className="space-y-5">
-                <div className="group/input">
-                  <label className="block text-[10px] font-black uppercase text-zinc-600 tracking-[0.2em] mb-2 ml-1 group-focus-within/input:text-amber-500/70 transition-colors">
-                    Credential ID
-                  </label>
-                  <div className="relative">
-                    <User className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-700 group-focus-within/input:text-amber-500 transition-colors" />
-                    <input
-                      required
-                      type="text"
-                      value={username}
-                      onChange={(e) => setUsername(e.target.value)}
-                      placeholder="Nombre de usuario"
-                      className="w-full pl-14 pr-4 py-3.5 bg-zinc-950/40 rounded-2xl border border-white/5 focus:border-amber-500/30 text-zinc-100 focus:outline-none focus:ring-[12px] focus:ring-amber-500/[0.03] transition-all placeholder:text-zinc-800 placeholder:font-light text-sm"
-                    />
+            {/* Login Modes Panels */}
+            {loginMode === "pin" ? (
+              <form onSubmit={handleSubmit} className="space-y-6">
+                <div className="space-y-5">
+                  <div className="group/input">
+                    <label className="block text-[10px] font-black uppercase text-zinc-600 tracking-[0.2em] mb-2 ml-1 group-focus-within/input:text-amber-500/70 transition-colors">
+                      Credential ID
+                    </label>
+                    <div className="relative">
+                      <User className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-700 group-focus-within/input:text-amber-500 transition-colors" />
+                      <input
+                        required
+                        type="text"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        placeholder="Nombre de usuario"
+                        className="w-full pl-14 pr-4 py-3.5 bg-zinc-950/40 rounded-2xl border border-white/5 focus:border-amber-500/30 text-zinc-100 focus:outline-none focus:ring-[12px] focus:ring-amber-500/[0.03] transition-all placeholder:text-zinc-800 placeholder:font-light text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="group/input">
+                    <label className="block text-[10px] font-black uppercase text-zinc-600 tracking-[0.2em] mb-2 ml-1 group-focus-within/input:text-amber-500/70 transition-colors">
+                      Access PIN
+                    </label>
+                    <div className="relative">
+                      <Lock className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-700 group-focus-within/input:text-amber-500 transition-colors" />
+                      <input
+                        required
+                        type="password"
+                        maxLength={6}
+                        value={pin}
+                        onChange={(e) =>
+                          setPin(e.target.value.replace(/\D/g, ""))
+                        }
+                        placeholder="••••"
+                        className="w-full pl-14 pr-4 py-4 bg-zinc-950/40 rounded-2xl border border-white/5 focus:border-amber-500/30 text-zinc-100 text-center text-3xl font-mono tracking-[0.8em] focus:outline-none focus:ring-[12px] focus:ring-amber-500/[0.03] transition-all placeholder:text-zinc-800 placeholder:tracking-normal"
+                      />
+                    </div>
                   </div>
                 </div>
 
-                <div className="group/input">
-                  <label className="block text-[10px] font-black uppercase text-zinc-600 tracking-[0.2em] mb-2 ml-1 group-focus-within/input:text-amber-500/70 transition-colors">
-                    Access PIN
-                  </label>
-                  <div className="relative">
-                    <Lock className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-700 group-focus-within/input:text-amber-500 transition-colors" />
-                    <input
-                      required
-                      type="password"
-                      maxLength={6}
-                      value={pin}
-                      onChange={(e) =>
-                        setPin(e.target.value.replace(/\D/g, ""))
-                      }
-                      placeholder="••••"
-                      className="w-full pl-14 pr-4 py-4 bg-zinc-950/40 rounded-2xl border border-white/5 focus:border-amber-500/30 text-zinc-100 text-center text-3xl font-mono tracking-[0.8em] focus:outline-none focus:ring-[12px] focus:ring-amber-500/[0.03] transition-all placeholder:text-zinc-800 placeholder:tracking-normal"
-                    />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full py-4.5 bg-zinc-100 text-zinc-900 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-white transition-all flex items-center justify-center gap-3 shadow-lg active:scale-[0.98] disabled:opacity-50"
+                >
+                  {loading ? (
+                    <div className="w-5 h-5 border-2 border-zinc-900 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <>
+                      <span>Autenticar Usuario</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  )}
+                </button>
+              </form>
+            ) : (
+              <div className="space-y-6">
+                <div className="border border-white/5 bg-zinc-950/40 p-6 rounded-3xl overflow-hidden relative flex flex-col items-center">
+                  <div className="absolute top-4 right-4 flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse" />
+                    <span className="text-[8px] uppercase tracking-widest text-zinc-500 font-extrabold font-mono">Lectura Activa</span>
                   </div>
+
+                  <QrCode className="w-8 h-8 text-blue-500 mb-2 animate-pulse" />
+                  <h3 className="text-sm font-bold text-zinc-200 text-center mb-1">Escáner de Credencial QR</h3>
+                  <p className="text-[11px] text-zinc-500 text-center max-w-xs mb-5">
+                    Sostén tu tarjeta o credencial QR frente a la cámara web para iniciar tu sesión de forma automática.
+                  </p>
+
+                  {/* Video layout */}
+                  <div className="relative w-full max-w-[260px] aspect-square rounded-2xl overflow-hidden border border-white/10 shadow-lg bg-zinc-950 flex items-center justify-center">
+                    <video
+                      ref={qrVideoRef}
+                      playsInline
+                      muted
+                      className="w-full h-full object-cover scale-x-[-1]"
+                    />
+                    {/* Retro reticle layout for visual elegance and feel */}
+                    <div className="absolute inset-8 border border-blue-500/20 rounded-2xl pointer-events-none">
+                      <div className="absolute -top-1 -left-1 w-4 h-4 border-t-2 border-l-2 border-blue-400 rounded-tl-md" />
+                      <div className="absolute -top-1 -right-1 w-4 h-4 border-t-2 border-r-2 border-blue-400 rounded-tr-md" />
+                      <div className="absolute -bottom-1 -left-1 w-4 h-4 border-b-2 border-l-2 border-blue-400 rounded-bl-md" />
+                      <div className="absolute -bottom-1 -right-1 w-4 h-4 border-b-2 border-r-2 border-blue-400 rounded-br-md" />
+                      <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-[2px] bg-blue-500/40 animate-pulse" />
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopQrCamera();
+                      setLoginMode("pin");
+                    }}
+                    className="mt-5 px-5 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-xs font-bold transition-all border border-white/5 active:scale-95"
+                  >
+                    Volver al Panel de PIN
+                  </button>
                 </div>
               </div>
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full py-4.5 bg-zinc-100 text-zinc-900 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-white transition-all flex items-center justify-center gap-3 shadow-lg active:scale-[0.98] disabled:opacity-50"
-              >
-                {loading ? (
-                  <div className="w-5 h-5 border-2 border-zinc-900 border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <>
-                    <span>Autenticar Usuario</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
-              </button>
-            </form>
+            )}
 
             {/* Footer Protocol Info */}
             <motion.div
@@ -1696,6 +1953,54 @@ const Auth = ({
           <div className="h-px w-8 bg-zinc-800" />
         </div>
       </motion.div>
+
+      {/* Modal de Error de Autenticación */}
+      <AnimatePresence>
+        {showErrorModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowErrorModal(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-md"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-sm bg-zinc-950 border border-white/10 rounded-[28px] shadow-[0_32px_64px_-16px_rgba(0,0,0,0.85)] overflow-hidden flex flex-col z-[101]"
+            >
+              <div className="p-8 flex flex-col items-center text-center space-y-5">
+                <div className="w-14 h-14 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-500">
+                  <AlertCircle className="w-8 h-8 animate-bounce" />
+                </div>
+                
+                <div>
+                  <h3 className="text-lg font-serif italic text-zinc-100 mb-1 leading-none tracking-tight">
+                    Acceso Denegado
+                  </h3>
+                  <p className="text-[10px] font-black uppercase tracking-widest text-zinc-550 mt-1">
+                    Terminal Secure No Autorizado
+                  </p>
+                </div>
+                
+                <p className="text-xs text-zinc-400 leading-relaxed max-w-[280px]">
+                  {error || "El PIN ingresado es incorrecto o la credencial de usuario no está registrada."}
+                </p>
+
+                <button
+                  type="button"
+                  onClick={() => setShowErrorModal(false)}
+                  className="w-full mt-2 py-3.5 bg-zinc-100 hover:bg-white text-zinc-900 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-lg active:scale-95"
+                >
+                  Intentar de Nuevo
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
@@ -1709,6 +2014,8 @@ interface MaterialModalProps {
   title: string;
   subtitle: string;
   submitLabel: string;
+  clients: Client[];
+  fetchData: () => Promise<void> | void;
 }
 
 const MaterialModal = ({
@@ -1720,8 +2027,111 @@ const MaterialModal = ({
   title,
   subtitle,
   submitLabel,
+  clients = [],
+  fetchData,
 }: MaterialModalProps) => {
   const initialRef = useRef<HTMLInputElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const [clientQuery, setClientQuery] = useState(formData.client || "");
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+
+  // Quick create states
+  const [isCreatingClient, setIsCreatingClient] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [newClientCI, setNewClientCI] = useState("");
+  const [newClientPhone, setNewClientPhone] = useState("");
+  const [isSubmittingClient, setIsSubmittingClient] = useState(false);
+  const [newClientError, setNewClientError] = useState("");
+
+  useEffect(() => {
+    if (isOpen) {
+      setClientQuery(formData.client || "");
+      const matched = (clients || []).find(
+        (c) =>
+          c.name === formData.client &&
+          (!c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === "")
+      );
+      setSelectedClient(matched || null);
+      setIsCreatingClient(false);
+      setNewClientError("");
+    }
+  }, [isOpen, formData.client, clients]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowDropdown(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const filteredCentralClients = useMemo(() => {
+    const central = (clients || []).filter(
+      (c) => !c.branchId || c.branchId === "sede_central" || c.branchId === "central" || c.branchId === ""
+    );
+    if (!clientQuery.trim()) return central.slice(0, 5);
+    const q = clientQuery.toLowerCase().trim();
+    return central.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        (c.ci && c.ci.toLowerCase().includes(q))
+    );
+  }, [clients, clientQuery]);
+
+  const handleCreateQuickClient = async () => {
+    if (!newClientName.trim() || !newClientCI.trim()) {
+      setNewClientError("Nombre y Cédula de Identidad (CI) son obligatorios.");
+      return;
+    }
+    setIsSubmittingClient(true);
+    setNewClientError("");
+    try {
+      const res = await apiFetch("/api/clients", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newClientName.trim(),
+          ci: newClientCI.trim(),
+          phone: newClientPhone.trim(),
+          phoneCountryCode: "591",
+          email: "",
+          workplace: "",
+          isMineCooperative: false,
+          recommendedBy: "",
+          referentialPhone: "",
+          photo: "",
+          documentPhoto: "",
+          documentPhotoBack: "",
+          branchId: "sede_central",
+          branchName: "Sede Central",
+          registeredBy: "Sede Central",
+        }),
+      });
+
+      if (res && res.error) {
+        setNewClientError(res.error);
+      } else if (res && res.id) {
+        if (fetchData) {
+          await fetchData();
+        }
+        setClientQuery(res.name);
+        setFormData((prev: any) => ({ ...prev, client: res.name }));
+        setSelectedClient(res);
+        setIsCreatingClient(false);
+        setShowDropdown(false);
+      } else {
+        setNewClientError("Error inesperado al crear el cliente.");
+      }
+    } catch (err: any) {
+      setNewClientError(err?.message || "Error al intentar crear el cliente");
+    } finally {
+      setIsSubmittingClient(false);
+    }
+  };
 
   useEffect(() => {
     if (isOpen) {
@@ -1821,19 +2231,175 @@ const MaterialModal = ({
                     className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm"
                   />
                 </div>
-                <div className="space-y-1">
-                  <label className="text-[10px] font-bold uppercase text-zinc-500">
-                    Cliente
+                <div className="space-y-1 relative" ref={dropdownRef}>
+                  <label className="text-[10px] font-bold uppercase text-zinc-500 flex justify-between items-center">
+                    <span>Cliente</span>
+                    {selectedClient && (
+                      <span className="text-[9px] font-mono text-amber-500 font-bold bg-amber-500/10 px-1.5 py-0.5 rounded">
+                        CI: {selectedClient.ci || "Sin CI"}
+                      </span>
+                    )}
                   </label>
-                  <input
-                    required
-                    type="text"
-                    value={formData.client || ""}
-                    onChange={(e) =>
-                      setFormData({ ...formData, client: e.target.value })
-                    }
-                    className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm"
-                  />
+                  <div className="relative">
+                    <input
+                      required
+                      type="text"
+                      placeholder="Buscar por nombre o CI..."
+                      value={clientQuery}
+                      onFocus={() => setShowDropdown(true)}
+                      onChange={(e) => {
+                        setClientQuery(e.target.value);
+                        setFormData({ ...formData, client: e.target.value });
+                        setSelectedClient(null);
+                        setShowDropdown(true);
+                      }}
+                      className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm pr-9"
+                    />
+                    {clientQuery && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setClientQuery("");
+                          setFormData({ ...formData, client: "" });
+                          setSelectedClient(null);
+                        }}
+                        className="absolute right-2.5 top-2.5 text-zinc-500 hover:text-zinc-300"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+
+                  {showDropdown && (
+                    <div className="absolute left-0 right-0 top-full mt-1.5 bg-zinc-900 border border-white/10 rounded-2xl shadow-2xl z-[60] overflow-hidden max-h-[350px] overflow-y-auto custom-scrollbar flex flex-col divide-y divide-white/5">
+                      {filteredCentralClients.length > 0 ? (
+                        <div className="flex flex-col">
+                          <div className="px-3 py-1.5 bg-zinc-950/40 text-[9px] font-bold uppercase tracking-wider text-zinc-500">
+                            Clientes de Sede Central
+                          </div>
+                          {filteredCentralClients.map((c) => (
+                            <button
+                              key={c.id}
+                              type="button"
+                              onClick={() => {
+                                setClientQuery(c.name);
+                                setFormData({ ...formData, client: c.name });
+                                setSelectedClient(c);
+                                setShowDropdown(false);
+                              }}
+                              className="w-full text-left px-4 py-2.5 hover:bg-white/[0.03] transition-colors flex flex-col gap-0.5"
+                            >
+                              <span className="font-bold text-zinc-100 text-xs">{c.name}</span>
+                              <span className="text-[10px] text-zinc-400 font-mono flex items-center gap-2">
+                                <span>CI: {c.ci || "---"}</span>
+                                {c.phone && <span>• Tel: {c.phone}</span>}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : clientQuery.trim() ? (
+                        <div className="p-4 text-center text-xs text-zinc-500 font-medium">
+                          No se encontraron clientes con "{clientQuery}" en Sede Central.
+                        </div>
+                      ) : (
+                        <div className="p-4 text-center text-xs text-zinc-500 font-medium">
+                          Escriba para buscar por nombre o CI...
+                        </div>
+                      )}
+
+                      {isCreatingClient ? (
+                        <div className="p-4 bg-zinc-955 flex flex-col gap-3">
+                          <div className="text-[10px] font-extrabold uppercase text-amber-500 tracking-wider">
+                            Registrar Nuevo Cliente
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-bold uppercase text-zinc-500">
+                                Nombre Completo
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                placeholder="Nombre..."
+                                value={newClientName}
+                                onChange={(e) => setNewClientName(e.target.value)}
+                                className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-zinc-100 focus:outline-none focus:ring-1 focus:ring-amber-500 text-xs"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-bold uppercase text-zinc-500">
+                                CI / Cédula *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                placeholder="CI..."
+                                value={newClientCI}
+                                onChange={(e) => {
+                                  setNewClientCI(e.target.value);
+                                  setNewClientError("");
+                                }}
+                                className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-zinc-100 focus:outline-none focus:ring-1 focus:ring-amber-500 text-xs"
+                              />
+                            </div>
+                            <div className="space-y-1 col-span-2">
+                              <label className="text-[9px] font-bold uppercase text-zinc-500">
+                                Teléfono (Opcional)
+                              </label>
+                              <input
+                                type="text"
+                                placeholder="Teléfono..."
+                                value={newClientPhone}
+                                onChange={(e) => setNewClientPhone(e.target.value)}
+                                className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-zinc-100 focus:outline-none focus:ring-1 focus:ring-amber-500 text-xs"
+                              />
+                            </div>
+                          </div>
+
+                          {newClientError && (
+                            <div className="text-[10px] text-rose-500 font-bold flex items-center gap-1">
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                              {newClientError}
+                            </div>
+                          )}
+
+                          <div className="flex gap-2 justify-end mt-1">
+                            <button
+                              type="button"
+                              onClick={() => setIsCreatingClient(false)}
+                              className="px-3 py-1.5 rounded-lg bg-zinc-850 text-zinc-300 hover:bg-zinc-800 font-bold text-[10px] transition-all"
+                            >
+                              Cancelar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleCreateQuickClient}
+                              disabled={isSubmittingClient || !newClientName.trim() || !newClientCI.trim()}
+                              className="px-3 py-1.5 rounded-lg bg-amber-500 text-zinc-950 hover:bg-amber-400 font-extrabold text-[10px] transition-all flex items-center gap-1 disabled:opacity-40"
+                            >
+                              {isSubmittingClient ? "Registrando..." : "Registrar Cliente"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="p-2 bg-zinc-950/20">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setNewClientName(clientQuery);
+                              setNewClientCI("");
+                              setNewClientPhone("");
+                              setNewClientError("");
+                              setIsCreatingClient(true);
+                            }}
+                            className="w-full py-2 px-3 hover:bg-white/[0.04] rounded-xl text-amber-500 hover:text-amber-400 transition-colors flex items-center justify-center gap-1.5 text-xs font-bold font-mono"
+                          >
+                            <UserPlus className="w-4 h-4" /> Registrar "{clientQuery || "Nuevo Cliente"}"
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold uppercase text-zinc-500">
@@ -2027,6 +2593,12 @@ const MaterialModal = ({
                     <option value="barra" className="bg-zinc-900">
                       Barra
                     </option>
+                    <option value="puro" className="bg-zinc-900">
+                      Puro
+                    </option>
+                    <option value="cerrado" className="bg-zinc-900">
+                      Cerrado
+                    </option>
                   </select>
                 </div>
                 <div className="flex items-end lg:col-span-2">
@@ -2158,18 +2730,43 @@ const MaterialCard = ({
       <div className="flex justify-between items-start mb-4">
         <div className="flex items-center gap-2">
           <div
-            className={`p-2 rounded-lg ${material.type === "barra" ? "bg-amber-500/10 text-amber-500" : "bg-blue-500/10 text-blue-400"}`}
+            className={`p-2 rounded-lg ${
+              material.type === "barra"
+                ? "bg-amber-500/10 text-amber-500"
+                : material.type === "puro"
+                  ? "bg-emerald-500/10 text-emerald-400"
+                  : material.type === "cerrado"
+                    ? "bg-indigo-500/10 text-indigo-400"
+                    : "bg-blue-500/10 text-blue-400"
+            }`}
           >
             {material.type === "barra" ? (
               <Package className="w-4 h-4" />
+            ) : material.type === "puro" ? (
+              <Coins className="w-4 h-4" />
+            ) : material.type === "cerrado" ? (
+              <CheckCircle2 className="w-4 h-4" />
             ) : (
               <Hash className="w-4 h-4" />
             )}
           </div>
           <div>
-            <h3 className="font-bold text-zinc-100 leading-none mb-1">
-              #{material.receiptNumber}
-            </h3>
+            <div className="flex items-center gap-1.5 mb-1">
+              <h3 className="font-bold text-zinc-100 leading-none">
+                #{material.receiptNumber}
+              </h3>
+              <span className={`text-[8px] font-extrabold uppercase px-1.5 py-0.5 rounded ${
+                material.type === "barra"
+                  ? "bg-amber-500/10 text-amber-500"
+                  : material.type === "puro"
+                    ? "bg-emerald-500/10 text-emerald-400"
+                    : material.type === "cerrado"
+                      ? "bg-indigo-500/10 text-indigo-400"
+                      : "bg-blue-500/10 text-blue-400"
+              }`}>
+                {material.type === "pieza" ? "Pieza" : material.type === "barra" ? "Barra" : material.type === "puro" ? "Puro" : "Cerrado"}
+              </span>
+            </div>
             <p className="text-xs text-zinc-500 uppercase tracking-wider font-medium">
               {material.client}
             </p>
@@ -2736,6 +3333,7 @@ export default function App() {
   const [historyClient, setHistoryClient] = useState<Client | null>(null);
   const [showBranchCalendar, setShowBranchCalendar] = useState(false);
   const [headerTime, setHeaderTime] = useState<Date>(new Date());
+  const [qrBadgeUser, setQrBadgeUser] = useState<SystemUser | null>(null);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -2743,6 +3341,10 @@ export default function App() {
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    document.title = companySettings?.name || "Aurum Manager";
+  }, [companySettings?.name]);
   const [clientHistoryFilter, setClientHistoryFilter] = useState<
     "todos" | "abiertos"
   >("todos");
@@ -2901,6 +3503,7 @@ export default function App() {
   const [branchInventoryStartDate, setBranchInventoryStartDate] = useState("");
   const [branchInventoryEndDate, setBranchInventoryEndDate] = useState("");
   const [branchInventoryPage, setBranchInventoryPage] = useState(1);
+  const [branchInventoryViewMode, setBranchInventoryViewMode] = useState<"cuadros" | "tabla">("cuadros");
   const [zoomedImage, setZoomedImage] = useState<string | null>(null);
   const [zoomScale, setZoomScale] = useState<number>(1);
   const [rotationAngle, setRotationAngle] = useState<number>(0);
@@ -6394,16 +6997,23 @@ export default function App() {
       currentY += 10;
     } else {
       cashMovesInClosure.forEach((move) => {
-        if (currentY + 10 > 280) {
+        const text = `${move.concept} (${move.category.toUpperCase()})`;
+        // Max width of concept column is from margin+2 (17) to margin+115 (130), so about 113. We use 108 for safety.
+        const lines: string[] = doc.splitTextToSize(text, 108);
+        const lineHeight = 4.5;
+        const rowHeight = Math.max(6, lines.length * lineHeight + 2);
+
+        if (currentY + rowHeight > 280) {
           doc.addPage();
           currentY = 20;
         }
 
-        doc.text(
-          `${move.concept} (${move.category.toUpperCase()})`,
-          margin + 2,
-          currentY + 4,
-        );
+        // Draw each line of wrapped concept text
+        lines.forEach((line, index) => {
+          doc.text(line, margin + 2, currentY + 4 + index * lineHeight);
+        });
+
+        // Other column items aligned vertically on the first line of the row
         doc.text(move.paymentType.toUpperCase(), margin + 115, currentY + 4);
 
         if (move.type === "ingreso") {
@@ -6421,7 +7031,7 @@ export default function App() {
             { align: "right" },
           );
         }
-        currentY += 6;
+        currentY += rowHeight;
       });
       currentY += 4;
     }
@@ -10701,7 +11311,7 @@ export default function App() {
       message += `*Adelantos:* ${formatNumber(totalAdvances)} BS\n\n`;
     }
 
-    message += `Gracias por confiar en *Aurum Manager*.`;
+    message += `Gracias por confiar en *${companySettings?.name || "Aurum Manager"}*.`;
 
     // Format phone: use country code if available, otherwise fallback to auto-detection
     const countryCode = client.phoneCountryCode || "591";
@@ -10822,7 +11432,9 @@ export default function App() {
         : !item.isVerifiedInCentral
           ? "En Tránsito"
           : "En Central";
-      const itemLey = (item.purity * 1000).toFixed(0);
+      const isPct = item.purity > 1;
+      const pctValue = isPct ? item.purity : item.purity * 100;
+      const itemLey = (pctValue * 10).toFixed(0);
       return [
         (index + 1).toString(),
         fDate,
@@ -13014,6 +13626,7 @@ export default function App() {
         pricePerGram: 0,
         type: "pieza",
       });
+      fetchData();
     } catch (error) {
       handleApiError(error, OperationType.CREATE, "materials");
     }
@@ -13037,6 +13650,7 @@ export default function App() {
       setShowEditModal(false);
       setEditingMaterial(null);
       resetFormData();
+      fetchData();
     } catch (error) {
       handleApiError(error, OperationType.UPDATE, "materials");
     }
@@ -13289,7 +13903,7 @@ export default function App() {
               <Lock className="w-5 h-5 text-amber-500 animate-pulse" />
             </div>
             <h2 className="text-3xl font-serif italic text-zinc-100 tracking-tight">
-              Aurum Manager
+              {companySettings?.name || "Aurum Manager"}
             </h2>
             <p className="text-[10px] uppercase tracking-widest text-zinc-500 mt-1 font-mono">
               Pantalla Bloqueada
@@ -13639,6 +14253,55 @@ export default function App() {
         </header>
 
         <main className="max-w-[1750px] mx-auto px-6 pt-8">
+          {/* Sede Central Header with Time Station */}
+          {!branchMode && (
+            <div className="bg-gradient-to-r from-zinc-800/10 to-transparent p-8 rounded-[40px] border border-white/5 mb-10">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+                <div className="flex items-center gap-4">
+                  <div className="p-4 bg-zinc-900 border border-white/10 rounded-3xl shadow-xl shadow-zinc-950/25 animate-fade-in">
+                    <Building2 className="w-8 h-8 text-amber-500" />
+                  </div>
+                  <div>
+                    {/* Estación de Tiempo Real */}
+                    <div className="flex items-center gap-2 mb-2 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full w-fit">
+                      <Clock className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
+                      <span className="text-[10px] text-amber-400 uppercase font-extrabold tracking-wider">
+                        Estación de Tiempo Real:
+                      </span>
+                      <span className="text-xs font-mono font-black text-amber-300">
+                        {headerTime.toLocaleTimeString("es-ES", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
+                      </span>
+                      <span className="text-[10px] font-bold text-zinc-400 border-l border-white/10 pl-2">
+                        {headerTime.toLocaleDateString("es-ES", {
+                          weekday: "short",
+                          day: "numeric",
+                          month: "short",
+                        })}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      <h1 className="text-3xl font-bold text-zinc-100 italic">
+                        Sede Central
+                      </h1>
+                      <span className="px-3 py-1 bg-zinc-900 text-zinc-400 rounded-full text-[10px] font-bold uppercase tracking-widest border border-white/5">
+                        Almacén Consolidado
+                      </span>
+                    </div>
+                    <p className="text-zinc-500 text-sm mt-1">
+                      Centro de operaciones, fundición, traspasos y control global de inventario de oro.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Stats Summary - ONLY for Warehouse */}
           {!branchMode && (
             <div className="space-y-6 mb-10">
@@ -14168,6 +14831,12 @@ export default function App() {
                       </option>
                       <option value="barra" className="bg-zinc-900">
                         Barras
+                      </option>
+                      <option value="puro" className="bg-zinc-900">
+                        Puro
+                      </option>
+                      <option value="cerrado" className="bg-zinc-900">
+                        Cerrado
                       </option>
                     </select>
                   </div>
@@ -15644,16 +16313,24 @@ export default function App() {
                           </span>
                         </div>
                       </div>
-                      <div className="flex gap-2">
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={() => setQrBadgeUser(u)}
+                          className="text-[10px] font-bold text-amber-500 hover:bg-amber-500/10 px-2 py-1 rounded transition-colors flex items-center gap-1 cursor-pointer"
+                          title="Generar Credencial de Acceso QR"
+                        >
+                          <QrCode className="w-3 h-3" />
+                          <span>Credencial</span>
+                        </button>
                         <button
                           onClick={() => handleEditUser(u)}
-                          className="text-[10px] font-bold text-blue-400 hover:bg-blue-500/10 px-2 py-1 rounded transition-colors"
+                          className="text-[10px] font-bold text-blue-400 hover:bg-blue-500/10 px-2 py-1 rounded transition-colors cursor-pointer"
                         >
                           Editar
                         </button>
                         <button
                           onClick={() => handleDeleteUser(u.id!)}
-                          className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-2 py-1 rounded transition-colors"
+                          className="text-[10px] font-bold text-red-400 hover:bg-red-500/10 px-2 py-1 rounded transition-colors cursor-pointer"
                         >
                           Eliminar
                         </button>
@@ -20793,8 +21470,37 @@ export default function App() {
                           </select>
                         </div>
 
-                        <div className="text-zinc-500 text-[10px] font-mono font-bold ml-auto px-2">
-                          Mostrando {filteredBranchItems.length} registros
+                        <div className="text-zinc-500 text-[10px] font-mono font-bold ml-auto px-2 flex items-center gap-4">
+                          <span>Mostrando {filteredBranchItems.length} registros</span>
+                          <div className="w-px h-3.5 bg-white/10" />
+                          <div className="flex items-center gap-1 bg-zinc-900 p-1 rounded-xl border border-white/5">
+                            <button
+                              type="button"
+                              onClick={() => setBranchInventoryViewMode("cuadros")}
+                              className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
+                                branchInventoryViewMode === "cuadros"
+                                  ? "bg-violet-650 text-white font-black shadow-lg"
+                                  : "text-zinc-500 hover:text-zinc-300"
+                              }`}
+                              title="Vista Cuadros (Tarjetas)"
+                            >
+                              <LayoutGrid className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline text-[9px] uppercase tracking-wider">Cuadros</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setBranchInventoryViewMode("tabla")}
+                              className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
+                                branchInventoryViewMode === "tabla"
+                                  ? "bg-violet-650 text-white font-black shadow-lg"
+                                  : "text-zinc-500 hover:text-zinc-300"
+                              }`}
+                              title="Vista Tabla"
+                            >
+                              <List className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline text-[9px] uppercase tracking-wider">Tabla</span>
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -20843,319 +21549,284 @@ export default function App() {
                         </motion.div>
                       )}
 
-                      {/* Table of materials */}
-                      <div className="bg-zinc-950 rounded-3xl border border-white/5 shadow-2xl overflow-hidden">
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-left border-collapse">
-                            <thead>
-                              <tr className="border-b border-white/5 bg-zinc-900/50 text-[10px] font-black uppercase tracking-wider text-zinc-400">
-                                <th className="px-4 py-4 w-[50px] text-center">
-                                  <input
-                                    type="checkbox"
-                                    checked={
-                                      paginatedItems.filter(
-                                        (i) =>
-                                          !i.isTransferred &&
-                                          !i.isHistoric &&
-                                          i.purchaseType === "cerrado",
-                                      ).length > 0 &&
-                                      paginatedItems
-                                        .filter(
-                                          (i) =>
-                                            !i.isTransferred &&
-                                            !i.isHistoric &&
-                                            i.purchaseType === "cerrado",
-                                        )
-                                        .every((i) =>
-                                          selectedInventoryItems.includes(
-                                            i.id!,
-                                          ),
-                                        )
-                                    }
-                                    onChange={(e) => {
-                                      const availableIds = paginatedItems
-                                        .filter(
-                                          (i) =>
-                                            !i.isTransferred &&
-                                            !i.isHistoric &&
-                                            i.purchaseType === "cerrado",
-                                        )
-                                        .map((i) => i.id!);
-                                      if (e.target.checked) {
-                                        setSelectedInventoryItems((prev) => {
-                                          const newSels = [...prev];
-                                          availableIds.forEach((id) => {
-                                            if (!newSels.includes(id))
-                                              newSels.push(id);
-                                          });
-                                          return newSels;
-                                        });
-                                      } else {
-                                        setSelectedInventoryItems((prev) =>
-                                          prev.filter(
-                                            (id) => !availableIds.includes(id),
-                                          ),
-                                        );
-                                      }
-                                    }}
-                                    disabled={
-                                      paginatedItems.filter(
-                                        (i) =>
-                                          !i.isTransferred &&
-                                          !i.isHistoric &&
-                                          i.purchaseType === "cerrado",
-                                      ).length === 0
-                                    }
-                                    className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                                    title="Seleccionar todos los disponibles en esta página"
-                                  />
-                                </th>
-                                <th className="px-4 py-4 w-[80px]">Foto</th>
-                                <th className="px-4 py-4">Recibo Compra</th>
-                                <th className="px-4 py-4">Cliente</th>
-                                <th className="px-4 py-4">Detalle / Tipo</th>
-                                <th className="px-4 py-4">Pureza (Ley)</th>
-                                <th className="px-4 py-4 text-right">
-                                  Peso (Inic / Final)
-                                </th>
-                                <th className="px-4 py-4 text-right">
-                                  Merma / Pérdida
-                                </th>
-                                <th className="px-4 py-4 text-right">
-                                  Importe
-                                </th>
-                                <th className="px-4 py-4 text-center">
-                                  Estado
-                                </th>
-                                <th className="px-6 py-4 text-center">
-                                  Acciones
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-white/5 text-zinc-300">
-                              {paginatedItems.map((item) => {
-                                const lossPercent =
-                                  item.lossPercentage ||
-                                  (item.initialWeight > 0
-                                    ? (item.loss / item.initialWeight) * 100
-                                    : 0);
-                                const isSelected =
-                                  selectedInventoryItems.includes(item.id!);
+                      {/* Grid or Table container depending on layout view mode */}
+                      {branchInventoryViewMode === "cuadros" ? (
+                        <div className="space-y-6">
+                          {/* Grid "Seleccionar Todos" indicator if we have items that can be selected */}
+                          {paginatedItems.filter(
+                            (i) =>
+                              !i.isTransferred &&
+                              !i.isHistoric &&
+                              i.purchaseType === "cerrado",
+                          ).length > 0 && (
+                            <div className="bg-zinc-900/40 p-4 rounded-2xl border border-white/5 flex items-center gap-3">
+                              <input
+                                type="checkbox"
+                                checked={
+                                  paginatedItems.filter(
+                                    (i) =>
+                                      !i.isTransferred &&
+                                      !i.isHistoric &&
+                                      i.purchaseType === "cerrado",
+                                  ).length > 0 &&
+                                  paginatedItems
+                                    .filter(
+                                      (i) =>
+                                        !i.isTransferred &&
+                                        !i.isHistoric &&
+                                        i.purchaseType === "cerrado",
+                                    )
+                                    .every((i) =>
+                                      selectedInventoryItems.includes(
+                                        i.id!,
+                                      ),
+                                    )
+                                }
+                                onChange={(e) => {
+                                  const availableIds = paginatedItems
+                                    .filter(
+                                      (i) =>
+                                        !i.isTransferred &&
+                                        !i.isHistoric &&
+                                        i.purchaseType === "cerrado",
+                                    )
+                                    .map((i) => i.id!);
+                                  if (e.target.checked) {
+                                    setSelectedInventoryItems((prev) => {
+                                      const newSels = [...prev];
+                                      availableIds.forEach((id) => {
+                                        if (!newSels.includes(id))
+                                          newSels.push(id);
+                                      });
+                                      return newSels;
+                                    });
+                                  } else {
+                                    setSelectedInventoryItems((prev) =>
+                                      prev.filter(
+                                        (id) => !availableIds.includes(id),
+                                      ),
+                                    );
+                                  }
+                                }}
+                                className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                                id="select_all_grid"
+                              />
+                              <label htmlFor="select_all_grid" className="text-xs font-bold text-zinc-350 uppercase cursor-pointer select-none">
+                                Seleccionar todos los materiales disponibles de esta página para transferencia masiva
+                              </label>
+                            </div>
+                          )}
 
-                                return (
-                                  <tr
-                                    key={item.id}
-                                    className="hover:bg-zinc-900/10 text-xs transition-colors duration-155"
-                                  >
-                                    {/* Multi-selection Checkbox */}
-                                    <td className="px-4 py-3 text-center whitespace-nowrap">
-                                      {!item.isTransferred &&
-                                      !item.isHistoric &&
-                                      item.purchaseType === "cerrado" ? (
-                                        <input
-                                          type="checkbox"
-                                          checked={isSelected}
-                                          onChange={() => {
-                                            setSelectedInventoryItems((prev) =>
-                                              prev.includes(item.id!)
-                                                ? prev.filter(
-                                                    (id) => id !== item.id!,
-                                                  )
-                                                : [...prev, item.id!],
-                                            );
-                                          }}
-                                          className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
-                                        />
-                                      ) : (
-                                        <input
-                                          type="checkbox"
-                                          disabled
-                                          className="w-4 h-4 rounded border-zinc-900 bg-zinc-950 text-zinc-700 opacity-20 cursor-not-allowed"
-                                          title={
-                                            item.isHistoric
-                                              ? "Registro histórico no disponible para transferencia"
-                                              : item.purchaseType === "abierto"
-                                                ? "Lote de compra abierto (Pendiente de Liquidar)"
-                                                : "Material ya transferido o verificado"
-                                          }
-                                        />
-                                      )}
-                                    </td>
+                          {/* Cards Grid */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                            {paginatedItems.map((item) => {
+                              const lossPercent =
+                                item.lossPercentage ||
+                                (item.initialWeight > 0
+                                  ? (item.loss / item.initialWeight) * 100
+                                  : 0);
+                              const isSelected =
+                                selectedInventoryItems.includes(item.id!);
+                              const isEligibleForTransfer =
+                                !item.isTransferred &&
+                                !item.isHistoric &&
+                                item.purchaseType === "cerrado";
 
-                                    {/* Photo Column */}
-                                    <td className="px-4 py-3 whitespace-nowrap">
-                                      {item.photo ? (
-                                        <button
-                                          type="button"
-                                          onClick={() =>
-                                            setZoomedImage(item.photo)
-                                          }
-                                          className="relative group block w-11 h-11 rounded-lg overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none"
-                                          title="Ver foto ampliada"
-                                        >
-                                          <img
-                                            src={item.photo}
-                                            alt="Material"
-                                            referrerPolicy="no-referrer"
-                                            className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-200"
+                              const isPct = item.purity > 1;
+                              const pctValue = isPct ? item.purity : item.purity * 100;
+                              const leyValue = (pctValue * 10).toFixed(0);
+
+                              return (
+                                <motion.div
+                                  key={item.id}
+                                  layout
+                                  initial={{ opacity: 0, scale: 0.95 }}
+                                  animate={{ opacity: 1, scale: 1 }}
+                                  className={`p-5 rounded-3xl border transition-all relative flex flex-col justify-between cursor-pointer group ${
+                                    isSelected
+                                      ? "bg-violet-950/20 border-violet-500 shadow-xl shadow-violet-950/15 ring-2 ring-violet-500/10"
+                                      : "bg-zinc-900/60 border-white/5 hover:border-violet-500/40 hover:bg-zinc-850"
+                                  }`}
+                                  onClick={(e) => {
+                                    // Make clicking the card toggle selection if eligible, but exclude buttons, checkboxes and images
+                                    const target = e.target as HTMLElement;
+                                    if (
+                                      isEligibleForTransfer &&
+                                      !target.closest("button") &&
+                                      !target.closest("input[type=checkbox]") &&
+                                      !target.closest("img")
+                                    ) {
+                                      setSelectedInventoryItems((prev) =>
+                                        prev.includes(item.id!)
+                                          ? prev.filter((id) => id !== item.id!)
+                                          : [...prev, item.id!]
+                                      );
+                                    }
+                                  }}
+                                >
+                                  <div>
+                                    {/* Top Status & Selection Checkbox row */}
+                                    <div className="flex justify-between items-center mb-4">
+                                      <div className="flex items-center gap-2">
+                                        {isEligibleForTransfer && (
+                                          <input
+                                            type="checkbox"
+                                            checked={isSelected}
+                                            onChange={(e) => {
+                                              e.stopPropagation();
+                                              setSelectedInventoryItems((prev) =>
+                                                prev.includes(item.id!)
+                                                  ? prev.filter((id) => id !== item.id!)
+                                                  : [...prev, item.id!]
+                                              );
+                                            }}
+                                            className="w-4 h-4 rounded border-zinc-700 bg-zinc-950 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
                                           />
-                                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
-                                            <Eye className="w-3.5 h-3.5 text-white" />
-                                          </div>
-                                        </button>
-                                      ) : (
-                                        <div
-                                          className="w-11 h-11 rounded-lg bg-zinc-905 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-0.5"
-                                          title="Sin foto"
-                                        >
-                                          <ImageIcon className="w-3.5 h-3.5 text-zinc-700" />
-                                          <span className="text-zinc-650 scale-90">
-                                            Sin Foto
-                                          </span>
-                                        </div>
-                                      )}
-                                    </td>
-
-                                    {/* Receipt Number */}
-                                    <td className="px-4 py-3 whitespace-nowrap">
-                                      <div className="flex flex-col">
-                                        <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg w-fit text-[11px]">
+                                        )}
+                                        <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg text-[10px]">
                                           #{item.purchaseReceiptNumber}
                                         </span>
-                                        <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
-                                          {new Date(
-                                            item.purchaseDate,
-                                          ).toLocaleDateString()}
-                                        </span>
                                       </div>
-                                    </td>
+                                      
+                                      {/* Status tag */}
+                                      <div className="shrink-0">
+                                        {item.isHistoric ? (
+                                          <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
+                                            No Disp
+                                          </span>
+                                        ) : item.purchaseType === "abierto" ? (
+                                          <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
+                                            Abierto
+                                          </span>
+                                        ) : !item.isTransferred ? (
+                                          <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
+                                            Disponible
+                                          </span>
+                                        ) : !item.isVerifiedInCentral ? (
+                                          <span className="text-[9px] inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/25 px-2 py-0.5 rounded-full font-black uppercase tracking-wider">
+                                            Tránsito
+                                          </span>
+                                        ) : (
+                                          <span className="text-[9px] inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/25 px-2 py-0.5 rounded-full font-black uppercase tracking-wider">
+                                            Central
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
 
-                                    {/* Client */}
-                                    <td className="px-4 py-3 whitespace-nowrap">
-                                      <div className="flex flex-col">
-                                        <span className="font-bold text-zinc-200 capitalize">
+                                    {/* Photo & Client Information Block */}
+                                    <div className="flex gap-4 mb-4 items-start">
+                                      {/* Material image */}
+                                      <div className="shrink-0">
+                                        {item.photo ? (
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setZoomedImage(item.photo);
+                                            }}
+                                            className="relative group block w-16 h-16 rounded-2xl overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none bg-zinc-950"
+                                            title="Ver foto ampliada"
+                                          >
+                                            <img
+                                              src={item.photo}
+                                              alt="Material"
+                                              referrerPolicy="no-referrer"
+                                              className="w-full h-full object-cover group-hover:scale-115 transition-transform duration-250"
+                                            />
+                                            <div className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                              <Eye className="w-4 h-4 text-white" />
+                                            </div>
+                                          </button>
+                                        ) : (
+                                          <div className="w-16 h-16 rounded-2xl bg-zinc-950 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-1" title="Sin foto">
+                                            <ImageIcon className="w-5 h-5 text-zinc-700 font-bold" />
+                                            <span className="text-zinc-600 scale-90">Sin Foto</span>
+                                          </div>
+                                        )}
+                                      </div>
+
+                                      {/* Client & Date */}
+                                      <div className="flex-1 min-w-0">
+                                        <h4 className="font-bold text-zinc-200 capitalize truncate text-sm" title={item.clientName}>
                                           {item.clientName}
-                                        </span>
-                                        <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
-                                          Responsable:{" "}
-                                          {item.operatorName || "System"}
-                                        </span>
-                                      </div>
-                                    </td>
-
-                                    {/* Type */}
-                                    <td className="px-4 py-3 whitespace-nowrap">
-                                      <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-zinc-900 text-zinc-300 border border-white/5 capitalize text-center block w-fit">
-                                        {item.type || "pieza"}
-                                      </span>
-                                    </td>
-
-                                    {/* Purity */}
-                                    <td className="px-4 py-3 whitespace-nowrap">
-                                      <div className="flex flex-col">
-                                        <span className="font-mono font-bold text-zinc-200">
-                                          {(item.purity * 1000).toFixed(0)} Ley
-                                          / {formatNumber(item.purity)}
-                                        </span>
-                                        <span className="text-[9px] text-zinc-500 font-bold mt-0.5">
-                                          {item.purity >= 0.99
-                                            ? "Oro Pureza 24K"
-                                            : item.purity >= 0.75
-                                              ? "Oro 18K (750)"
-                                              : "Ley Especial"}
+                                        </h4>
+                                        <div className="flex items-center gap-1.5 mt-1.5 mb-1">
+                                          <span className="px-2 py-0.5 text-[9px] font-black uppercase tracking-widest rounded bg-zinc-950 text-zinc-400 border border-white/5 capitalize">
+                                            {item.type || "pieza"}
+                                          </span>
+                                        </div>
+                                        <span className="text-[9px] text-zinc-500 font-mono mt-1 block font-bold">
+                                          Op: {item.operatorName || "System"}
                                         </span>
                                       </div>
-                                    </td>
+                                    </div>
 
-                                    {/* Weight Info */}
-                                    <td className="px-4 py-3 text-right whitespace-nowrap">
-                                      <div className="flex flex-col font-mono">
-                                        <span className="text-zinc-200 font-bold">
+                                    {/* Detailed Stats Grid */}
+                                    <div className="grid grid-cols-2 gap-3 p-3 bg-zinc-950/40 rounded-2xl border border-white/5 font-mono text-[10px] mb-4">
+                                      <div className="space-y-0.5">
+                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Ley (Purity)</span>
+                                        <span className="font-bold text-zinc-200 text-[11px] block">
+                                          {leyValue} Ley / {formatNumber(pctValue)}%
+                                        </span>
+                                      </div>
+                                      <div className="space-y-0.5">
+                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block font-bold text-violet-400">Peso Final</span>
+                                        <span className="font-bold text-white text-[11.5px] block font-black">
                                           {formatNumber(item.finalWeight)} g
                                         </span>
-                                        <span className="text-[10px] text-zinc-555">
-                                          Inicial:{" "}
+                                      </div>
+                                      <div className="space-y-0.5">
+                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Peso Inicial</span>
+                                        <span className="font-medium text-zinc-400 block">
                                           {formatNumber(item.initialWeight)} g
                                         </span>
                                       </div>
-                                    </td>
-
-                                    {/* Loss Info */}
-                                    <td className="px-4 py-3 text-right whitespace-nowrap">
-                                      {item.loss > 0 ? (
-                                        <div className="flex flex-col font-mono text-amber-500">
-                                          <span className="font-bold">
-                                            -{formatNumber(item.loss)} g
+                                      <div className="space-y-0.5">
+                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Merma / Pérdida</span>
+                                        {item.loss > 0 ? (
+                                          <span className="font-bold text-amber-500 block">
+                                            -{formatNumber(item.loss)} g (-{formatNumber(lossPercent)}%)
                                           </span>
-                                          <span className="text-[10px] opacity-75">
-                                            -{formatNumber(lossPercent)}%
-                                          </span>
-                                        </div>
-                                      ) : (
-                                        <span className="text-zinc-650 font-mono italic">
-                                          -
-                                        </span>
-                                      )}
-                                    </td>
+                                        ) : (
+                                          <span className="text-zinc-650 block italic">Sin mermas</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
 
-                                    {/* Total Purchase Paid for Item */}
-                                    <td className="px-4 py-3 text-right whitespace-nowrap font-mono font-bold text-emerald-400">
-                                      {formatNumber(item.total)} BS
-                                    </td>
+                                  {/* Total Value & Action Buttons Footer */}
+                                  <div>
+                                    <div className="flex items-center justify-between gap-2 py-2 border-t border-white/5 bg-zinc-950/20 px-2 rounded-xl mb-3">
+                                      <span className="text-[9px] text-zinc-500 font-mono">FECHA COMPRA: {new Date(item.purchaseDate).toLocaleDateString()}</span>
+                                      <div className="text-right">
+                                        <span className="text-[9px] text-emerald-400 block uppercase font-mono font-bold leading-none mb-0.5">IMPORTE PAGADO</span>
+                                        <span className="text-xs font-black text-emerald-400 font-mono">
+                                          {formatNumber(item.total)} BS
+                                        </span>
+                                      </div>
+                                    </div>
 
-                                    {/* Item Status */}
-                                    <td className="px-4 py-3 text-center whitespace-nowrap">
-                                      {item.isHistoric ? (
-                                        <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                          <span className="w-1.5 h-1.5 rounded-full bg-red-500" />{" "}
-                                          No Disponible
-                                        </span>
-                                      ) : item.purchaseType === "abierto" ? (
-                                        <span
-                                          className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide"
-                                          title="Lote de compra abierto - No liquidado aún"
-                                        >
-                                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />{" "}
-                                          Compra Abierta
-                                        </span>
-                                      ) : !item.isTransferred ? (
-                                        <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />{" "}
-                                          Disponible
-                                        </span>
-                                      ) : !item.isVerifiedInCentral ? (
-                                        <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                          <Truck className="w-3 h-3 text-amber-400" />{" "}
-                                          En Tránsito
-                                        </span>
-                                      ) : (
-                                        <span className="inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                          <CheckCircle2 className="w-3 h-3 text-sky-400" />{" "}
-                                          En Central
-                                        </span>
-                                      )}
-                                    </td>
-
-                                    {/* Actions Column */}
-                                    <td className="px-6 py-3 text-center whitespace-nowrap">
-                                      <div className="flex items-center justify-center gap-1.5">
-                                        {/* Info button */}
+                                    {/* Action Buttons */}
+                                    <div className="flex flex-col gap-1.5">
+                                      <div className="grid grid-cols-2 gap-2">
                                         <button
                                           type="button"
-                                          onClick={() =>
-                                            setViewingItemDetail(item)
-                                          }
-                                          className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-zinc-850 hover:text-white border border-white/5 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setViewingItemDetail(item);
+                                          }}
+                                          className="py-2 px-3 rounded-xl bg-zinc-950 hover:bg-zinc-800 text-zinc-300 hover:text-white border border-white/5 transition-all text-[11px] font-bold flex items-center justify-center gap-1.5"
                                           title="Ver detalles de registro"
                                         >
-                                          <Eye className="w-3.5 h-3.5 text-zinc-400" />{" "}
-                                          Ver Detalles
+                                          <Eye className="w-3.5 h-3.5 text-zinc-400" />
+                                          Detalles
                                         </button>
 
-                                        {/* PDF receipt button */}
                                         <button
                                           type="button"
-                                          onClick={() => {
+                                          onClick={(e) => {
+                                            e.stopPropagation();
                                             const purchase = goldPurchases.find(
                                               (p) => p.id === item.purchaseId,
                                             );
@@ -21167,72 +21838,461 @@ export default function App() {
                                                   : "cierre",
                                               );
                                             } else {
-                                              alert(
-                                                "No se pudo encontrar el lote original para este material.",
-                                              );
+                                              alert("Operación de compra origen no encontrada");
                                             }
                                           }}
-                                          className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-violet-950/40 hover:text-violet-400 border border-white/5 hover:border-violet-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
-                                          title="Descargar PDF de recibo de compra"
+                                          className="py-2 px-3 rounded-xl bg-zinc-950 hover:bg-zinc-800 text-zinc-300 hover:text-white border border-white/5 transition-all text-[11px] font-bold flex items-center justify-center gap-1.5"
+                                          title="Descargar Comprobante de Compra PDF"
                                         >
-                                          <FileText className="w-3.5 h-3.5 text-red-400/80" />{" "}
+                                          <FileText className="w-3.5 h-3.5 text-zinc-400 hover:text-red-400" />
                                           Recibo PDF
                                         </button>
-
-                                        {/* Transfer individual button */}
-                                        {!item.isTransferred &&
-                                          !item.isHistoric &&
-                                          item.purchaseType === "cerrado" && (
-                                            <button
-                                              type="button"
-                                              onClick={() => {
-                                                setSelectedTransferMaterials([
-                                                  item.id!,
-                                                ]);
-                                                setShowTransferModal(true);
-                                              }}
-                                              className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-emerald-950/40 hover:text-emerald-400 border border-white/5 hover:border-emerald-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
-                                              title="Transferir a Central ahora"
-                                            >
-                                              <ArrowUpRight className="w-3.5 h-3.5 text-emerald-400/80" />{" "}
-                                              Enviar
-                                            </button>
-                                          )}
                                       </div>
+
+                                      {/* Individual direct transfer action button if eligible */}
+                                      {isEligibleForTransfer && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setSelectedTransferMaterials([
+                                              item.id!,
+                                            ]);
+                                            setShowTransferModal(true);
+                                          }}
+                                          className="w-full py-2 px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-bold transition-all text-[11px] flex items-center justify-center gap-1.5 shadow shadow-violet-650/40"
+                                          title="Enviar de forma independiente a la Central"
+                                        >
+                                          <ArrowUpRight className="w-3.5 h-3.5 text-white" />
+                                          Enviar a Sede Central
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                </motion.div>
+                              );
+                            })}
+
+                            {filteredBranchItems.length === 0 && (
+                              <div className="col-span-full py-16 bg-zinc-950/20 rounded-3xl border border-dashed border-white/5 text-center text-zinc-500">
+                                <AlertCircle className="w-8 h-8 text-zinc-650 mx-auto mb-3" />
+                                <p className="text-xs font-bold uppercase tracking-wider">No se encontraron piezas registradas en esta sucursal</p>
+                                <p className="text-[10px] text-zinc-600 mt-1">Intente ajustar los filtros de búsqueda o fechas arriba</p>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Pagination segment (shared) */}
+                          {filteredBranchItems.length > itemsPerPage && (
+                            <div className="p-4 bg-zinc-900/30 rounded-3xl border border-white/5">
+                              <Pagination
+                                totalItems={filteredBranchItems.length}
+                                currentPage={branchInventoryPage}
+                                onPageChange={(page) =>
+                                  setBranchInventoryPage(page)
+                                }
+                                itemsPerPage={itemsPerPage}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="bg-zinc-950 rounded-3xl border border-white/5 shadow-2xl overflow-hidden">
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left border-collapse">
+                              <thead>
+                                <tr className="border-b border-white/5 bg-zinc-900/50 text-[10px] font-black uppercase tracking-wider text-zinc-400">
+                                  <th className="px-4 py-4 w-[50px] text-center">
+                                    <input
+                                      type="checkbox"
+                                      checked={
+                                        paginatedItems.filter(
+                                          (i) =>
+                                            !i.isTransferred &&
+                                            !i.isHistoric &&
+                                            i.purchaseType === "cerrado",
+                                        ).length > 0 &&
+                                        paginatedItems
+                                          .filter(
+                                            (i) =>
+                                              !i.isTransferred &&
+                                              !i.isHistoric &&
+                                              i.purchaseType === "cerrado",
+                                          )
+                                          .every((i) =>
+                                            selectedInventoryItems.includes(
+                                              i.id!,
+                                            ),
+                                          )
+                                      }
+                                      onChange={(e) => {
+                                        const availableIds = paginatedItems
+                                          .filter(
+                                            (i) =>
+                                              !i.isTransferred &&
+                                              !i.isHistoric &&
+                                              i.purchaseType === "cerrado",
+                                          )
+                                          .map((i) => i.id!);
+                                        if (e.target.checked) {
+                                          setSelectedInventoryItems((prev) => {
+                                            const newSels = [...prev];
+                                            availableIds.forEach((id) => {
+                                              if (!newSels.includes(id))
+                                                newSels.push(id);
+                                            });
+                                            return newSels;
+                                          });
+                                        } else {
+                                          setSelectedInventoryItems((prev) =>
+                                            prev.filter(
+                                              (id) => !availableIds.includes(id),
+                                            ),
+                                          );
+                                        }
+                                      }}
+                                      disabled={
+                                        paginatedItems.filter(
+                                          (i) =>
+                                            !i.isTransferred &&
+                                            !i.isHistoric &&
+                                            i.purchaseType === "cerrado",
+                                        ).length === 0
+                                      }
+                                      className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                                      title="Seleccionar todos los disponibles en esta página"
+                                    />
+                                  </th>
+                                  <th className="px-4 py-4 w-[80px]">Foto</th>
+                                  <th className="px-4 py-4">Recibo Compra</th>
+                                  <th className="px-4 py-4">Cliente</th>
+                                  <th className="px-4 py-4">Detalle / Tipo</th>
+                                  <th className="px-4 py-4">Pureza (Ley)</th>
+                                  <th className="px-4 py-4 text-right">
+                                    Peso (Inic / Final)
+                                  </th>
+                                  <th className="px-4 py-4 text-right">
+                                    Merma / Pérdida
+                                  </th>
+                                  <th className="px-4 py-4 text-right">
+                                    Importe
+                                  </th>
+                                  <th className="px-4 py-4 text-center">
+                                    Estado
+                                  </th>
+                                  <th className="px-6 py-4 text-center">
+                                    Acciones
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-white/5 text-zinc-300">
+                                {paginatedItems.map((item) => {
+                                  const lossPercent =
+                                    item.lossPercentage ||
+                                    (item.initialWeight > 0
+                                      ? (item.loss / item.initialWeight) * 100
+                                      : 0);
+                                  const isSelected =
+                                    selectedInventoryItems.includes(item.id!);
+
+                                  return (
+                                    <tr
+                                      key={item.id}
+                                      className="hover:bg-zinc-900/10 text-xs transition-colors duration-155"
+                                    >
+                                      {/* Multi-selection Checkbox */}
+                                      <td className="px-4 py-3 text-center whitespace-nowrap">
+                                        {!item.isTransferred &&
+                                        !item.isHistoric &&
+                                        item.purchaseType === "cerrado" ? (
+                                          <input
+                                            type="checkbox"
+                                            checked={isSelected}
+                                            onChange={() => {
+                                              setSelectedInventoryItems((prev) =>
+                                                prev.includes(item.id!)
+                                                  ? prev.filter(
+                                                      (id) => id !== item.id!,
+                                                    )
+                                                  : [...prev, item.id!],
+                                              );
+                                            }}
+                                            className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                                          />
+                                        ) : (
+                                          <input
+                                            type="checkbox"
+                                            disabled
+                                            className="w-4 h-4 rounded border-zinc-900 bg-zinc-950 text-zinc-700 opacity-20 cursor-not-allowed"
+                                            title={
+                                              item.isHistoric
+                                                ? "Registro histórico no disponible para transferencia"
+                                                : item.purchaseType === "abierto"
+                                                  ? "Lote de compra abierto (Pendiente de Liquidar)"
+                                                  : "Material ya transferido o verificado"
+                                            }
+                                          />
+                                        )}
+                                      </td>
+
+                                      {/* Photo Column */}
+                                      <td className="px-4 py-3 whitespace-nowrap">
+                                        {item.photo ? (
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              setZoomedImage(item.photo)
+                                            }
+                                            className="relative group block w-11 h-11 rounded-lg overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none"
+                                            title="Ver foto ampliada"
+                                          >
+                                            <img
+                                              src={item.photo}
+                                              alt="Material"
+                                              referrerPolicy="no-referrer"
+                                              className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-200"
+                                            />
+                                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                              <Eye className="w-3.5 h-3.5 text-white" />
+                                            </div>
+                                          </button>
+                                        ) : (
+                                          <div
+                                            className="w-11 h-11 rounded-lg bg-zinc-905 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-0.5"
+                                            title="Sin foto"
+                                          >
+                                            <ImageIcon className="w-3.5 h-3.5 text-zinc-700" />
+                                            <span className="text-zinc-655 scale-90">
+                                              Sin Foto
+                                            </span>
+                                          </div>
+                                        )}
+                                      </td>
+
+                                      {/* Receipt Number */}
+                                      <td className="px-4 py-3 whitespace-nowrap">
+                                        <div className="flex flex-col">
+                                          <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg w-fit text-[11px]">
+                                            #{item.purchaseReceiptNumber}
+                                          </span>
+                                          <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
+                                            {new Date(
+                                              item.purchaseDate,
+                                            ).toLocaleDateString()}
+                                          </span>
+                                        </div>
+                                      </td>
+
+                                      {/* Client */}
+                                      <td className="px-4 py-3 whitespace-nowrap">
+                                        <div className="flex flex-col">
+                                          <span className="font-bold text-zinc-200 capitalize">
+                                            {item.clientName}
+                                          </span>
+                                          <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
+                                            Responsable:{" "}
+                                            {item.operatorName || "System"}
+                                          </span>
+                                        </div>
+                                      </td>
+
+                                      {/* Type */}
+                                      <td className="px-4 py-3 whitespace-nowrap">
+                                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-zinc-900 text-zinc-300 border border-white/5 capitalize text-center block w-fit">
+                                          {item.type || "pieza"}
+                                        </span>
+                                      </td>
+
+                                      {/* Purity */}
+                                      <td className="px-4 py-3 whitespace-nowrap">
+                                        {(() => {
+                                          const isPct = item.purity > 1;
+                                          const pctValue = isPct ? item.purity : item.purity * 100;
+                                          const leyValue = (pctValue * 10).toFixed(0);
+                                          return (
+                                            <div className="flex flex-col">
+                                              <span className="font-mono font-bold text-zinc-200">
+                                                {leyValue} Ley / {formatNumber(pctValue)}%
+                                              </span>
+                                              <span className="text-[9px] text-zinc-500 font-bold mt-0.5">
+                                                {pctValue >= 99
+                                                  ? "Oro Pureza 24K"
+                                                  : pctValue >= 75
+                                                    ? "Oro 18K (750)"
+                                                    : "Ley Especial"}
+                                              </span>
+                                            </div>
+                                          );
+                                        })()}
+                                      </td>
+
+                                      {/* Weight Info */}
+                                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                                        <div className="flex flex-col font-mono">
+                                          <span className="text-zinc-200 font-bold">
+                                            {formatNumber(item.finalWeight)} g
+                                          </span>
+                                          <span className="text-[10px] text-zinc-555">
+                                            Inicial:{" "}
+                                            {formatNumber(item.initialWeight)} g
+                                          </span>
+                                        </div>
+                                      </td>
+
+                                      {/* Loss Info */}
+                                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                                        {item.loss > 0 ? (
+                                          <div className="flex flex-col font-mono text-amber-500">
+                                            <span className="font-bold">
+                                              -{formatNumber(item.loss)} g
+                                            </span>
+                                            <span className="text-[10px] opacity-75">
+                                              -{formatNumber(lossPercent)}%
+                                            </span>
+                                          </div>
+                                        ) : (
+                                          <span className="text-zinc-650 font-mono italic">
+                                            -
+                                          </span>
+                                        )}
+                                      </td>
+
+                                      {/* Total Purchase Paid for Item */}
+                                      <td className="px-4 py-3 text-right whitespace-nowrap font-mono font-bold text-emerald-400">
+                                        {formatNumber(item.total)} BS
+                                      </td>
+
+                                      {/* Item Status */}
+                                      <td className="px-4 py-3 text-center whitespace-nowrap">
+                                        {item.isHistoric ? (
+                                          <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-red-500" />{" "}
+                                            No Disponible
+                                          </span>
+                                        ) : item.purchaseType === "abierto" ? (
+                                          <span
+                                            className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide"
+                                            title="Lote de compra abierto - No liquidado aún"
+                                          >
+                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />{" "}
+                                            Compra Abierta
+                                          </span>
+                                        ) : !item.isTransferred ? (
+                                          <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />{" "}
+                                            Disponible
+                                          </span>
+                                        ) : !item.isVerifiedInCentral ? (
+                                          <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                            <Truck className="w-3 h-3 text-amber-400" />{" "}
+                                            En Tránsito
+                                          </span>
+                                        ) : (
+                                          <span className="inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                            <CheckCircle2 className="w-3 h-3 text-sky-400" />{" "}
+                                            En Central
+                                          </span>
+                                        )}
+                                      </td>
+
+                                      {/* Actions Column */}
+                                      <td className="px-6 py-3 text-center whitespace-nowrap">
+                                        <div className="flex items-center justify-center gap-1.5">
+                                          {/* Info button */}
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              setViewingItemDetail(item)
+                                            }
+                                            className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-zinc-850 hover:text-white border border-white/5 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                            title="Ver detalles de registro"
+                                          >
+                                            <Eye className="w-3.5 h-3.5 text-zinc-400" />{" "}
+                                            Ver Detalles
+                                          </button>
+
+                                          {/* PDF receipt button */}
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const purchase = goldPurchases.find(
+                                                (p) => p.id === item.purchaseId,
+                                              );
+                                              if (purchase) {
+                                                handlePrintPurchaseReceipt(
+                                                  purchase,
+                                                  purchase.type === "abierto"
+                                                    ? "abierto"
+                                                    : "cierre",
+                                                );
+                                              } else {
+                                                alert(
+                                                  "No se pudo encontrar el lote original para este material.",
+                                                );
+                                              }
+                                            }}
+                                            className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-violet-950/40 hover:text-violet-400 border border-white/5 hover:border-violet-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                            title="Descargar PDF de recibo de compra"
+                                          >
+                                            <FileText className="w-3.5 h-3.5 text-red-400/80" />{" "}
+                                            Recibo PDF
+                                          </button>
+
+                                          {/* Transfer individual button */}
+                                          {!item.isTransferred &&
+                                            !item.isHistoric &&
+                                            item.purchaseType === "cerrado" && (
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  setSelectedTransferMaterials([
+                                                    item.id!,
+                                                  ]);
+                                                  setShowTransferModal(true);
+                                                }}
+                                                className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-emerald-950/40 hover:text-emerald-400 border border-white/5 hover:border-emerald-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                                title="Transferir a Central ahora"
+                                              >
+                                                <ArrowUpRight className="w-3.5 h-3.5 text-emerald-400/80" />{" "}
+                                                Enviar
+                                              </button>
+                                            )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+
+                                {filteredBranchItems.length === 0 && (
+                                  <tr>
+                                    <td
+                                      colSpan={11}
+                                      className="px-6 py-20 text-center text-zinc-500 italic text-xs"
+                                    >
+                                      No hay materiales que coincidan con la
+                                      búsqueda o filtros.
                                     </td>
                                   </tr>
-                                );
-                              })}
-
-                              {filteredBranchItems.length === 0 && (
-                                <tr>
-                                  <td
-                                    colSpan={11}
-                                    className="px-6 py-20 text-center text-zinc-500 italic text-xs"
-                                  >
-                                    No hay materiales que coincidan con la
-                                    búsqueda o filtros.
-                                  </td>
-                                </tr>
-                              )}
-                            </tbody>
-                          </table>
-                        </div>
-
-                        {/* Pagination segment */}
-                        {filteredBranchItems.length > itemsPerPage && (
-                          <div className="p-4 border-t border-white/5 bg-zinc-900/30">
-                            <Pagination
-                              totalItems={filteredBranchItems.length}
-                              currentPage={branchInventoryPage}
-                              onPageChange={(page) =>
-                                setBranchInventoryPage(page)
-                              }
-                              itemsPerPage={itemsPerPage}
-                            />
+                                )}
+                              </tbody>
+                            </table>
                           </div>
-                        )}
-                      </div>
+
+                          {/* Pagination segment */}
+                          {filteredBranchItems.length > itemsPerPage && (
+                            <div className="p-4 border-t border-white/5 bg-zinc-900/30">
+                              <Pagination
+                                totalItems={filteredBranchItems.length}
+                                currentPage={branchInventoryPage}
+                                onPageChange={(page) =>
+                                  setBranchInventoryPage(page)
+                                }
+                                itemsPerPage={itemsPerPage}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
@@ -25663,6 +26723,8 @@ DB_NAME=aurum_gestor
           title="Nuevo Registro"
           subtitle="Ingrese los detalles del material de oro"
           submitLabel="Registrar Material"
+          clients={clients}
+          fetchData={fetchData}
         />
 
         {/* Edit Modal */}
@@ -25679,6 +26741,8 @@ DB_NAME=aurum_gestor
           title="Editar Registro"
           subtitle="Actualice los detalles del material de oro"
           submitLabel="Guardar Cambios"
+          clients={clients}
+          fetchData={fetchData}
         />
 
         {/* Delete Confirmation Modal */}
@@ -35274,7 +36338,6 @@ DB_NAME=aurum_gestor
                             type="number"
                             step="0.01"
                             required
-                            min={0}
                             placeholder="Ingrese la cantidad de efectivo físico"
                             value={
                               closureFormData.physicalBalance !== undefined
@@ -36189,22 +37252,30 @@ DB_NAME=aurum_gestor
                           <span className="text-[9px] text-zinc-500 uppercase font-mono block">
                             Pureza Registrada
                           </span>
-                          <span className="text-xs font-mono font-bold text-zinc-200">
-                            {(viewingItemDetail.purity * 1000).toFixed(0)} Ley /{" "}
-                            {formatNumber(viewingItemDetail.purity)}
-                          </span>
+                          {(() => {
+                            const isPct = viewingItemDetail.purity > 1;
+                            const pctValue = isPct ? viewingItemDetail.purity : viewingItemDetail.purity * 100;
+                            const leyValue = (pctValue * 10).toFixed(0);
+                            return (
+                              <span className="text-xs font-mono font-bold text-zinc-200">
+                                {leyValue} Ley / {formatNumber(pctValue)}%
+                              </span>
+                            );
+                          })()}
                         </div>
                         <div>
                           <span className="text-[9px] text-zinc-500 uppercase font-mono block">
                             Equivalente 100% (Ley 1000)
                           </span>
-                          <span className="text-xs font-mono text-zinc-200 font-black">
-                            {formatNumber(
-                              viewingItemDetail.finalWeight *
-                                viewingItemDetail.purity,
-                            )}{" "}
-                            g
-                          </span>
+                          {(() => {
+                            const isPct = viewingItemDetail.purity > 1;
+                            const purityFraction = isPct ? viewingItemDetail.purity / 100 : viewingItemDetail.purity;
+                            return (
+                              <span className="text-xs font-mono text-zinc-200 font-black">
+                                {formatNumber(viewingItemDetail.finalWeight * purityFraction)} g
+                              </span>
+                            );
+                          })()}
                         </div>
                         <div>
                           <span className="text-[9px] text-zinc-500 uppercase font-mono block">
@@ -39902,833 +40973,117 @@ DB_NAME=aurum_gestor
             </motion.div>
           ))}
         </AnimatePresence>
+
+        {/* QR Badge Modal for easy login badge generation */}
+        <AnimatePresence>
+          {qrBadgeUser && (
+            <div 
+              onClick={() => setQrBadgeUser(null)}
+              className="fixed inset-0 z-50 overflow-y-auto bg-zinc-950/85 backdrop-blur-md flex items-center justify-center p-4 cursor-pointer"
+            >
+              <motion.div
+                onClick={(e) => e.stopPropagation()}
+                initial={{ opacity: 0, scale: 0.95, y: 15 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 15 }}
+                className="relative bg-zinc-950 border border-white/5 rounded-[40px] p-8 max-w-sm w-full shadow-2xl overflow-hidden group text-center cursor-default"
+              >
+                {/* Decorative corner lines */}
+                <div className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-amber-500/30 rounded-tl-3xl pointer-events-none" />
+                <div className="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-amber-500/30 rounded-tr-3xl pointer-events-none" />
+                <div className="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-amber-500/30 rounded-bl-3xl pointer-events-none" />
+                <div className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-amber-500/30 rounded-br-3xl pointer-events-none" />
+
+                <div className="flex justify-between items-center mb-6">
+                  <span className="text-[9px] font-black uppercase text-zinc-500 tracking-[0.2em]">Credencial de Seguridad</span>
+                  <button
+                    onClick={() => setQrBadgeUser(null)}
+                    className="p-2 bg-zinc-900 rounded-xl border border-white/5 text-zinc-400 hover:text-rose-450 transition-colors cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Printable Card Container */}
+                <div id="printable-qr-badge" className="bg-zinc-900 border border-white/5 p-6 rounded-3xl relative overflow-hidden flex flex-col items-center">
+                  {/* Subtle logo/branding background */}
+                  <div className="absolute inset-0 bg-gradient-to-b from-amber-500/[0.02] to-transparent pointer-events-none" />
+                  
+                  <h2 className="text-xl font-serif italic text-zinc-100 tracking-tight mb-0.5">
+                    {companySettings?.name || "Aurum Manager"}
+                  </h2>
+                  <p className="text-[8px] font-black uppercase tracking-[0.3em] text-amber-500/70 border-b border-white/5 pb-3 mb-4 w-full text-center">
+                    Credencial de Acceso Rápido
+                  </p>
+
+                  {/* QR Code Container */}
+                  <div className="bg-white p-4 rounded-2xl shadow-xl flex items-center justify-center mb-4 border border-zinc-200">
+                    <img
+                      src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=AURUM_QR_AUTH:${qrBadgeUser.username}:${qrBadgeUser.pin}`}
+                      alt={`Código QR para ${qrBadgeUser.name}`}
+                      className="w-40 h-40 object-contain selection:bg-transparent"
+                      referrerPolicy="no-referrer"
+                    />
+                  </div>
+
+                  <h3 className="text-base font-black text-zinc-100 tracking-tight leading-none mb-1.5">{qrBadgeUser.name}</h3>
+                  <p className="text-xs text-zinc-400 font-bold uppercase tracking-wider mb-0.5">@{qrBadgeUser.username}</p>
+                  <p className="text-[10px] bg-blue-500/10 border border-blue-500/20 text-blue-400 px-3 py-1 rounded-full font-black uppercase tracking-widest mt-2 scale-90">
+                    {qrBadgeUser.role}
+                  </p>
+
+                  {qrBadgeUser.branchId && (
+                    <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-widest mt-2 text-center">
+                      Sucursal: {branches.find(b => b.id === qrBadgeUser.branchId)?.name || "Sede Central"}
+                    </p>
+                  )}
+
+                  <div className="mt-4 pt-3 w-full border-t border-white/5 flex justify-center">
+                     <span className="text-[8px] font-mono text-zinc-600 tracking-wider">PIN de Respaldo: {qrBadgeUser.pin}</span>
+                  </div>
+                </div>
+
+                {/* Action buttons */}
+                <div className="grid grid-cols-2 gap-3 mt-6">
+                  <button
+                    onClick={() => {
+                      window.print();
+                    }}
+                    className="py-3 bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-xs uppercase tracking-wider rounded-2xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg active:scale-95 border border-blue-500"
+                  >
+                    <Printer className="w-4 h-4" />
+                    <span>Imprimir</span>
+                  </button>
+                  
+                  <button
+                    onClick={() => {
+                      const link = document.createElement("a");
+                      link.href = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=AURUM_QR_AUTH:${qrBadgeUser.username}:${qrBadgeUser.pin}`;
+                      link.download = `credencial_${qrBadgeUser.username}.png`;
+                      link.target = "_blank";
+                      link.click();
+                    }}
+                    className="py-3 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 font-extrabold text-xs uppercase tracking-wider rounded-2xl flex items-center justify-center gap-2 transition-all border border-white/5 active:scale-95 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Descargar</span>
+                  </button>
+                </div>
+
+                <div className="mt-4">
+                  <button
+                    type="button"
+                    onClick={() => setQrBadgeUser(null)}
+                    className="w-full py-3 bg-zinc-900 hover:bg-zinc-850 text-zinc-400 hover:text-zinc-200 rounded-2xl text-xs font-black uppercase tracking-widest transition-all border border-white/5 active:scale-95 cursor-pointer"
+                  >
+                    Cerrar Guardado
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
       </div>
     </ErrorBoundary>
-  );
-}
-
-interface BranchSmeltingAuditPanelProps {
-  materials: Material[];
-  branches: Branch[];
-  goldPurchases: GoldPurchase[];
-}
-
-export function BranchSmeltingAuditPanel({
-  materials,
-  branches,
-  goldPurchases,
-}: BranchSmeltingAuditPanelProps) {
-  const [selectedBranchId, setSelectedBranchId] = useState<string>("all");
-  const [timeRange, setTimeRange] = useState<string>("all");
-  const [searchTerm, setSearchTerm] = useState<string>("");
-  const [expandedBars, setExpandedBars] = useState<string[]>([]);
-
-  const toggleExpandBar = (id: string) => {
-    if (expandedBars.includes(id)) {
-      setExpandedBars(expandedBars.filter((barId) => barId !== id));
-    } else {
-      setExpandedBars([...expandedBars, id]);
-    }
-  };
-
-  // Compile all completed smelting operations (bar materials and their components)
-  const auditedBars = useMemo(() => {
-    return materials
-      .filter((m) => m.type === "barra" && m.status !== "eliminado")
-      .map((m) => {
-        const sourceMaterials = m.sourceMaterials || [];
-
-        // Sum final weights of raw materials because final weight is what was logged at purchase
-        const inputWeight = sourceMaterials.reduce(
-          (acc, src) => acc + (src.finalWeight || 0),
-          0,
-        );
-
-        // Weighted average purity of source materials
-        const totalWeightedPurity = sourceMaterials.reduce(
-          (acc, src) => acc + (src.finalWeight || 0) * (src.purity || 0),
-          0,
-        );
-        const weightedSrcPurity =
-          inputWeight > 0 ? totalWeightedPurity / inputWeight : 0;
-
-        // Final Weight of the bar
-        const finalWeight = m.finalWeight || m.initialWeight || 0;
-
-        // Loss (Merma) in grams
-        const lossAmount = Math.max(0, inputWeight - finalWeight);
-
-        // Loss percentage
-        const lossPercentage =
-          inputWeight > 0 ? (lossAmount / inputWeight) * 100 : 0;
-
-        // Final Purity of the bar after refinement/smelting
-        const finalPurity = m.purity || 0;
-
-        // Ley (Purity) concentration gain
-        const purityGain = finalPurity - weightedSrcPurity;
-
-        // Trace back the branch of origin
-        let branchId = "unknown";
-        let branchName = "Depósito Central";
-
-        if (sourceMaterials.length > 0) {
-          for (const src of sourceMaterials) {
-            const purchase = goldPurchases.find(
-              (p) => p.receiptNumber === src.receiptNumber,
-            );
-            if (purchase) {
-              branchId = purchase.branchId;
-              const b = branches.find((br) => br.id === purchase.branchId);
-              if (b) branchName = b.name;
-              break;
-            }
-          }
-        } else {
-          // Check if bar itself matches any purchase receipt directly
-          const purchase = goldPurchases.find(
-            (p) => p.receiptNumber === m.receiptNumber,
-          );
-          if (purchase) {
-            branchId = purchase.branchId;
-            const b = branches.find((br) => br.id === purchase.branchId);
-            if (b) branchName = b.name;
-          }
-        }
-
-        return {
-          id: m.id || `bar-${m.receiptNumber}`,
-          receiptNumber: m.receiptNumber,
-          date: m.registrationDate,
-          inputWeight,
-          finalWeight,
-          lossAmount,
-          lossPercentage,
-          weightedSrcPurity,
-          finalPurity,
-          purityGain,
-          branchId,
-          branchName,
-          sourceCount: sourceMaterials.length,
-          sourceMaterials,
-          createdBy: m.createdBy || "system",
-        };
-      })
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  }, [materials, goldPurchases, branches]);
-
-  // Apply selectors (branch, time and search term)
-  const filteredBars = useMemo(() => {
-    return auditedBars.filter((bar) => {
-      if (selectedBranchId !== "all" && bar.branchId !== selectedBranchId) {
-        return false;
-      }
-
-      if (timeRange !== "all") {
-        const barDate = new Date(bar.date);
-        const now = new Date();
-        const limit = new Date();
-
-        if (timeRange === "30days") {
-          limit.setDate(now.getDate() - 30);
-          if (barDate < limit) return false;
-        } else if (timeRange === "90days") {
-          limit.setDate(now.getDate() - 90);
-          if (barDate < limit) return false;
-        }
-      }
-
-      if (searchTerm.trim() !== "") {
-        const term = searchTerm.toLowerCase();
-        const receiptMatch = bar.receiptNumber?.toLowerCase().includes(term);
-        const creatorMatch = bar.createdBy?.toLowerCase().includes(term);
-        const branchMatch = bar.branchName?.toLowerCase().includes(term);
-        if (!receiptMatch && !creatorMatch && !branchMatch) return false;
-      }
-
-      return true;
-    });
-  }, [auditedBars, selectedBranchId, timeRange, searchTerm]);
-
-  // Compute aggregate statistics
-  const metrics = useMemo(() => {
-    const totalBars = filteredBars.length;
-    if (totalBars === 0) {
-      return {
-        totalInputsWeight: 0,
-        totalOutputsWeight: 0,
-        totalLoss: 0,
-        averageLossPercentage: 0,
-        avgSrcPurity: 0,
-        avgFinalPurity: 0,
-        avgPurityGain: 0,
-      };
-    }
-
-    let totalInputsWeight = 0;
-    let totalOutputsWeight = 0;
-    let sumSrcPurity = 0;
-    let sumFinalPurity = 0;
-
-    filteredBars.forEach((bar) => {
-      totalInputsWeight += bar.inputWeight;
-      totalOutputsWeight += bar.finalWeight;
-      sumSrcPurity += bar.weightedSrcPurity;
-      sumFinalPurity += bar.finalPurity;
-    });
-
-    const totalLoss = Math.max(0, totalInputsWeight - totalOutputsWeight);
-    const averageLossPercentage =
-      totalInputsWeight > 0 ? (totalLoss / totalInputsWeight) * 100 : 0;
-    const avgSrcPurity = sumSrcPurity / totalBars;
-    const avgFinalPurity = sumFinalPurity / totalBars;
-    const avgPurityGain = avgFinalPurity - avgSrcPurity;
-
-    return {
-      totalInputsWeight,
-      totalOutputsWeight,
-      totalLoss,
-      averageLossPercentage,
-      avgSrcPurity,
-      avgFinalPurity,
-      avgPurityGain,
-    };
-  }, [filteredBars]);
-
-  // Gather chart data formatted correctly for Recharts (limit to last 12 chronological for clarity)
-  const chartData = useMemo(() => {
-    return [...filteredBars]
-      .reverse()
-      .slice(-12)
-      .map((bar) => ({
-        name: bar.receiptNumber.startsWith("F-")
-          ? bar.receiptNumber
-          : `F-${bar.receiptNumber.slice(0, 6)}`,
-        "Peso Origen (g)": parseFloat(bar.inputWeight.toFixed(2)),
-        "Peso Barra (g)": parseFloat(bar.finalWeight.toFixed(2)),
-        "Ley Origen (%)": parseFloat(bar.weightedSrcPurity.toFixed(2)),
-        "Ley Final (%)": parseFloat(bar.finalPurity.toFixed(2)),
-        "Merma (%)": parseFloat(bar.lossPercentage.toFixed(2)),
-        "Mejora Ley (%)": parseFloat(bar.purityGain.toFixed(2)),
-      }));
-  }, [filteredBars]);
-
-  // Export report of selected sucursal smelting parameters to excel
-  const exportAuditToExcel = () => {
-    if (filteredBars.length === 0) {
-      alert("No hay registros de auditoría para exportar.");
-      return;
-    }
-
-    const dataForExcel = filteredBars.flatMap((bar) => {
-      const masterRow = {
-        "Fecha Fundición": bar.date,
-        "Nro. Recibo": bar.receiptNumber,
-        "Sucursal de Origen": bar.branchName,
-        "Operador Fundidor": bar.createdBy,
-        "Componentes Fundidos": bar.sourceCount,
-        "PESO INICIAL TOTAL (g)": bar.inputWeight,
-        "PESO BARRA RESULTANTE (g)": bar.finalWeight,
-        "MERMA OBTENIDA (g)": bar.lossAmount,
-        "MERMA (%)": bar.lossPercentage,
-        "LEY COMPONENTES PROMEDIO (%)": bar.weightedSrcPurity,
-        "LEY REFINADA BARRA (%)": bar.finalPurity,
-        "REFINE INCREMENTO LEY (%)": bar.purityGain,
-        "Estado de Rendimiento":
-          bar.lossPercentage > 4 ? "MERMA ELEVADA" : "MERMA NORMAL",
-        "Fila de Registro": "RESUMEN",
-      };
-
-      const componentRows = bar.sourceMaterials.map((src, idx) => ({
-        "Fecha Fundición": "",
-        "Nro. Recibo": `   ↳ Componente ${idx + 1}: #${src.receiptNumber}`,
-        "Sucursal de Origen": "",
-        "Operador Fundidor": "",
-        "Componentes Fundidos": "",
-        "PESO INICIAL TOTAL (g)": src.finalWeight,
-        "PESO BARRA RESULTANTE (g)": "",
-        "MERMA OBTENIDA (g)": "",
-        "MERMA (%)": "",
-        "LEY COMPONENTES PROMEDIO (%)": src.purity,
-        "LEY REFINADA BARRA (%)": "",
-        "REFINE INCREMENTO LEY (%)": "",
-        "Estado de Rendimiento": "",
-        "Fila de Registro": `COMPONENTE (#${src.receiptNumber})`,
-      }));
-
-      return [masterRow, ...componentRows];
-    });
-
-    const ws = XLSX.utils.json_to_sheet(dataForExcel);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Auditoría de Fundición");
-
-    // Auto-size columns for premium aesthetics
-    const maxLens = Object.keys(dataForExcel[0] || {}).map((key) => {
-      return Math.max(
-        key.length,
-        ...dataForExcel.map((row) => String((row as any)[key] || "").length),
-      );
-    });
-    ws["!cols"] = maxLens.map((len) => ({ wch: len + 3 }));
-
-    XLSX.writeFile(
-      wb,
-      `Reporte_Auditoria_Fundicion_${selectedBranchId === "all" ? "Consolidado" : selectedBranchId}_${new Date().toISOString().slice(0, 10)}.xlsx`,
-    );
-  };
-
-  return (
-    <div className="space-y-8 animate-none">
-      {/* Title & Introduction */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-zinc-900/40 p-6 rounded-3xl border border-white/5 gap-4">
-        <div>
-          <h2 className="text-xl font-bold text-zinc-100 flex items-center gap-2">
-            <Flame className="w-5 h-5 text-amber-500 animate-pulse" /> Auditoría
-            de Rendimiento de Fundición
-          </h2>
-          <p className="text-xs text-zinc-400 mt-1 max-w-2xl">
-            Compara con exactitud científica el peso y la pureza (ley) del oro
-            adquirido en sucursales en su etapa inicial de compra contra el
-            rendimiento de las barras refinadas tras el proceso de fundición.
-          </p>
-        </div>
-        <button
-          onClick={exportAuditToExcel}
-          disabled={filteredBars.length === 0}
-          className="flex items-center gap-2 px-4 py-2 bg-zinc-100 hover:bg-white text-zinc-950 rounded-xl text-xs font-bold transition-all shadow-md shrink-0 disabled:opacity-40 disabled:pointer-events-none"
-        >
-          <Download className="w-4 h-4" /> Exportar Auditoría
-        </button>
-      </div>
-
-      {/* Selectors and Filters */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-zinc-950 p-4 rounded-3xl border border-white/5 shadow-sm">
-        <div>
-          <label className="block text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 pl-1">
-            Filtrar por Sucursal
-          </label>
-          <div className="relative">
-            <Building2 className="absolute left-3.5 top-3 w-4 h-4 text-zinc-500" />
-            <select
-              value={selectedBranchId}
-              onChange={(e) => setSelectedBranchId(e.target.value)}
-              className="w-full bg-zinc-900 border border-white/5 rounded-2xl pl-10 pr-4 py-2 text-xs font-bold text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/30 transition-all cursor-pointer h-10"
-            >
-              <option value="all">Todas las Sucursales (Consolidado)</option>
-              {branches.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name} ({b.abbreviation})
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 pl-1">
-            Rango Postal de Tiempo
-          </label>
-          <div className="relative">
-            <Clock className="absolute left-3.5 top-3 w-4 h-4 text-zinc-500" />
-            <select
-              value={timeRange}
-              onChange={(e) => setTimeRange(e.target.value)}
-              className="w-full bg-zinc-900 border border-white/5 rounded-2xl pl-10 pr-4 py-2 text-xs font-bold text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/30 transition-all cursor-pointer h-10"
-            >
-              <option value="all">Histórico Completo</option>
-              <option value="30days">Últimos 30 días</option>
-              <option value="90days">Últimos 90 días</option>
-            </select>
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 pl-1">
-            Buscar por Recibo / Operador
-          </label>
-          <div className="relative">
-            <Search className="absolute left-3.5 top-3 w-4 h-4 text-zinc-500" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Ej: F-1718 o administrador..."
-              className="w-full bg-zinc-900 border border-white/5 rounded-2xl pl-10 pr-4 py-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30 transition-all h-10"
-            />
-          </div>
-        </div>
-      </div>
-
-      {filteredBars.length === 0 ? (
-        <div className="bg-zinc-900/30 p-12 rounded-[32px] border border-white/5 text-center">
-          <AlertCircle className="w-8 h-8 text-amber-500/50 mx-auto mb-3 animate-pulse" />
-          <p className="text-zinc-300 font-bold text-sm">
-            No se encontraron barras fundidas con los filtros actuales
-          </p>
-          <p className="text-xs text-zinc-500 mt-1 max-w-md mx-auto">
-            Para realizar una auditoría, asegúrese de registrar una fundición en
-            el panel de inventario central para que se compilen materias primas
-            en barras refinadas.
-          </p>
-        </div>
-      ) : (
-        <>
-          {/* Auditing KPI Panel */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 flex flex-col justify-between shadow-sm hover:border-amber-500/10 transition-colors">
-              <div>
-                <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">
-                  Lotes Auditados
-                </span>
-                <p className="text-2xl font-black text-zinc-100 font-mono mt-2">
-                  {filteredBars.length}
-                </p>
-              </div>
-              <div className="pt-3 border-t border-white/5 mt-4 flex items-center justify-between text-[11px]">
-                <span className="text-zinc-400">Total de fundiciones</span>
-                <span className="font-bold text-amber-500">✓ Activo</span>
-              </div>
-            </div>
-
-            <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 flex flex-col justify-between shadow-sm hover:border-amber-500/10 transition-colors">
-              <div>
-                <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">
-                  Rendimiento de Peso (Masa)
-                </span>
-                <p className="text-lg font-black text-zinc-100 font-mono mt-2">
-                  {formatNumber(metrics.totalInputsWeight)}g{" "}
-                  <span className="text-zinc-500 font-normal text-xs">→</span>{" "}
-                  {formatNumber(metrics.totalOutputsWeight)}g
-                </p>
-              </div>
-              <div className="pt-3 border-t border-white/5 mt-4 flex items-center justify-between text-[11px]">
-                <span className="text-zinc-400">Retorno de Oro</span>
-                <span className="font-extrabold text-emerald-400 font-mono">
-                  {formatNumber(
-                    metrics.totalInputsWeight > 0
-                      ? (metrics.totalOutputsWeight /
-                          metrics.totalInputsWeight) *
-                          100
-                      : 0,
-                  )}
-                  %
-                </span>
-              </div>
-            </div>
-
-            <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 flex flex-col justify-between shadow-sm hover:border-amber-500/10 transition-colors">
-              <div>
-                <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">
-                  Merma Promedio General
-                </span>
-                <p className="text-2xl font-black text-red-400 font-mono mt-2">
-                  {formatNumber(metrics.averageLossPercentage)}%
-                </p>
-              </div>
-              <div className="pt-3 border-t border-white/5 mt-4 flex items-center justify-between text-[11px]">
-                <span className="text-zinc-400">Pérdida neta de peso</span>
-                <span className="font-bold font-mono text-zinc-400">
-                  -{formatNumber(metrics.totalLoss)}g
-                </span>
-              </div>
-            </div>
-
-            <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 flex flex-col justify-between shadow-sm hover:border-amber-500/10 transition-colors">
-              <div>
-                <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">
-                  Mejora de Pureza (Refinado)
-                </span>
-                <div className="flex items-baseline gap-2 mt-2">
-                  <p className="text-2xl font-black text-emerald-400 font-mono">
-                    +{formatNumber(metrics.avgPurityGain)}%
-                  </p>
-                  <span className="text-[10px] text-zinc-400 font-mono">
-                    Ley Delta
-                  </span>
-                </div>
-              </div>
-              <div className="pt-3 border-t border-white/5 mt-4 flex items-center justify-between text-[11px]">
-                <span className="text-zinc-400">Pond. Origen a Barra</span>
-                <span className="text-zinc-300 font-mono font-bold">
-                  {formatNumber(metrics.avgSrcPurity, 1)}% ley →{" "}
-                  {formatNumber(metrics.avgFinalPurity, 1)}%
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Interactive Recharts Graphics */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Peso Chart */}
-            <div className="bg-zinc-900 p-6 rounded-[28px] border border-white/5 shadow-sm">
-              <div className="flex justify-between items-center mb-6">
-                <div>
-                  <h3 className="text-sm font-bold text-zinc-100">
-                    Auditoría de Masa (Peso Inicial vs. Final)
-                  </h3>
-                  <p className="text-[10px] text-zinc-400">
-                    Muestra la pérdida por merma física en gramos durante la
-                    fundición.
-                  </p>
-                </div>
-                <div className="flex gap-4 text-[10px] font-bold">
-                  <span className="flex items-center gap-1">
-                    <span className="w-2.5 h-2.5 bg-orange-500 rounded-sm" />{" "}
-                    Origen
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-2.5 h-2.5 bg-amber-500 rounded-sm" />{" "}
-                    Barra
-                  </span>
-                </div>
-              </div>
-              <div className="h-72">
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart
-                    data={chartData}
-                    margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
-                  >
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      vertical={false}
-                      stroke="rgba(255,255,255,0.03)"
-                    />
-                    <XAxis
-                      dataKey="name"
-                      stroke="#52525b"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={false}
-                    />
-                    <YAxis
-                      stroke="#52525b"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={false}
-                      unit="g"
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "#18181b",
-                        borderColor: "rgba(255,255,255,0.08)",
-                        borderRadius: "12px",
-                      }}
-                      labelStyle={{
-                        fontWeight: "bold",
-                        color: "#f4f4f5",
-                        fontSize: "12px",
-                      }}
-                      itemStyle={{ fontSize: "11px", color: "#a1a1aa" }}
-                    />
-                    <Legend
-                      verticalAlign="bottom"
-                      height={36}
-                      iconType="circle"
-                      wrapperStyle={{ fontSize: "10px", paddingTop: "15px" }}
-                    />
-                    <Bar
-                      dataKey="Peso Origen (g)"
-                      fill="#f97316"
-                      radius={[4, 4, 0, 0]}
-                      maxBarSize={30}
-                    />
-                    <Bar
-                      dataKey="Peso Barra (g)"
-                      fill="#f59e0b"
-                      radius={[4, 4, 0, 0]}
-                      maxBarSize={30}
-                    />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            {/* Purity Chart */}
-            <div className="bg-zinc-900 p-6 rounded-[28px] border border-white/5 shadow-sm">
-              <div className="flex justify-between items-center mb-6">
-                <div>
-                  <h3 className="text-sm font-bold text-zinc-100">
-                    Rendimiento de Pureza (Mejora de Ley)
-                  </h3>
-                  <p className="text-[10px] text-zinc-400">
-                    Verifica que el refinado incremente correctamente la ley (%)
-                    del lote.
-                  </p>
-                </div>
-                <div className="flex gap-4 text-[10px] font-bold">
-                  <span className="flex items-center gap-1">
-                    <span className="w-2.5 h-2.5 bg-zinc-600 rounded-sm" /> Ley
-                    Origen
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-2.5 h-2.5 bg-yellow-400 rounded-sm" />{" "}
-                    Ley Barra
-                  </span>
-                </div>
-              </div>
-              <div className="h-72">
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart
-                    data={chartData}
-                    margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
-                  >
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      vertical={false}
-                      stroke="rgba(255,255,255,0.03)"
-                    />
-                    <XAxis
-                      dataKey="name"
-                      stroke="#52525b"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={false}
-                    />
-                    <YAxis
-                      stroke="#52525b"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={false}
-                      unit="%"
-                      domain={[50, 100]}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "#18181b",
-                        borderColor: "rgba(255,255,255,0.08)",
-                        borderRadius: "12px",
-                      }}
-                      labelStyle={{
-                        fontWeight: "bold",
-                        color: "#f4f4f5",
-                        fontSize: "12px",
-                      }}
-                      itemStyle={{ fontSize: "11px", color: "#a1a1aa" }}
-                    />
-                    <Legend
-                      verticalAlign="bottom"
-                      height={36}
-                      iconType="circle"
-                      wrapperStyle={{ fontSize: "10px", paddingTop: "15px" }}
-                    />
-                    <Bar
-                      dataKey="Ley Origen (%)"
-                      fill="#4b5563"
-                      radius={[4, 4, 0, 0]}
-                      maxBarSize={30}
-                    />
-                    <Bar
-                      dataKey="Ley Final (%)"
-                      fill="#fbbf24"
-                      radius={[4, 4, 0, 0]}
-                      maxBarSize={30}
-                    />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-
-          {/* Historical Items Audit Table */}
-          <div className="bg-zinc-900 border border-white/5 rounded-3xl shadow-sm overflow-hidden">
-            <div className="px-6 py-5 border-b border-white/5 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-zinc-950/60">
-              <div>
-                <h3 className="font-extrabold text-zinc-100 text-sm flex items-center gap-2">
-                  Historial de Fundiciones Auditadas
-                </h3>
-                <p className="text-zinc-500 text-[11px] mt-0.5">
-                  Mostrando {filteredBars.length} barra(s) registradas.
-                </p>
-              </div>
-              <span className="px-2.5 py-1 bg-amber-500/10 border border-amber-500/15 rounded-xl text-[10px] font-black uppercase text-amber-500 tracking-wider">
-                Auditoría en Tiempo Real
-              </span>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse table-auto">
-                <thead>
-                  <tr className="bg-zinc-900/80 border-b border-white/5 text-[10px] font-bold uppercase text-zinc-400 tracking-widest">
-                    <th className="px-6 py-4">Lote / Recibo</th>
-                    <th className="px-6 py-4">Origen</th>
-                    <th className="px-6 py-4">Fecha</th>
-                    <th className="px-6 py-4 text-center">Componentes</th>
-                    <th className="px-6 py-4 text-right">
-                      Masa Origen → Barra
-                    </th>
-                    <th className="px-6 py-4 text-center">Merma %</th>
-                    <th className="px-6 py-4 text-right">Ley Origen → Barra</th>
-                    <th className="px-6 py-4 text-center">Estado Lote</th>
-                    <th className="px-6 py-4 text-center">Detalle</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5 text-xs">
-                  {filteredBars.map((bar) => {
-                    const isExpanded = expandedBars.includes(bar.id);
-                    const isNormalMerma = bar.lossPercentage <= 3.5;
-                    const isWarningMerma =
-                      bar.lossPercentage > 3.5 && bar.lossPercentage < 5;
-
-                    return (
-                      <React.Fragment key={bar.id}>
-                        <tr className="hover:bg-white/[0.01] transition-all">
-                          <td className="px-6 py-4 font-mono font-bold text-amber-500 text-sm">
-                            {bar.receiptNumber}
-                          </td>
-                          <td className="px-6 py-4">
-                            <div className="flex flex-col">
-                              <span className="font-bold text-zinc-200">
-                                {bar.branchName}
-                              </span>
-                              <span className="text-[10px] text-zinc-500">
-                                Fundido por: {bar.createdBy}
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4 font-mono text-zinc-400">
-                            {bar.date.includes("T")
-                              ? bar.date.split("T")[0]
-                              : bar.date}
-                          </td>
-                          <td className="px-6 py-4 text-center font-bold font-mono text-zinc-300">
-                            {bar.sourceCount} pza(s)
-                          </td>
-                          <td className="px-6 py-4 text-right font-mono font-medium">
-                            <div className="flex flex-col items-end">
-                              <span className="text-zinc-200">
-                                {formatNumber(bar.inputWeight)}g
-                              </span>
-                              <span className="text-[10px] text-zinc-500">
-                                → {formatNumber(bar.finalWeight)}g
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4 text-center font-mono">
-                            <span
-                              className={`px-2 py-0.5 rounded-lg text-[11px] font-bold ${
-                                isNormalMerma
-                                  ? "text-zinc-300 bg-zinc-800"
-                                  : isWarningMerma
-                                    ? "text-amber-400 bg-amber-500/10"
-                                    : "text-red-400 bg-red-500/10"
-                              }`}
-                            >
-                              -{formatNumber(bar.lossPercentage)}%
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 text-right font-mono">
-                            <div className="flex flex-col items-end">
-                              <span className="text-zinc-400">
-                                {formatNumber(bar.weightedSrcPurity, 1)}%
-                              </span>
-                              <span className="text-[11px] text-emerald-400">
-                                → {formatNumber(bar.finalPurity, 1)}%
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4 text-center">
-                            <span
-                              className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${
-                                isNormalMerma
-                                  ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/15"
-                                  : isWarningMerma
-                                    ? "bg-amber-500/10 text-amber-500 border border-amber-500/15"
-                                    : "bg-red-500/10 text-red-400 border border-red-500/15"
-                              }`}
-                            >
-                              {isNormalMerma
-                                ? "Normal ✓"
-                                : isWarningMerma
-                                  ? "Alerta ⚠️"
-                                  : "Crítico ✖"}
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 text-center">
-                            <button
-                              type="button"
-                              onClick={() => toggleExpandBar(bar.id)}
-                              className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 hover:text-white rounded-xl text-[10px] font-bold transition-all text-zinc-300"
-                            >
-                              {isExpanded ? "Ocultar" : "Componentes"}
-                            </button>
-                          </td>
-                        </tr>
-
-                        {isExpanded && (
-                          <tr className="bg-zinc-950/40">
-                            <td
-                              colSpan={9}
-                              className="px-8 py-5 border-t border-b border-white/5"
-                            >
-                              <div className="rounded-2xl border border-white/5 bg-zinc-950 p-4 space-y-3">
-                                <span className="text-[10px] font-black uppercase text-amber-500 tracking-widest block mb-1">
-                                  Trazabilidad de Componentes de Compra en
-                                  Origen
-                                </span>
-                                <div className="overflow-x-auto">
-                                  <table className="w-full text-left font-mono">
-                                    <thead>
-                                      <tr className="border-b border-white/5 text-[9px] text-zinc-500 uppercase font-black">
-                                        <th className="py-2">
-                                          Código Recibo Compra
-                                        </th>
-                                        <th className="py-2">
-                                          Cliente Proveedor
-                                        </th>
-                                        <th className="py-2 text-right">
-                                          Peso Registrado
-                                        </th>
-                                        <th className="py-2 text-right">
-                                          Ley (%) Compra
-                                        </th>
-                                        <th className="py-2 text-right">
-                                          Monto BS
-                                        </th>
-                                        <th className="py-2 text-center">
-                                          Fecha Compra
-                                        </th>
-                                      </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-white/5 text-[11px] text-zinc-300">
-                                      {bar.sourceMaterials.map((src, idx) => (
-                                        <tr key={`${src.receiptNumber}-${idx}`}>
-                                          <td className="py-2 text-orange-400 font-bold">
-                                            #{src.receiptNumber}
-                                          </td>
-                                          <td className="py-2 text-zinc-400 font-sans font-medium">
-                                            {src.client}
-                                          </td>
-                                          <td className="py-2 text-right text-zinc-100">
-                                            {formatNumber(src.finalWeight)}g
-                                          </td>
-                                          <td className="py-2 text-right text-zinc-100">
-                                            {formatNumber(src.purity)}%
-                                          </td>
-                                          <td className="py-2 text-right text-zinc-100">
-                                            {formatCurrency(src.total)}
-                                          </td>
-                                          <td className="py-2 text-center text-zinc-500">
-                                            {src.registrationDate}
-                                          </td>
-                                        </tr>
-                                      ))}
-                                    </tbody>
-                                  </table>
-                                </div>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </>
-      )}
-    </div>
   );
 }

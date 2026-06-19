@@ -179,4 +179,89 @@ body {
   scrollbar-color: var(--zinc-700) transparent;
 }
 
+@media print {
+  /* Hide absolutely everything else */
+  body * {
+    visibility: hidden !important;
+  }
+  
+  /* Show only the printable badge card container */
+  #printable-qr-badge,
+  #printable-qr-badge * {
+    visibility: visible !important;
+  }
+  
+  /* Position the printable badge card nicely on the page */
+  #printable-qr-badge {
+    visibility: visible !important;
+    position: fixed !important;
+    left: 50% !important;
+    top: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    border: 2px solid #000000 !important;
+    background-color: #ffffff !important;
+    background-image: none !important;
+    color: #000000 !important;
+    padding: 30px !important;
+    border-radius: 20px !important;
+    width: 320px !important;
+    max-width: 320px !important;
+    box-shadow: none !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    text-align: center !important;
+    z-index: 999999 !important;
+  }
+  
+  #printable-qr-badge h2 {
+    color: #000000 !important;
+    font-size: 24px !important;
+    font-weight: bold !important;
+    margin-top: 0 !important;
+    margin-bottom: 5px !important;
+  }
+  
+  #printable-qr-badge p {
+    color: #444444 !important;
+    font-size: 11px !important;
+    border-color: #cccccc !important;
+  }
+  
+  #printable-qr-badge h3 {
+    color: #000000 !important;
+    font-size: 18px !important;
+    font-weight: bold !important;
+    margin-top: 10px !important;
+    margin-bottom: 5px !important;
+  }
+  
+  #printable-qr-badge span {
+    color: #000000 !important;
+  }
+
+  /* Make sure the badge container forces black colors for text */
+  #printable-qr-badge .text-zinc-100 {
+    color: #000000 !important;
+  }
+  
+  #printable-qr-badge .text-zinc-400 {
+    color: #555555 !important;
+  }
+
+  #printable-qr-badge .text-zinc-500 {
+    color: #666666 !important;
+  }
+
+  #printable-qr-badge .text-zinc-600 {
+    color: #777777 !important;
+  }
+
+  /* Make sure the QR image is not hidden */
+  #printable-qr-badge img {
+    visibility: visible !important;
+    border: 1px solid #dddddd !important;
+  }
+}
+
 

@@ -632,6 +632,9 @@ async function startServer() {
         await targetDb.run("INSERT INTO users (id, name, username, email, pin, role, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)", 
           [crypto.randomUUID(), "Super Administrador", adminUsername, adminEmail, "1234", "superadmin", new Date().toISOString()]);
         console.log("[Db Bootstrap] Default superadmin user successfully created/verified.");
+      } else if (String(existing.pin).trim() !== "1234") {
+        await targetDb.run("UPDATE users SET pin = ? WHERE id = ?", ["1234", existing.id]);
+        console.log("[Db Bootstrap] Forced reset of default superadmin user PIN to 1234.");
       }
     } catch (err: any) {
       fs.appendFileSync("startup_log.txt", `${new Date().toISOString()} - Bootstrap (users) error: ${err.message}\n`);
@@ -898,17 +901,18 @@ async function startServer() {
   // Auth
   apiRouter.post("/auth/login", async (req, res) => {
     const { username, pin } = req.body;
-    const pinStr = String(pin);
-    console.log(`Login attempt for: ${username} with PIN: ${pinStr}`);
+    const trimmedUsername = String(username || "").trim();
+    const pinStr = String(pin || "").trim();
+    console.log(`Login attempt for: ${trimmedUsername} with PIN: ${pinStr}`);
     
     const user = await db.get(`
       SELECT * FROM users 
       WHERE (LOWER(username) = LOWER(?)) 
       OR (email IS NOT NULL AND LOWER(email) = LOWER(?))
-    `, [username, username]);
+    `, [trimmedUsername, trimmedUsername]);
 
     if (user) {
-      if (String(user.pin) === pinStr) {
+      if (String(user.pin).trim() === pinStr) {
         res.json(user);
       } else {
         res.status(401).json({ error: "PIN incorrecto" });

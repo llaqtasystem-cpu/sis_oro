@@ -1,12 +1,12 @@
 {
   "type": "sqlite",
-  "useSandbox": false,
+  "useSandbox": true,
   "mysql": {
-    "host": "sql10.freesqldatabase.com",
-    "user": "sql10830595",
-    "password": "hMBmvVqXHi",
-    "database": "sql10830595",
-    "port": 3306
+    "host": "localhost",
+    "user": "root",
+    "password": "root",
+    "database": "bd_oro",
+    "port": 8080
   },
   "sqlite": {
     "path": "database"

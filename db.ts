@@ -158,10 +158,44 @@ class MySQLConnectionWrapper implements DB {
 class SQLiteWrapper implements DB {
   isMySQL = false;
   private db: Database.Database;
-  constructor(path: string) {
-    this.db = new Database(path);
-    this.db.exec("PRAGMA foreign_keys = ON;");
+  constructor(private dbPath: string) {
+    let connectionOk = false;
     try {
+      this.db = new Database(dbPath);
+      // Run quick check to verify the database file is readable and not malformed
+      this.db.prepare("SELECT 1").get();
+      connectionOk = true;
+    } catch (e: any) {
+      const errMsg = e?.message || "";
+      if (errMsg.includes("malformed") || errMsg.includes("corrupt") || errMsg.includes("disk image is malformed")) {
+        console.error(`⚠️ SQLite Database Malformed/Corrupt detected at "${dbPath}": ${errMsg}. Initiating self-healing...`);
+      } else {
+        throw e;
+      }
+    }
+
+    if (!connectionOk) {
+      try {
+        if (this.db) {
+          try { this.db.close(); } catch (_) {}
+        }
+        // Delete malformed sqlite database files
+        const files = [dbPath, `${dbPath}-shm`, `${dbPath}-wal`, `${dbPath}-journal`];
+        for (const f of files) {
+          if (fs.existsSync(f)) {
+            fs.unlinkSync(f);
+            console.log(`Successfully removed corrupted SQLite file: ${f}`);
+          }
+        }
+      } catch (err) {
+        console.error(`Failed to delete corrupted SQLite database files at "${dbPath}":`, err);
+      }
+      // Recreate a clean database instance
+      this.db = new Database(dbPath);
+    }
+
+    try {
+      this.db.exec("PRAGMA foreign_keys = ON;");
       this.db.exec("PRAGMA journal_mode = WAL;");
       this.db.exec("PRAGMA synchronous = NORMAL;");
     } catch (e) {
