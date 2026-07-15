@@ -77,6 +77,7 @@ async function startServer() {
       branchId VARCHAR(255),
       createdAt VARCHAR(255) NOT NULL,
       photo TEXT,
+      activeSessionId VARCHAR(255),
       UNIQUE(username)
     )`,
     `CREATE TABLE IF NOT EXISTS materials (
@@ -147,8 +148,17 @@ async function startServer() {
       cashDenominations TEXT,
       lowPurityThreshold_pieza DOUBLE DEFAULT 50.0,
       lowPurityThreshold_barra DOUBLE DEFAULT 50.0,
+      minWeight_pieza DOUBLE,
+      maxWeight_pieza DOUBLE,
+      minWeight_barra DOUBLE,
+      maxWeight_barra DOUBLE,
+      minWeight_puro DOUBLE,
+      maxWeight_puro DOUBLE,
+      minWeight_cerrado DOUBLE,
+      maxWeight_cerrado DOUBLE,
       notifyEmailOnClosureDifference INTEGER DEFAULT 0,
       serverIp VARCHAR(255) DEFAULT 'localhost',
+      deletePurchasePassword VARCHAR(255) DEFAULT '',
       updatedAt VARCHAR(255) NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS branches (
@@ -524,6 +534,9 @@ async function startServer() {
       if (!await columnExists(targetDb, 'users', 'photo')) {
         await targetDb.exec("ALTER TABLE users ADD COLUMN photo TEXT");
       }
+      if (!await columnExists(targetDb, 'users', 'activeSessionId')) {
+        await targetDb.exec("ALTER TABLE users ADD COLUMN activeSessionId VARCHAR(255)");
+      }
       if (!await columnExists(targetDb, 'clients', 'photo')) {
         await targetDb.exec("ALTER TABLE clients ADD COLUMN photo TEXT");
       }
@@ -614,6 +627,33 @@ async function startServer() {
       if (!await columnExists(targetDb, 'companySettings', 'serverIp')) {
         await targetDb.exec("ALTER TABLE companySettings ADD COLUMN serverIp VARCHAR(255) DEFAULT 'localhost'");
       }
+      if (!await columnExists(targetDb, 'companySettings', 'deletePurchasePassword')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN deletePurchasePassword VARCHAR(255) DEFAULT ''");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'minWeight_pieza')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN minWeight_pieza DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'maxWeight_pieza')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN maxWeight_pieza DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'minWeight_barra')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN minWeight_barra DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'maxWeight_barra')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN maxWeight_barra DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'minWeight_puro')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN minWeight_puro DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'maxWeight_puro')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN maxWeight_puro DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'minWeight_cerrado')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN minWeight_cerrado DOUBLE");
+      }
+      if (!await columnExists(targetDb, 'companySettings', 'maxWeight_cerrado')) {
+        await targetDb.exec("ALTER TABLE companySettings ADD COLUMN maxWeight_cerrado DOUBLE");
+      }
 
       fs.appendFileSync("startup_log.txt", `${new Date().toISOString()} - Migrations successful\n`);
     } catch (err: any) {
@@ -630,7 +670,7 @@ async function startServer() {
       const existing = await targetDb.get("SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR (email IS NOT NULL AND LOWER(email) = LOWER(?))", [adminUsername, adminEmail]);
       if (!existing) {
         await targetDb.run("INSERT INTO users (id, name, username, email, pin, role, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-          [crypto.randomUUID(), "Super Administrador", adminUsername, adminEmail, "1234", "superadmin", new Date().toISOString()]);
+          ["admin", "Super Administrador", adminUsername, adminEmail, "1234", "superadmin", new Date().toISOString()]);
         console.log("[Db Bootstrap] Default superadmin user successfully created/verified.");
       } else if (String(existing.pin).trim() !== "1234") {
         await targetDb.run("UPDATE users SET pin = ? WHERE id = ?", ["1234", existing.id]);
@@ -740,6 +780,70 @@ async function startServer() {
   });
 
   const apiRouter = express.Router();
+
+  // Validate active single session
+  apiRouter.use(async (req, res, next) => {
+    const publicPaths = [
+      "/health",
+      "/auth/login",
+      "/auth/webauthn/login",
+      "/auth/webauthn/register",
+      "/auth/webauthn/credentials",
+      "/debug/users"
+    ];
+    if (publicPaths.some(p => req.path === p || req.path.startsWith(p))) {
+      return next();
+    }
+
+    const sessionId = req.headers["x-session-id"];
+    const userId = req.headers["x-user-id"];
+
+    if (sessionId && userId) {
+      try {
+        const dbUser = await db.get("SELECT activeSessionId FROM users WHERE id = ?", [userId]);
+        if (dbUser) {
+          if (!dbUser.activeSessionId) {
+            // Auto-associate the existing session to the user in the database
+            await db.run("UPDATE users SET activeSessionId = ? WHERE id = ?", [sessionId, userId]);
+          } else if (dbUser.activeSessionId !== sessionId) {
+            return res.status(401).json({ error: "session_invalid", message: "Tu sesión ha sido iniciada en otro dispositivo." });
+          }
+        } else {
+          // User not found in the database (e.g. database cleared or switched)
+          return res.status(401).json({ error: "session_invalid", message: "Tu usuario no fue encontrado en la base de datos actual." });
+        }
+      } catch (err) {
+        console.error("Session validation database query failed:", err);
+      }
+    }
+    next();
+  });
+
+  // Explicit session validation route
+  apiRouter.get("/auth/validate-session", async (req, res) => {
+    const sessionId = req.headers["x-session-id"];
+    const userId = req.headers["x-user-id"];
+
+    if (!userId || !sessionId) {
+      return res.status(400).json({ error: "Missing session headers" });
+    }
+
+    try {
+      const dbUser = await db.get("SELECT activeSessionId FROM users WHERE id = ?", [userId]);
+      if (!dbUser) {
+        return res.status(401).json({ error: "session_invalid", message: "Usuario no encontrado." });
+      }
+      if (!dbUser.activeSessionId) {
+        // Auto-associate
+        await db.run("UPDATE users SET activeSessionId = ? WHERE id = ?", [sessionId, userId]);
+      } else if (dbUser.activeSessionId !== sessionId) {
+        return res.status(401).json({ error: "session_invalid", message: "Tu sesión ha sido iniciada en otro dispositivo o navegador." });
+      }
+      res.json({ valid: true });
+    } catch (err: any) {
+      res.status(500).json({ error: "Database error", message: err.message });
+    }
+  });
 
   // Health check
   apiRouter.get("/health", (req, res) => {
@@ -913,6 +1017,9 @@ async function startServer() {
 
     if (user) {
       if (String(user.pin).trim() === pinStr) {
+        const newSessionId = crypto.randomUUID();
+        await db.run("UPDATE users SET activeSessionId = ? WHERE id = ?", [newSessionId, user.id]);
+        user.activeSessionId = newSessionId;
         res.json(user);
       } else {
         res.status(401).json({ error: "PIN incorrecto" });
@@ -976,6 +1083,10 @@ async function startServer() {
       if (!user) {
         return res.status(404).json({ error: "Usuario no encontrado" });
       }
+
+      const newSessionId = crypto.randomUUID();
+      await db.run("UPDATE users SET activeSessionId = ? WHERE id = ?", [newSessionId, user.id]);
+      user.activeSessionId = newSessionId;
 
       res.json(user);
     } catch (e: any) {
@@ -1368,7 +1479,9 @@ async function startServer() {
     const allowedFields = [
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 'inactivityTimeout', 'timezone', 'maxStayMinutes',
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp',
+      'deletePurchasePassword',
+      'minWeight_pieza', 'maxWeight_pieza', 'minWeight_barra', 'maxWeight_barra', 'minWeight_puro', 'maxWeight_puro', 'minWeight_cerrado', 'maxWeight_cerrado'
     ];
     const values = allowedFields.map(f => data[f] !== undefined ? data[f] : null);
 
@@ -1415,7 +1528,8 @@ async function startServer() {
       'name', 'address', 'phone', 'email', 'taxId', 'logoUrl', 'loginBgUrl', 
       'inactivityTimeout', 'timezone', 'maxStayMinutes', 
       'maxStayMinutes_pieza', 'maxStayMinutes_barra', 'notifyVisual_pieza', 'notifyVisual_barra', 'notifySound_pieza', 'notifySound_barra',
-      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp', 'updatedAt'
+      'cashDenominations', 'lowPurityThreshold_pieza', 'lowPurityThreshold_barra', 'notifyEmailOnClosureDifference', 'serverIp', 'updatedAt',
+      'minWeight_pieza', 'maxWeight_pieza', 'minWeight_barra', 'maxWeight_barra', 'minWeight_puro', 'maxWeight_puro', 'minWeight_cerrado', 'maxWeight_cerrado'
     ];
     for (const key of Object.keys(updateData)) {
       if (!allowedColumns.includes(key)) {
@@ -2408,6 +2522,7 @@ async function startServer() {
       advancePaymentType, advanceSourceBankAccountId, advanceClientBank, advanceClientAccountNumber, isFullPayment,
       advanceCashAmount, advanceBankAmount, advances, openEstimateFactor, expirationDays, isHistoric
     } = req.body;
+    const normalizedBranchId = (!branchId || branchId === 'sede_central' || branchId === 'central') ? 'sede_central' : branchId;
     const purchaseId = crypto.randomUUID();
     const tz = await getCompanyTimezone();
     const createdAt = date ? new Date(date).toISOString() : getCurrentDateInTimezone(tz);
@@ -2418,7 +2533,7 @@ async function startServer() {
     
     try {
       await db.transaction(async () => {
-        const branch = await db.get("SELECT abbreviation FROM branches WHERE id = ?", [branchId]) as any;
+        const branch = await db.get("SELECT abbreviation FROM branches WHERE id = ?", [normalizedBranchId]) as any;
         const abbr = branch ? branch.abbreviation : 'S';
         const dateObj = new Date(createdAt);
         const year = dateObj.getFullYear().toString().slice(-2);
@@ -2428,7 +2543,7 @@ async function startServer() {
           SELECT receiptNumber FROM goldPurchases 
           WHERE branchId = ? AND receiptNumber LIKE ? 
           ORDER BY LENGTH(receiptNumber) DESC, receiptNumber DESC LIMIT 1
-        `, [branchId, `${prefix}%`]) as any;
+        `, [normalizedBranchId, `${prefix}%`]) as any;
         
         let sequence = 1;
         if (lastPurchase) {
@@ -2446,7 +2561,7 @@ async function startServer() {
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
-          purchaseId, receiptNumber, branchId, clientId, total, type, referrerName || null, 
+          purchaseId, receiptNumber, normalizedBranchId, clientId, total, type, referrerName || null, 
           commission || 0, advancePayment || 0, createdBy, createdAt,
           advancePaymentType || 'efectivo', advanceSourceBankAccountId || null,
           advanceClientBank || null, advanceClientAccountNumber || null,
@@ -2848,9 +2963,61 @@ async function startServer() {
   });
 
   apiRouter.delete("/gold-purchases/:id", async (req, res) => {
-    await db.run("DELETE FROM goldPurchases WHERE id = ?", [req.params.id]);
-    res.json({ success: true });
-    broadcast("purchase_deleted", { id: req.params.id });
+    const { id } = req.params;
+    const userId = req.headers["x-user-id"];
+    // Accept password from x-delete-password header, request body, or query params
+    const inputPassword = req.headers["x-delete-password"] || req.body.password || req.query.password;
+
+    if (!userId) {
+      return res.status(400).json({ error: "No se especificó el usuario para esta operación." });
+    }
+
+    try {
+      // 1. Verify user exists and is a superadmin
+      const dbUser = await db.get("SELECT role FROM users WHERE id = ?", [userId]);
+      if (!dbUser || dbUser.role !== "superadmin") {
+        return res.status(403).json({ error: "Solo un Super Administrador puede borrar compras." });
+      }
+
+      // 2. Retrieve security password from companySettings
+      const settings = await db.get("SELECT deletePurchasePassword FROM companySettings LIMIT 1");
+      const savedPassword = settings ? settings.deletePurchasePassword : null;
+
+      if (!savedPassword || String(savedPassword).trim() === "") {
+        return res.status(400).json({ 
+          error: "La contraseña de seguridad para eliminación no ha sido configurada en Empresa." 
+        });
+      }
+
+      if (String(inputPassword).trim() !== String(savedPassword).trim()) {
+        return res.status(401).json({ error: "Contraseña de seguridad incorrecta." });
+      }
+
+      // 3. Execute deletions inside a transaction
+      await db.transaction(async () => {
+        // Find receipt number of the purchase to delete related materials
+        const purchase = await db.get("SELECT receiptNumber FROM goldPurchases WHERE id = ?", [id]);
+        if (purchase) {
+          // Delete from central inventory (materials table)
+          await db.run("DELETE FROM materials WHERE receiptNumber = ?", [purchase.receiptNumber]);
+        }
+
+        // Delete associated payment registers / cash flows
+        await db.run("DELETE FROM branchCashMoves WHERE referenceId = ?", [id]);
+
+        // Delete associated gold purchase items
+        await db.run("DELETE FROM goldPurchaseItems WHERE purchaseId = ?", [id]);
+
+        // Delete the purchase itself
+        await db.run("DELETE FROM goldPurchases WHERE id = ?", [id]);
+      });
+
+      res.json({ success: true });
+      broadcast("purchase_deleted", { id });
+    } catch (err: any) {
+      console.error("Error deleting gold purchase:", err);
+      res.status(500).json({ error: "Error al borrar la compra: " + err.message });
+    }
   });
 
   // Toggle historic status (allows validator to mark purchase as historic which pulls from petty cash / inventory)

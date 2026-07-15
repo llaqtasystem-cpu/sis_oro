@@ -1,4 +1,6 @@
 import * as React from "react";
+import { MaterialCard } from "./components/MaterialCard";
+import { MaterialTable } from "./components/MaterialTable";
 import CustomerDisplay from "./components/CustomerDisplay";
 import BranchCalendarClockPanel from "./components/BranchCalendarClockPanel";
 import { BranchSmeltingAuditPanel } from "./components/BranchSmeltingAuditPanel";
@@ -38,6 +40,8 @@ import {
   LogOut,
   Search,
   Filter,
+  LayoutGrid,
+  List,
   ChevronRight,
   ChevronLeft,
   ChevronUp,
@@ -107,8 +111,8 @@ import {
   RotateCw,
   Network,
   Globe,
-  LayoutGrid,
-  List,
+  PenTool,
+  ShieldCheck,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { jsPDF } from "jspdf";
@@ -155,9 +159,21 @@ function handleApiError(
   path: string | null,
 ) {
   console.error(`API Error (${operationType}) on ${path}:`, error);
-  alert(
-    `Error en la operación ${operationType}: ${error instanceof Error ? error.message : String(error)}`,
-  );
+  const msg = error instanceof Error ? error.message : String(error);
+  if (msg.includes("session_invalid")) {
+    return;
+  }
+  if (typeof window !== "undefined") {
+    try {
+      if (window.alert) {
+        window.alert(
+          `Error en la operación ${operationType}: ${msg}`
+        );
+      }
+    } catch (e) {
+      console.error("Failed to show alert dialog:", e);
+    }
+  }
 }
 
 function invalidateApiCache() {
@@ -230,94 +246,124 @@ async function apiFetch(url: string, options?: RequestInit): Promise<any> {
   const cleanOptions = { ...options };
   const headersObj = { ...((cleanOptions.headers || {}) as any) };
   delete headersObj["X-Bypass-Cache"];
+
+  // Inject user session headers if they exist in localStorage
+  try {
+    const savedUserStr = localStorage.getItem("aurum_user");
+    if (savedUserStr) {
+      const savedUserObj = JSON.parse(savedUserStr);
+      if (savedUserObj && savedUserObj.activeSessionId) {
+        headersObj["X-Session-ID"] = savedUserObj.activeSessionId;
+        headersObj["X-User-ID"] = savedUserObj.id;
+      }
+    }
+  } catch (err) {
+    console.error("Error setting session headers in apiFetch:", err);
+  }
+
   cleanOptions.headers = headersObj;
 
   const fetchPromise = (async () => {
-    let attempts = 0;
-    const maxAttempts = 8;
-    let delay = 1000;
+    try {
+      // Robust debouncing: wait 30ms to group any slightly staggered concurrent identical GET requests
+      if (method === "GET") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
 
-    while (true) {
-      try {
-        const res = await fetch(url, { ...cleanOptions, cache: "no-store" });
-        const text = await res.text();
-        const trimmed = text.trim();
+      let attempts = 0;
+      const maxAttempts = 8;
+      let delay = 1000;
 
-        if (
-          res.status === 429 ||
-          trimmed.startsWith("<") ||
-          trimmed.toLowerCase().includes("<!doctype html>")
-        ) {
-          if (method !== "GET") {
-            throw new Error(trimmed.startsWith("<") ? "Error en el servidor backend" : `Límite de peticiones excedido (HTTP ${res.status})`);
+      while (true) {
+        try {
+          const res = await fetch(url, { ...cleanOptions, cache: "no-store" });
+          const text = await res.text();
+          const trimmed = text.trim();
+
+          if (
+            res.status === 429 ||
+            trimmed.startsWith("<") ||
+            trimmed.toLowerCase().includes("<!doctype html>")
+          ) {
+            if (method !== "GET") {
+              throw new Error(trimmed.startsWith("<") ? "Error en el servidor backend" : `Límite de peticiones excedido (HTTP ${res.status})`);
+            }
+            attempts++;
+            if (attempts >= maxAttempts) {
+              throw new Error(
+                `HTTP 429 or HTML Fallback received from API. Rate exceeded or server unavailable (${url})`,
+              );
+            }
+            console.warn(
+              `[apiFetch] Rate limited (429) or HTML response on ${url}. Retrying in ${delay}ms... (attempt ${attempts}/${maxAttempts})`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            delay = Math.min(delay * 1.5, 3000); // Backoff capped at 3s
+            continue;
           }
+
+          if (!res.ok) {
+            if (res.status === 401) {
+              try {
+                const json = JSON.parse(text);
+                if (json.error === "session_invalid") {
+                  window.dispatchEvent(new CustomEvent("session-invalidated"));
+                }
+              } catch (e) {}
+            }
+            let errorMessage = `HTTP ${res.status}`;
+            try {
+              const json = JSON.parse(text);
+              if (json.error) errorMessage = json.error;
+              else if (json.message) errorMessage = json.message;
+            } catch {
+              errorMessage = `${errorMessage}: ${text.slice(0, 100)}`;
+            }
+            const responseError = new Error(errorMessage);
+            (responseError as any).isResponseError = true;
+            (responseError as any).status = res.status;
+            throw responseError;
+          }
+
+          const data = JSON.parse(text);
+          if (method === "GET") {
+            try {
+              sessionStorage.setItem(`api_cache_${url}`, text);
+              sessionStorage.setItem(
+                `api_cache_time_${url}`,
+                Date.now().toString(),
+              );
+            } catch (e) {
+              console.warn("sessionStorage storage limit or access issue:", e);
+            }
+          }
+          return data;
+        } catch (err: any) {
+          if (err.isResponseError) {
+            throw err;
+          }
+          if (
+            err.message &&
+            (err.message.includes("HTTP 429") ||
+              err.message.includes("HTML Fallback"))
+          ) {
+            throw err;
+          }
+          if (method !== "GET") {
+            throw err;
+          }
+          // For other potential transient network errors while fetching, retry up to maxAttempts
           attempts++;
           if (attempts >= maxAttempts) {
-            throw new Error(
-              `HTTP 429 or HTML Fallback received from API. Rate exceeded or server unavailable (${url})`,
-            );
+            throw err;
           }
-          console.warn(
-            `[apiFetch] Rate limited (429) or HTML response on ${url}. Retrying in ${delay}ms... (attempt ${attempts}/${maxAttempts})`,
-          );
           await new Promise((resolve) => setTimeout(resolve, delay));
-          delay = Math.min(delay * 1.5, 3000); // Backoff capped at 3s
-          continue;
+          delay *= 2;
         }
-
-        if (!res.ok) {
-          let errorMessage = `HTTP ${res.status}`;
-          try {
-            const json = JSON.parse(text);
-            if (json.error) errorMessage = json.error;
-            else if (json.message) errorMessage = json.message;
-          } catch {
-            errorMessage = `${errorMessage}: ${text.slice(0, 100)}`;
-          }
-          const responseError = new Error(errorMessage);
-          (responseError as any).isResponseError = true;
-          (responseError as any).status = res.status;
-          throw responseError;
-        }
-
-        const data = JSON.parse(text);
-        if (method === "GET") {
-          try {
-            sessionStorage.setItem(`api_cache_${url}`, text);
-            sessionStorage.setItem(
-              `api_cache_time_${url}`,
-              Date.now().toString(),
-            );
-          } catch (e) {
-            console.warn("sessionStorage storage limit or access issue:", e);
-          }
-        }
-        return data;
-      } catch (err: any) {
-        if (err.isResponseError) {
-          throw err;
-        }
-        if (
-          err.message &&
-          (err.message.includes("HTTP 429") ||
-            err.message.includes("HTML Fallback"))
-        ) {
-          throw err;
-        }
-        if (method !== "GET") {
-          throw err;
-        }
-        // For other potential transient network errors while fetching, retry up to maxAttempts
-        attempts++;
-        if (attempts >= maxAttempts) {
-          throw err;
-        }
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        delay *= 2;
-      } finally {
-        if (method === "GET") {
-          inflightRequests.delete(url);
-        }
+      }
+    } finally {
+      if (method === "GET") {
+        inflightRequests.delete(url);
       }
     }
   })();
@@ -781,6 +827,8 @@ const Auth = ({
     fetchAvailableUsers();
   }, []);
 
+
+
   // Pre-load reference photo of coordinates when selectedUser changes
   useEffect(() => {
     if (selectedUser) {
@@ -831,7 +879,7 @@ const Auth = ({
       setTimeout(() => playBeep(1100, "sine", 0.15), 80);
       onLogin(user);
     } catch (err: any) {
-      console.error(err);
+      console.warn("Intento de inicio de sesión fallido:", err.message || err);
       setError(err.message || "PIN o usuario incorrecto");
       setShowErrorModal(true);
       setPin(""); // Clear the incorrect PIN input so it doesn't stay "colgado"
@@ -862,7 +910,7 @@ const Auth = ({
       }
       setIsFaceScanning(true);
     } catch (err) {
-      console.error("Camera access denied:", err);
+      console.warn("Camera access denied or failed:", err);
       setError(
         "No se pudo iniciar la cámara web. Asegúrate de dar los permisos correspondientes.",
       );
@@ -1334,7 +1382,7 @@ const Auth = ({
       setTimeout(() => playBeep(1100, "sine", 0.15), 80);
       onLogin(user);
     } catch (err: any) {
-      console.error(err);
+      console.warn("Intento de inicio de sesión QR fallido:", err.message || err);
       setError(err.message || "La credencial QR escaneada ya no es válida para iniciar sesión.");
       setShowErrorModal(true);
       setUsername(uName);
@@ -1385,7 +1433,7 @@ const Auth = ({
           }
           qrAnimationFrameRef.current = requestAnimationFrame(scanQrFrame);
         } catch (err) {
-          console.error("QR Camera access denied or failed:", err);
+          console.warn("QR Camera access denied or failed:", err);
           setError("No se pudo iniciar la cámara para escaneo QR. Comprueba los permisos de tu navegador o cámara.");
           setLoginMode("pin");
         }
@@ -1562,7 +1610,7 @@ const Auth = ({
 
       onLogin(loggedUser);
     } catch (err: any) {
-      console.error("WebAuthn assertion failed:", err);
+      console.warn("WebAuthn assertion failed or canceled:", err);
       const isIframe = window.self !== window.top;
       let errMsg = err.message || "Error al autenticar con biometría nativa.";
       if (
@@ -2016,6 +2064,7 @@ interface MaterialModalProps {
   submitLabel: string;
   clients: Client[];
   fetchData: () => Promise<void> | void;
+  companySettings?: CompanySettings | null;
 }
 
 const MaterialModal = ({
@@ -2029,6 +2078,7 @@ const MaterialModal = ({
   submitLabel,
   clients = [],
   fetchData,
+  companySettings,
 }: MaterialModalProps) => {
   const initialRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -2181,6 +2231,31 @@ const MaterialModal = ({
     formData.usdToBs,
   ]);
 
+  const isWeightInvalid = (formData.finalWeight || 0) > (formData.initialWeight || 0);
+
+  const selectedType = formData.type || "pieza";
+  let minLimit: number | undefined;
+  let maxLimit: number | undefined;
+
+  if (selectedType === "pieza") {
+    minLimit = companySettings?.minWeight_pieza;
+    maxLimit = companySettings?.maxWeight_pieza;
+  } else if (selectedType === "barra") {
+    minLimit = companySettings?.minWeight_barra;
+    maxLimit = companySettings?.maxWeight_barra;
+  } else if (selectedType === "puro") {
+    minLimit = companySettings?.minWeight_puro;
+    maxLimit = companySettings?.maxWeight_puro;
+  } else if (selectedType === "cerrado") {
+    minLimit = companySettings?.minWeight_cerrado;
+    maxLimit = companySettings?.maxWeight_cerrado;
+  }
+
+  const initialWeight = formData.initialWeight || 0;
+  const isBelowMin = minLimit !== undefined && minLimit !== null && initialWeight > 0 && initialWeight < minLimit;
+  const isAboveMax = maxLimit !== undefined && maxLimit !== null && initialWeight > maxLimit;
+  const isWeightLimitInvalid = isBelowMin || isAboveMax;
+
   return (
     <AnimatePresence>
       {isOpen && (
@@ -2211,7 +2286,16 @@ const MaterialModal = ({
               </button>
             </div>
 
-            <form onSubmit={onSubmit} className="p-8">
+            <form
+              onSubmit={(e) => {
+                if (isWeightInvalid || isWeightLimitInvalid) {
+                  e.preventDefault();
+                  return;
+                }
+                onSubmit(e);
+              }}
+              className="p-8"
+            >
               <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-8">
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold uppercase text-zinc-500">
@@ -2402,9 +2486,16 @@ const MaterialModal = ({
                   )}
                 </div>
                 <div className="space-y-1">
-                  <label className="text-[10px] font-bold uppercase text-zinc-500">
-                    Peso Inicial (g)
-                  </label>
+                  <div className="flex justify-between items-center">
+                    <label className="text-[10px] font-bold uppercase text-zinc-500">
+                      Peso Inicial (g)
+                    </label>
+                    {(minLimit !== undefined || maxLimit !== undefined) && (
+                      <span className="text-[9px] font-mono font-bold text-zinc-500">
+                        Límites: {minLimit !== undefined ? `>= ${minLimit}g` : ""} {minLimit !== undefined && maxLimit !== undefined ? "y" : ""} {maxLimit !== undefined ? `<= ${maxLimit}g` : ""}
+                      </span>
+                    )}
+                  </div>
                   <input
                     required
                     type="number"
@@ -2413,14 +2504,21 @@ const MaterialModal = ({
                     onChange={(e) => {
                       const val =
                         e.target.value === "" ? 0 : parseFloat(e.target.value);
-                      const finalW = val * (1 - formData.loss / 100);
+                      const lossPct = formData.lossPercentage || 0;
+                      const lossG = (lossPct / 100) * val;
+                      const finalW = val - lossG;
                       setFormData({
                         ...formData,
                         initialWeight: val,
+                        loss: Number(lossG.toFixed(2)),
                         finalWeight: Number(finalW.toFixed(2)),
                       });
                     }}
-                    className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm"
+                    className={`w-full p-2 bg-zinc-950 rounded-xl border text-zinc-100 focus:outline-none focus:ring-2 text-sm transition-all ${
+                      isWeightInvalid || isWeightLimitInvalid
+                        ? "border-rose-500 focus:ring-rose-500/20"
+                        : "border-white/5 focus:ring-amber-500/20"
+                    }`}
                   />
                 </div>
                 <div className="space-y-1">
@@ -2435,20 +2533,43 @@ const MaterialModal = ({
                     onChange={(e) => {
                       const val =
                         e.target.value === "" ? 0 : parseFloat(e.target.value);
+                      const lossG = formData.initialWeight - val;
                       const lossPct =
                         formData.initialWeight > 0
-                          ? ((formData.initialWeight - val) * 100) /
-                            formData.initialWeight
+                          ? (lossG * 100) / formData.initialWeight
                           : 0;
                       setFormData({
                         ...formData,
                         finalWeight: val,
-                        loss: Number(lossPct.toFixed(2)),
+                        loss: Number(Math.max(0, lossG).toFixed(2)),
+                        lossPercentage: Number(Math.max(0, lossPct).toFixed(2)),
                       });
                     }}
-                    className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm"
+                    className={`w-full p-2 bg-zinc-950 rounded-xl border text-zinc-100 focus:outline-none focus:ring-2 text-sm transition-all ${
+                      isWeightInvalid
+                        ? "border-rose-500 focus:ring-rose-500/20"
+                        : "border-white/5 focus:ring-amber-500/20"
+                    }`}
                   />
                 </div>
+                {isWeightInvalid && (
+                  <div className="col-span-full text-xs text-rose-500 font-bold flex items-center gap-1.5 bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-500" />
+                    <span>Error: El peso final no puede ser superior al peso inicial.</span>
+                  </div>
+                )}
+                {isBelowMin && (
+                  <div className="col-span-full text-xs text-rose-500 font-bold flex items-center gap-1.5 bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-500" />
+                    <span>Error: El peso inicial ({initialWeight}g) es inferior al límite mínimo permitido para {selectedType.toUpperCase()} ({minLimit}g).</span>
+                  </div>
+                )}
+                {isAboveMax && (
+                  <div className="col-span-full text-xs text-rose-500 font-bold flex items-center gap-1.5 bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-500" />
+                    <span>Error: El peso inicial ({initialWeight}g) supera el límite máximo permitido para {selectedType.toUpperCase()} ({maxLimit}g).</span>
+                  </div>
+                )}
                 <div className="space-y-1">
                   <label className="text-[10px] font-bold uppercase text-zinc-500">
                     Ley (%)
@@ -2559,18 +2680,32 @@ const MaterialModal = ({
                     required
                     type="number"
                     step="0.01"
-                    value={formData.loss || ""}
+                    value={formData.lossPercentage || ""}
                     onChange={(e) => {
                       const val =
                         e.target.value === "" ? 0 : parseFloat(e.target.value);
-                      const finalW = formData.initialWeight * (1 - val / 100);
+                      const lossG = (val / 100) * formData.initialWeight;
+                      const finalW = formData.initialWeight - lossG;
                       setFormData({
                         ...formData,
-                        loss: val,
+                        lossPercentage: val,
+                        loss: Number(lossG.toFixed(2)),
                         finalWeight: Number(finalW.toFixed(2)),
                       });
                     }}
                     className="w-full p-2 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 text-sm"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold uppercase text-zinc-500">
+                    Merma (g)
+                  </label>
+                  <input
+                    readOnly
+                    type="number"
+                    step="0.01"
+                    value={formData.loss || 0}
+                    className="w-full p-2 bg-zinc-950/50 rounded-xl border border-white/5 text-zinc-100/60 focus:outline-none cursor-not-allowed text-sm font-mono font-bold text-red-400"
                   />
                 </div>
                 <div className="space-y-1">
@@ -2617,7 +2752,8 @@ const MaterialModal = ({
 
               <button
                 type="submit"
-                className="w-full py-4 bg-amber-500 text-zinc-950 rounded-2xl font-bold shadow-xl hover:bg-amber-400 transition-all"
+                disabled={isWeightInvalid}
+                className="w-full py-4 bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-zinc-950 rounded-2xl font-bold shadow-xl hover:bg-amber-400 transition-all"
               >
                 {submitLabel}
               </button>
@@ -2642,379 +2778,6 @@ interface MaterialCardProps {
   canEdit?: boolean;
   allMaterials?: Material[];
 }
-
-const MaterialCard = ({
-  material,
-  systemUsers,
-  onSelect,
-  onViewSource,
-  onEdit,
-  onDelete,
-  isSelected,
-  selectable,
-  canEdit,
-  allMaterials = [],
-}: MaterialCardProps) => {
-  const sameTypeHistory = useMemo(() => {
-    if (!allMaterials || allMaterials.length === 0) return [];
-
-    // Filter by same type. Filter out deleted/invalid/newly created with undefined or 0 prices, or current material to show only historical or include current for continuity.
-    // The prompt says: "que muestre la evolución del precio por gramo de los últimos 5 materiales registrados del mismo tipo"
-    // Usually, we should sort by registrationDate descending to get the most recent 5, and then reverse to show chronological order.
-    const filtered = allMaterials
-      .filter(
-        (m) =>
-          m.type === material.type && m.pricePerGram > 0 && m.registrationDate,
-      )
-      .sort(
-        (a, b) =>
-          new Date(b.registrationDate).getTime() -
-          new Date(a.registrationDate).getTime(),
-      )
-      .slice(0, 5)
-      .reverse();
-
-    return filtered.map((m) => ({
-      receiptNumber: `#${m.receiptNumber}`,
-      price: m.pricePerGram,
-      date: new Date(m.registrationDate).toLocaleDateString("es-ES", {
-        month: "short",
-        day: "numeric",
-      }),
-    }));
-  }, [allMaterials, material.type]);
-
-  return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      className={`p-5 rounded-2xl border transition-all cursor-pointer relative group ${
-        isSelected
-          ? "bg-amber-950/40 border-amber-500 shadow-md ring-2 ring-amber-500/20"
-          : "bg-zinc-900 border-white/5 hover:border-amber-500/50 hover:shadow-sm"
-      }`}
-      onClick={() => {
-        if (selectable && onSelect && material.id) {
-          onSelect(material.id);
-        }
-      }}
-    >
-      <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-all z-10">
-        {canEdit && material.status === "disponible" && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onEdit && onEdit(material);
-            }}
-            className="p-2 bg-zinc-800 text-zinc-400 rounded-lg hover:bg-amber-500/10 hover:text-amber-500 border border-white/5"
-            title="Editar Registro"
-          >
-            <Edit className="w-3.5 h-3.5" />
-          </button>
-        )}
-        {canEdit && material.status === "disponible" && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete && onDelete(material);
-            }}
-            className="p-2 bg-zinc-800 text-zinc-400 rounded-lg hover:bg-red-500/10 hover:text-red-500 border border-white/5"
-            title="Eliminar Registro"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        )}
-      </div>
-
-      <div className="flex justify-between items-start mb-4">
-        <div className="flex items-center gap-2">
-          <div
-            className={`p-2 rounded-lg ${
-              material.type === "barra"
-                ? "bg-amber-500/10 text-amber-500"
-                : material.type === "puro"
-                  ? "bg-emerald-500/10 text-emerald-400"
-                  : material.type === "cerrado"
-                    ? "bg-indigo-500/10 text-indigo-400"
-                    : "bg-blue-500/10 text-blue-400"
-            }`}
-          >
-            {material.type === "barra" ? (
-              <Package className="w-4 h-4" />
-            ) : material.type === "puro" ? (
-              <Coins className="w-4 h-4" />
-            ) : material.type === "cerrado" ? (
-              <CheckCircle2 className="w-4 h-4" />
-            ) : (
-              <Hash className="w-4 h-4" />
-            )}
-          </div>
-          <div>
-            <div className="flex items-center gap-1.5 mb-1">
-              <h3 className="font-bold text-zinc-100 leading-none">
-                #{material.receiptNumber}
-              </h3>
-              <span className={`text-[8px] font-extrabold uppercase px-1.5 py-0.5 rounded ${
-                material.type === "barra"
-                  ? "bg-amber-500/10 text-amber-500"
-                  : material.type === "puro"
-                    ? "bg-emerald-500/10 text-emerald-400"
-                    : material.type === "cerrado"
-                      ? "bg-indigo-500/10 text-indigo-400"
-                      : "bg-blue-500/10 text-blue-400"
-              }`}>
-                {material.type === "pieza" ? "Pieza" : material.type === "barra" ? "Barra" : material.type === "puro" ? "Puro" : "Cerrado"}
-              </span>
-            </div>
-            <p className="text-xs text-zinc-500 uppercase tracking-wider font-medium">
-              {material.client}
-            </p>
-          </div>
-        </div>
-        <span
-          className={`text-[10px] px-2 py-1 rounded-full font-bold uppercase tracking-tighter ${
-            material.status === "disponible"
-              ? "bg-emerald-500/10 text-emerald-400"
-              : material.status === "exportado"
-                ? "bg-blue-500/10 text-blue-400"
-                : material.status === "no disponible"
-                  ? "bg-red-500/10 text-red-500"
-                  : "bg-zinc-800 text-zinc-500"
-          }`}
-        >
-          {material.status === "exportado" ? "Vendido" : material.status}
-        </span>
-      </div>
-
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <Scale className="w-3 h-3" /> Peso Inicial
-          </p>
-          <p className="text-sm font-mono font-bold text-zinc-400">
-            {formatNumber(material.initialWeight)}g
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <Scale className="w-3 h-3" /> Peso Final
-          </p>
-          <p className="text-sm font-mono font-bold text-zinc-100">
-            {formatNumber(material.finalWeight)}g
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <TrendingUp className="w-3 h-3" /> Cotización
-          </p>
-          <p className="text-sm font-mono font-bold text-zinc-400">
-            {formatCurrency(material.marketPrice)}
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <Coins className="w-3 h-3" /> Precio/g
-          </p>
-          <p className="text-sm font-mono font-bold text-zinc-400">
-            {formatCurrency(material.pricePerGram)}
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <AlertCircle className="w-3 h-3" /> Merma
-          </p>
-          <p className="text-sm font-mono font-bold text-red-400">
-            {material.lossPercentage
-              ? `${formatNumber(material.lossPercentage)}%`
-              : `${formatNumber((material.loss / material.initialWeight) * 100)}%`}
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <CheckCircle2 className="w-3 h-3" /> Ley
-          </p>
-          <p className="text-sm font-mono font-bold text-emerald-400">
-            {formatNumber(material.purity)}%
-          </p>
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-            <TrendingUp className="w-3 h-3" /> USD/BS
-          </p>
-          <p className="text-sm font-mono font-bold text-blue-400">
-            {formatNumber(material.usdToBs)}
-          </p>
-        </div>
-      </div>
-
-      {sameTypeHistory.length >= 2 ? (
-        <div className="mt-2 mb-4 p-3 bg-zinc-950/50 rounded-xl border border-white/5 space-y-2">
-          <div className="flex justify-between items-center">
-            <span className="text-[9px] text-amber-500 uppercase font-extrabold tracking-wider flex items-center gap-1">
-              <TrendingUp className="w-3 h-3" /> Evolución Precio/g (
-              {material.type === "barra" ? "Barras" : "Piezas"})
-            </span>
-            <span className="text-[8px] text-zinc-500 font-bold">
-              Últimos {sameTypeHistory.length} registros
-            </span>
-          </div>
-          <div className="h-[75px] w-full mt-1">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={sameTypeHistory}>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke="#27272a"
-                  vertical={false}
-                />
-                <XAxis
-                  dataKey="receiptNumber"
-                  tick={{ fill: "#71717a", fontSize: 8, fontWeight: "bold" }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <YAxis domain={["auto", "auto"]} hide />
-                <Tooltip
-                  content={({ active, payload }) => {
-                    if (active && payload && payload.length) {
-                      const data = payload[0].payload;
-                      return (
-                        <div className="bg-zinc-900/95 backdrop-blur-sm border border-white/10 p-2 rounded-lg shadow-xl text-[9px] font-mono leading-normal">
-                          <p className="font-bold text-zinc-200">
-                            {data.receiptNumber}
-                          </p>
-                          <p className="text-zinc-400 font-medium">
-                            {data.date}
-                          </p>
-                          <p className="text-amber-500 font-extrabold mt-0.5">
-                            {formatCurrency(data.price)}/g
-                          </p>
-                        </div>
-                      );
-                    }
-                    return null;
-                  }}
-                  cursor={{
-                    stroke: "#f59e0b",
-                    strokeWidth: 0.5,
-                    strokeDasharray: "2 2",
-                  }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="price"
-                  stroke="#f59e0b"
-                  strokeWidth={2}
-                  dot={{
-                    r: 3,
-                    stroke: "#18181b",
-                    strokeWidth: 1.5,
-                    fill: "#f59e0b",
-                  }}
-                  activeDot={{
-                    r: 5,
-                    stroke: "#18181b",
-                    strokeWidth: 1.5,
-                    fill: "#f5a623",
-                  }}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      ) : (
-        <div className="mt-2 mb-4 p-3 bg-zinc-950/30 rounded-xl border border-white/5 flex flex-col items-center justify-center h-[75px] text-zinc-500 select-none">
-          <TrendingUp className="w-4 h-4 mb-1 opacity-25 text-amber-500" />
-          <p className="text-[9px] uppercase tracking-wider font-bold opacity-45">
-            Evolución Precio/g
-          </p>
-          <p className="text-[8px] opacity-40">
-            Se requieren al menos 2 registros
-          </p>
-        </div>
-      )}
-
-      <div className="bg-amber-950/20 p-3 rounded-xl border border-amber-500/20 mb-4">
-        <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1 mb-1">
-          <Coins className="w-3 h-3" /> Total
-        </p>
-        <p className="text-xl font-mono font-bold text-amber-500">
-          {formatCurrency(material.total)}
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-3 pt-4 border-t border-white/5">
-        <div className="flex justify-between items-center">
-          <div className="flex items-center gap-1 text-zinc-500">
-            <Calendar className="w-3 h-3" />
-            <span className="text-[10px] font-medium">
-              {new Date(material.registrationDate).toLocaleDateString()}
-            </span>
-          </div>
-          <div className="text-[10px] font-bold text-zinc-400 bg-zinc-800 px-2 py-1 rounded capitalize">
-            {material.type}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-5 h-5 rounded-full bg-zinc-800 flex items-center justify-center border border-white/5">
-            <User className="w-2.5 h-2.5 text-zinc-500" />
-          </div>
-          <p className="text-[9px] text-zinc-500 font-bold uppercase tracking-widest">
-            Res:{" "}
-            {systemUsers.find(
-              (u) =>
-                u.id === material.createdBy ||
-                u.username === material.createdBy,
-            )?.name ||
-              material.createdBy ||
-              "Sistema"}
-          </p>
-        </div>
-      </div>
-
-      {material.sourceMaterials && material.sourceMaterials.length > 0 && (
-        <div className="mt-4 pt-4 border-t border-dashed border-zinc-800">
-          <div className="flex justify-between items-center mb-2">
-            <p className="text-[10px] text-zinc-500 uppercase font-bold flex items-center gap-1">
-              <History className="w-3 h-3" /> Materiales de Origen
-            </p>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onViewSource && onViewSource(material);
-              }}
-              className="text-[10px] font-bold text-amber-500 hover:text-amber-400 bg-amber-500/10 px-2 py-1 rounded-lg border border-amber-500/20 transition-colors"
-            >
-              Ver Detalles
-            </button>
-          </div>
-          <div className="space-y-2">
-            {material.sourceMaterials.slice(0, 2).map((sm, idx) => (
-              <div
-                key={`${sm.receiptNumber}-${idx}`}
-                className="bg-zinc-800/50 p-2 rounded-lg text-[10px] border border-white/5"
-              >
-                <div className="flex justify-between font-bold text-zinc-300 mb-0.5">
-                  <span>#{sm.receiptNumber}</span>
-                  <span>{formatNumber(sm.finalWeight)}g</span>
-                </div>
-                <div className="flex justify-between text-zinc-500">
-                  <span className="truncate max-w-[100px]">{sm.client}</span>
-                  <span>{formatCurrency(sm.total)}</span>
-                </div>
-              </div>
-            ))}
-            {material.sourceMaterials.length > 2 && (
-              <p className="text-[9px] text-center text-zinc-500 font-medium">
-                + {material.sourceMaterials.length - 2} materiales más
-              </p>
-            )}
-          </div>
-        </div>
-      )}
-    </motion.div>
-  );
-};
 
 interface SourceHistoryRowProps {
   key?: React.Key;
@@ -3312,6 +3075,7 @@ export default function App() {
   const [selectedItemToVerify, setSelectedItemToVerify] = useState<any | null>(
     null,
   );
+  const isVerifyWeightInvalid = selectedItemToVerify ? (selectedItemToVerify.finalWeight || 0) > (selectedItemToVerify.initialWeight || 0) : false;
   const [showVerifyItemModal, setShowVerifyItemModal] = useState(false);
   const [isVerifyingItem, setIsVerifyingItem] = useState(false);
   const [selectedPurchasesForPayout, setSelectedPurchasesForPayout] = useState<
@@ -3486,6 +3250,7 @@ export default function App() {
     | "executive_dashboard"
     | "branch_inventory"
   >("inventory");
+  const [inventoryViewMode, setInventoryViewMode] = useState<"grid" | "table">("grid");
   const [pettyCashSubTab, setPettyCashSubTab] = useState<"operations" | "auditing">("operations");
   const [branchInventorySearch, setBranchInventorySearch] = useState("");
   const [branchInventoryTypeFilter, setBranchInventoryTypeFilter] = useState<
@@ -3503,7 +3268,6 @@ export default function App() {
   const [branchInventoryStartDate, setBranchInventoryStartDate] = useState("");
   const [branchInventoryEndDate, setBranchInventoryEndDate] = useState("");
   const [branchInventoryPage, setBranchInventoryPage] = useState(1);
-  const [branchInventoryViewMode, setBranchInventoryViewMode] = useState<"cuadros" | "tabla">("cuadros");
   const [zoomedImage, setZoomedImage] = useState<string | null>(null);
   const [zoomScale, setZoomScale] = useState<number>(1);
   const [rotationAngle, setRotationAngle] = useState<number>(0);
@@ -4066,27 +3830,64 @@ export default function App() {
   }, [branches, goldPurchases]);
 
   const executiveDashboardData = useMemo(() => {
-    // 1. Filter purchases of interest based on the executive filters
-    const filteredPurchases = goldPurchases.filter((p) => {
-      if (p.type === "anulado") return false;
-      // Branch filter
-      if (executiveBranchFilter !== "all") {
-        const pBranchId = p.branchId || "sede_central";
-        if (pBranchId !== executiveBranchFilter) {
-          return false;
-        }
+    const getNormalizedBranchId = (bid?: string | null) => {
+      if (!bid || bid === "sede_central" || bid === "central" || bid === "") {
+        return "sede_central";
       }
-      // Year filter
-      if (executiveYearFilter !== "all") {
+      return bid;
+    };
+
+    // 1. Filter purchases of interest based on the executive filters
+    let filteredPurchases = [];
+
+    if (executiveBranchFilter === "sede_central") {
+      // Sede Central does not have direct client purchases.
+      // Instead, its "received gold / inventory" is the verified materials in the central inventory.
+      // We map these materials into virtual purchase records so they populate the dashboard beautifully.
+      filteredPurchases = materials
+        .filter((m) => m.status !== "eliminado")
+        .map((m) => ({
+          id: m.id || crypto.randomUUID(),
+          branchId: "sede_central",
+          createdAt: m.registrationDate,
+          total: m.total || 0,
+          receiptNumber: m.receiptNumber,
+          clientId: "central_inventory",
+          clientName: m.client || "Fundición/Traspaso",
+          type: "cerrado", // virtual purchase type
+          items: [
+            {
+              id: m.id || crypto.randomUUID(),
+              type: m.type,
+              initialWeight: m.initialWeight,
+              finalWeight: m.finalWeight,
+              purity: m.purity,
+            },
+          ],
+        }));
+    } else {
+      filteredPurchases = goldPurchases.filter((p) => {
+        if (p.type === "anulado") return false;
+        // Branch filter
+        if (executiveBranchFilter !== "all") {
+          const pBranchId = getNormalizedBranchId(p.branchId);
+          if (pBranchId !== executiveBranchFilter) {
+            return false;
+          }
+        }
+        return true;
+      });
+    }
+
+    // Year filter (applies to both actual and virtual purchases)
+    if (executiveYearFilter !== "all") {
+      filteredPurchases = filteredPurchases.filter((p) => {
         const pYear = p.createdAt
           ? new Date(p.createdAt).getFullYear().toString()
           : "";
-        if (pYear !== executiveYearFilter) {
-          return false;
-        }
-      }
-      return true;
-    });
+        return pYear === executiveYearFilter;
+      });
+    }
 
     // 2. Trend data: monthly aggregate purchases (volume in grams)
     // We want to group by Year-Month
@@ -4105,6 +3906,12 @@ export default function App() {
     goldPurchases.forEach((p) => {
       if (p.createdAt) {
         const year = new Date(p.createdAt).getFullYear().toString();
+        yearsSet.add(year);
+      }
+    });
+    materials.forEach((m) => {
+      if (m.registrationDate) {
+        const year = new Date(m.registrationDate).getFullYear().toString();
         yearsSet.add(year);
       }
     });
@@ -4218,7 +4025,7 @@ export default function App() {
     });
 
     filteredPurchases.forEach((p) => {
-      const bid = p.branchId || "sede_central";
+      const bid = getNormalizedBranchId(p.branchId);
       if (!branchStats[bid]) {
         branchStats[bid] = {
           branchName:
@@ -4277,7 +4084,7 @@ export default function App() {
     } = {};
 
     filteredPurchases.forEach((p) => {
-      const bid = p.branchId || "sede_central";
+      const bid = getNormalizedBranchId(p.branchId);
       const bName =
         bid === "sede_central"
           ? "Sede Central"
@@ -4299,7 +4106,7 @@ export default function App() {
         const purity = item.purity || 0;
         const weight = item.initialWeight || 0;
         const cl = clients.find((c) => c.id === p.clientId);
-        const clientName = cl?.name || "Desconocido";
+        const clientName = cl?.name || p.clientName || "Desconocido";
 
         scatterDataByBranch[bid].data.push({
           purity: parseFloat(purity.toFixed(2)),
@@ -4346,8 +4153,8 @@ export default function App() {
         const finalWeight = m.finalWeight || m.initialWeight || 0;
 
         // Trace back the branch of origin
-        let branchId = "unknown";
-        let branchName = "Depósito Central";
+        let branchId = "sede_central";
+        let branchName = "Sede Central";
 
         if (sourceMaterials.length > 0) {
           for (const src of sourceMaterials) {
@@ -4355,9 +4162,13 @@ export default function App() {
               (p) => p.receiptNumber === src.receiptNumber,
             );
             if (purchase) {
-              branchId = purchase.branchId;
-              const b = branches.find((br) => br.id === purchase.branchId);
-              if (b) branchName = b.name;
+              branchId = getNormalizedBranchId(purchase.branchId);
+              if (branchId === "sede_central") {
+                branchName = "Sede Central";
+              } else {
+                const b = branches.find((br) => br.id === branchId);
+                if (b) branchName = b.name;
+              }
               break;
             }
           }
@@ -4366,9 +4177,13 @@ export default function App() {
             (p) => p.receiptNumber === m.receiptNumber,
           );
           if (purchase) {
-            branchId = purchase.branchId;
-            const b = branches.find((br) => br.id === purchase.branchId);
-            if (b) branchName = b.name;
+            branchId = getNormalizedBranchId(purchase.branchId);
+            if (branchId === "sede_central") {
+              branchName = "Sede Central";
+            } else {
+              const b = branches.find((br) => br.id === branchId);
+              if (b) branchName = b.name;
+            }
           }
         }
 
@@ -4503,6 +4318,118 @@ export default function App() {
     const avgPurchaseWeight =
       totalTransactions > 0 ? totalVolume / totalTransactions : 0;
 
+    // Calculate current stock based on the branch filter
+    let currentStockWeight = 0;
+    let currentStockItemsCount = 0;
+
+    if (executiveBranchFilter === "all") {
+      // Sede Central Stock + All Branches Stocks combined
+      const centralStock = materials.filter((m) => m.status === "disponible");
+      const centralWeight = centralStock.reduce((acc, m) => acc + m.finalWeight, 0);
+      const centralCount = centralStock.length;
+
+      // Sum untransferred items from all branches
+      let branchesWeight = 0;
+      let branchesCount = 0;
+      goldPurchases
+        .filter((p) => p.type === "cerrado" && p.isHistoric !== 1)
+        .forEach((p) => {
+          p.items?.forEach((item: any) => {
+            if (!item.isTransferred) {
+              branchesWeight += item.finalWeight || 0;
+              branchesCount += 1;
+            }
+          });
+        });
+
+      currentStockWeight = centralWeight + branchesWeight;
+      currentStockItemsCount = centralCount + branchesCount;
+    } else if (executiveBranchFilter === "sede_central") {
+      // Sede Central only
+      const centralStock = materials.filter((m) => m.status === "disponible");
+      currentStockWeight = centralStock.reduce((acc, m) => acc + m.finalWeight, 0);
+      currentStockItemsCount = centralStock.length;
+    } else {
+      // Specific branch only
+      let branchWeight = 0;
+      let branchCount = 0;
+      goldPurchases
+        .filter((p) => p.branchId === executiveBranchFilter && p.type === "cerrado" && p.isHistoric !== 1)
+        .forEach((p) => {
+          p.items?.forEach((item: any) => {
+            if (!item.isTransferred) {
+              branchWeight += item.finalWeight || 0;
+              branchCount += 1;
+            }
+          });
+        });
+      currentStockWeight = branchWeight;
+      currentStockItemsCount = branchCount;
+    }
+
+    // 8. Daily volume of gold received per sucursal over the last 30 days
+    const last30Days: { dateStr: string; label: string; [key: string]: any }[] = [];
+    const today = new Date();
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(today.getDate() - i);
+      const dateStr = d.toISOString().split("T")[0]; // YYYY-MM-DD
+      const label = d.toLocaleDateString("es-ES", { day: "2-digit", month: "short" }); // e.g. "25 jun"
+      
+      const dayData: { dateStr: string; label: string; [key: string]: any } = {
+        dateStr,
+        label,
+        "Sede Central": 0,
+      };
+      branches.forEach((b) => {
+        dayData[b.name] = 0;
+      });
+      last30Days.push(dayData);
+    }
+
+    // Accumulate materials registered in Sede Central
+    materials.forEach((m) => {
+      if (m.status === "eliminado" || !m.registrationDate) return;
+      const d = new Date(m.registrationDate);
+      const dateStr = d.toISOString().split("T")[0];
+      const dayObj = last30Days.find((day) => day.dateStr === dateStr);
+      if (dayObj) {
+        dayObj["Sede Central"] += m.initialWeight || 0;
+      }
+    });
+
+    // Accumulate purchases from branches
+    goldPurchases.forEach((p) => {
+      if (p.type === "anulado" || !p.createdAt) return;
+      const d = new Date(p.createdAt);
+      const dateStr = d.toISOString().split("T")[0];
+      const dayObj = last30Days.find((day) => day.dateStr === dateStr);
+      if (dayObj) {
+        const bid = getNormalizedBranchId(p.branchId);
+        const bName = bid === "sede_central" ? "Sede Central" : (branches.find((b) => b.id === bid)?.name || "Desconocida");
+        const weight = p.items?.reduce((acc: number, item: any) => acc + (item.initialWeight || 0), 0) || 0;
+        if (dayObj[bName] === undefined) {
+          dayObj[bName] = 0;
+        }
+        dayObj[bName] += weight;
+      }
+    });
+
+    const last30DaysVolumeTrend = last30Days.map((day) => {
+      const formattedDay: any = {
+        dateStr: day.dateStr,
+        name: day.label,
+      };
+      Object.keys(day).forEach((key) => {
+        if (key !== "dateStr" && key !== "label") {
+          formattedDay[key] = parseFloat(day[key].toFixed(2));
+        }
+      });
+      return formattedDay;
+    });
+
+    const trendBranchNames = ["Sede Central", ...branches.map((b) => b.name)];
+
     return {
       monthlyTrends,
       materialDistribution,
@@ -4511,6 +4438,8 @@ export default function App() {
       scatterDataGrouped,
       smeltingComparisonData,
       purityDistribution,
+      last30DaysVolumeTrend,
+      trendBranchNames,
       purityStats: {
         avgPurity: parseFloat(avgPurity.toFixed(2)),
         highestPurity: parseFloat((purityItemCount > 0 ? highestPurity : 0).toFixed(2)),
@@ -4523,6 +4452,8 @@ export default function App() {
         totalInversion: parseFloat(totalInversion.toFixed(2)),
         totalTransactions,
         avgPurchaseWeight: parseFloat(avgPurchaseWeight.toFixed(2)),
+        currentStockWeight: parseFloat(currentStockWeight.toFixed(2)),
+        currentStockItemsCount,
       },
     };
   }, [
@@ -4581,6 +4512,23 @@ export default function App() {
     setPurchaseReportIgnoreDatesForExpiry,
   ] = useState<boolean>(false);
 
+  // EOD Purchase Report & Signature States
+  const [showEodReportModal, setShowEodReportModal] = useState(false);
+  const [eodTab, setEodTab] = useState<"new" | "history">("new");
+  const [eodReportDate, setEodReportDate] = useState(() => {
+    return getLocalCurrentDateString();
+  });
+  const [eodOperatorPin, setEodOperatorPin] = useState("");
+  const [eodNotes, setEodNotes] = useState("");
+  const [eodHistory, setEodHistory] = useState<any[]>(() => {
+    try {
+      const saved = localStorage.getItem("aurum_eod_signatures");
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
   const [showAddUserModal, setShowAddUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState<SystemUser | null>(null);
   const [showAddBranchModal, setShowAddBranchModal] = useState(false);
@@ -4601,6 +4549,7 @@ export default function App() {
   const [showEditCashMoveModal, setShowEditCashMoveModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [inventoryClientSearch, setInventoryClientSearch] = useState("");
+  const [materialsMultiSearch, setMaterialsMultiSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<"all" | "pieza" | "barra">(
     "all",
   );
@@ -4637,6 +4586,7 @@ export default function App() {
     client: "",
     receiptNumber: "",
   });
+  const [showClientSuggestions, setShowClientSuggestions] = useState(false);
 
   // User Form State
   const [userFormData, setUserFormData] = useState({
@@ -5750,6 +5700,7 @@ export default function App() {
   ]);
 
   const [showAddClientModal, setShowAddClientModal] = useState(false);
+  const [forceCentralBranchForClient, setForceCentralBranchForClient] = useState(false);
   const [showAddReferrerModal, setShowAddReferrerModal] = useState(false);
   const [editingReferrer, setEditingReferrer] = useState<Referrer | null>(null);
   const [showAddPurchaseModal, setShowAddPurchaseModal] = useState(false);
@@ -5758,6 +5709,9 @@ export default function App() {
     "purchasePhoto" | "purchaseItemPhoto" | null
   >(null);
   const [showViewPurchaseModal, setShowViewPurchaseModal] = useState(false);
+  const [showPurchaseActionsModal, setShowPurchaseActionsModal] = useState(false);
+  const [selectedPurchaseForActions, setSelectedPurchaseForActions] = useState<GoldPurchase | null>(null);
+  const [activeActionsTab, setActiveActionsTab] = useState<"comprobantes" | "operaciones" | "gestion">("comprobantes");
   const [viewPurchaseFullScreen, setViewPurchaseFullScreen] = useState(false);
   const [viewingPurchase, setViewingPurchase] = useState<GoldPurchase | null>(
     null,
@@ -5803,6 +5757,12 @@ export default function App() {
   } | null>(null);
   const [voidReason, setVoidReason] = useState("");
   const [isVoiding, setIsVoiding] = useState(false);
+
+  // States for gold purchase physical deletion
+  const [showDeletePurchaseModal, setShowDeletePurchaseModal] = useState(false);
+  const [deletingPurchase, setDeletingPurchase] = useState<GoldPurchase | null>(null);
+  const [deletePasswordInput, setDeletePasswordInput] = useState("");
+  const [isDeletingPurchase, setIsDeletingPurchase] = useState(false);
 
   // States for historic toggler and authorization modal
   const [showToggleHistoricModal, setShowToggleHistoricModal] = useState(false);
@@ -6369,6 +6329,7 @@ export default function App() {
     inactivityTimeout: 10,
     timezone: "America/La_Paz",
     serverIp: "localhost",
+    deletePurchasePassword: "",
     updatedAt: "",
   });
 
@@ -6546,6 +6507,7 @@ export default function App() {
     finalWeight: 0,
     marketPrice: 0,
     loss: 0,
+    lossPercentage: 0,
     purity: 100,
     usdToBs: 6.96,
     pricePerGram: 0,
@@ -6563,6 +6525,7 @@ export default function App() {
       finalWeight: 0,
       marketPrice: 0,
       loss: 0,
+      lossPercentage: 0,
       purity: 100,
       usdToBs: 6.96,
       pricePerGram: 0,
@@ -6582,6 +6545,7 @@ export default function App() {
         finalWeight: editingMaterial.finalWeight,
         marketPrice: editingMaterial.marketPrice,
         loss: editingMaterial.loss,
+        lossPercentage: editingMaterial.lossPercentage || (editingMaterial.initialWeight > 0 ? parseFloat(((editingMaterial.loss / editingMaterial.initialWeight) * 100).toFixed(2)) : 0),
         purity: editingMaterial.purity,
         usdToBs: editingMaterial.usdToBs,
         pricePerGram: editingMaterial.pricePerGram,
@@ -7709,6 +7673,419 @@ export default function App() {
     purchaseReportStartDate,
     purchaseReportEndDate,
     purchaseReportTypeFilter,
+  ]);
+
+  // Drawing Canvas references & functions for EOD Purchase Report
+  const eodCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [isDrawingEod, setIsDrawingEod] = useState(false);
+
+  const startDrawingEod = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+    const canvas = eodCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.strokeStyle = "#1e3a8a"; // Ink blue color
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+
+    const rect = canvas.getBoundingClientRect();
+    let x, y;
+    if ("touches" in e) {
+      if (e.touches.length === 0) return;
+      // Prevent scrolling while drawing on mobile touch
+      if (e.cancelable) e.preventDefault();
+      x = e.touches[0].clientX - rect.left;
+      y = e.touches[0].clientY - rect.top;
+    } else {
+      x = e.nativeEvent.clientX - rect.left;
+      y = e.nativeEvent.clientY - rect.top;
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    setIsDrawingEod(true);
+  };
+
+  const drawEod = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+    if (!isDrawingEod) return;
+    const canvas = eodCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    let x, y;
+    if ("touches" in e) {
+      if (e.touches.length === 0) return;
+      if (e.cancelable) e.preventDefault();
+      x = e.touches[0].clientX - rect.left;
+      y = e.touches[0].clientY - rect.top;
+    } else {
+      x = e.nativeEvent.clientX - rect.left;
+      y = e.nativeEvent.clientY - rect.top;
+    }
+
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopDrawingEod = () => {
+    setIsDrawingEod(false);
+  };
+
+  const clearEodCanvas = () => {
+    const canvas = eodCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+
+  useEffect(() => {
+    if (showEodReportModal && eodTab === "new") {
+      setTimeout(() => {
+        clearEodCanvas();
+      }, 150);
+    }
+  }, [showEodReportModal, eodTab]);
+
+  // Helper to generate verification hashes
+  const generateEodVerificationHash = (operatorName: string, date: string, count: number) => {
+    const input = `${operatorName}-${date}-${count}-${Date.now()}`;
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      const char = input.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
+    }
+    const part1 = Math.abs(hash).toString(16).padStart(8, "0");
+    const part2 = Math.abs(hash * 31).toString(16).padStart(8, "0");
+    const part3 = Math.abs(hash * 17).toString(16).padStart(8, "0");
+    const part4 = Math.abs(hash * 3).toString(16).padStart(8, "0");
+    return `${part1}${part2}${part3}${part4}`.toUpperCase();
+  };
+
+  // Filter purchases for selected EOD report date
+  const eodFilteredPurchases = useMemo(() => {
+    return goldPurchases
+      .filter((p) => !branchMode || p.branchId === branchMode)
+      .filter((p) => p.type !== "anulado")
+      .filter((p) => {
+        const pDate = p.date
+          ? getLocalDateOnlyString(p.date, companySettings?.timezone)
+          : p.createdAt
+            ? getLocalDateOnlyString(p.createdAt, companySettings?.timezone)
+            : "";
+        return pDate === eodReportDate;
+      });
+  }, [goldPurchases, branchMode, eodReportDate, companySettings?.timezone]);
+
+  // Handler to export consolidated EOD report with digital signature
+  const handleExportEodPurchaseReportPDF = useCallback(() => {
+    if (eodFilteredPurchases.length === 0) {
+      alert(`No se encontraron compras registradas para la fecha seleccionada (${eodReportDate}).`);
+      return;
+    }
+
+    if (!user) {
+      alert("Error de autenticación: No hay un operador de turno autenticado.");
+      return;
+    }
+
+    if (eodOperatorPin !== user.pin) {
+      alert("Error de verificación: El PIN ingresado no coincide con el registrado para el operador de turno.");
+      return;
+    }
+
+    const canvas = eodCanvasRef.current;
+    if (!canvas) {
+      alert("Error del sistema: El lienzo de firma no está disponible.");
+      return;
+    }
+
+    const doc = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a4", // 210 mm width x 297 mm height
+    });
+
+    const company = companySettings;
+    const margin = 15;
+    const pageWidth = 210;
+    const sucursalName = branches.find((b) => b.id === branchMode)?.name || "TODAS LAS SUCURSALES";
+
+    // 1. HEADER (Design: High contrast, Swiss Minimalist, clean fonts)
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(24, 24, 27); // Zinc-900
+    doc.text(company?.name?.toUpperCase() || "AURUM MANAGER", margin, 20);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(113, 113, 122); // Zinc-500
+    doc.text(`NIT: ${company?.taxId || ""}`, margin, 25);
+    doc.text(`Dirección: ${company?.address || ""}`, margin, 29);
+    doc.text(`Teléfono: ${company?.phone || ""}`, margin, 33);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(194, 65, 12); // Amber-700 / Orange-700
+    doc.text("ACTA DE CIERRE Y CONSOLIDADO DE COMPRAS", pageWidth - margin, 20, { align: "right" });
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(39, 39, 42); // Zinc-800
+    doc.text(`SUCURSAL: ${sucursalName.toUpperCase()}`, pageWidth - margin, 25, { align: "right" });
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.5);
+    doc.setTextColor(82, 82, 91); // Zinc-600
+    doc.text(`Fecha del Cierre: ${eodReportDate}`, pageWidth - margin, 30, { align: "right" });
+    doc.text(`Generado el: ${new Date().toLocaleString()}`, pageWidth - margin, 34, { align: "right" });
+
+    // Decorative elegant line
+    doc.setDrawColor(228, 228, 231); // Zinc-200
+    doc.setLineWidth(0.5);
+    doc.line(margin, 38, pageWidth - margin, 38);
+
+    // 2. SUMMARY BOX (Resumen Consolidado)
+    // Draw a subtle background box for the consolidated values
+    doc.setFillColor(244, 244, 245); // Zinc-100 background
+    doc.rect(margin, 43, pageWidth - (margin * 2), 24, "F");
+
+    // Calculate totals for eodFilteredPurchases
+    const totalCount = eodFilteredPurchases.length;
+    const totalWeight = eodFilteredPurchases.reduce((acc, curr) => acc + (curr.items?.reduce((s, i) => s + i.finalWeight, 0) || 0), 0);
+    const totalFinoSum = eodFilteredPurchases.reduce((acc, curr) => acc + (curr.items?.reduce((s, i) => s + i.finalWeight * (i.purity / 100), 0) || 0), 0);
+    const totalAmount = eodFilteredPurchases.reduce((acc, curr) => acc + (curr.type === "cerrado" ? curr.closeTotal || curr.total : curr.total), 0);
+    const totalAdvances = eodFilteredPurchases.reduce((acc, curr) => acc + ((curr.advancePayment || 0) + (curr.advances?.reduce((sum, a) => sum + a.amount, 0) || 0)), 0);
+    const totalPendingSum = eodFilteredPurchases.reduce((acc, curr) => acc + (curr.type === "abierto" ? curr.total - ((curr.advancePayment || 0) + (curr.advances?.reduce((sum, a) => sum + a.amount, 0) || 0)) : 0), 0);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(113, 113, 122);
+    doc.text("LOTES ADQUIRIDOS", margin + 5, 49);
+    doc.text("PESO NETO TOTAL", margin + 42, 49);
+    doc.text("PESO FINO TOTAL (100%)", margin + 82, 49);
+    doc.text("MONTO VALORIZADO", margin + 130, 49);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(24, 24, 27);
+    doc.text(`${totalCount}`, margin + 5, 55);
+    doc.text(`${formatNumber(totalWeight)} g`, margin + 42, 55);
+    doc.text(`${formatNumber(totalFinoSum, 3)} g`, margin + 82, 55);
+    doc.setTextColor(16, 185, 129); // Emerald-600
+    doc.text(`${formatNumber(totalAmount)} BS`, margin + 130, 55);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(113, 113, 122);
+    doc.text(`Pendiente de Cierre: ${formatNumber(totalPendingSum)} BS`, margin + 130, 60);
+    doc.text(`Total Liquidado / Adelantos: ${formatNumber(totalAdvances)} BS`, margin + 5, 60);
+
+    // 3. TABLE OF TRANSACTIONS (Desglose de Compras)
+    const tableHeaders = [
+      ["Recibo", "Cliente", "C.I.", "Tipo", "Items", "Peso Neto (g)", "Fino (g)", "Total (BS)"]
+    ];
+
+    const tableRows = eodFilteredPurchases.map((p) => {
+      const client = clients.find((c) => c.id === p.clientId);
+      const itemsCount = p.items?.length || 0;
+      const fino = p.items?.reduce((s, i) => s + i.finalWeight * (i.purity / 100), 0) || 0;
+      const netWt = p.items?.reduce((s, i) => s + i.finalWeight, 0) || 0;
+      const amount = p.type === "cerrado" ? p.closeTotal || p.total : p.total;
+
+      return [
+        `#${p.receiptNumber}`,
+        client?.name || "Desconocido",
+        client?.ci || "S/N",
+        p.type.toUpperCase(),
+        `${itemsCount} item(s)`,
+        `${formatNumber(netWt)}g`,
+        `${formatNumber(fino, 3)}g`,
+        `${formatNumber(amount)} BS`,
+      ];
+    });
+
+    autoTable(doc, {
+      startY: 73,
+      margin: { left: margin, right: margin },
+      head: tableHeaders,
+      body: tableRows,
+      theme: "grid",
+      headStyles: {
+        fillColor: [39, 39, 42], // Zinc-800
+        textColor: 255,
+        fontStyle: "bold",
+        fontSize: 8,
+        halign: "center",
+      },
+      styles: {
+        fontSize: 7.5,
+        cellPadding: 2.5,
+        valign: "middle",
+      },
+      columnStyles: {
+        0: { fontStyle: "bold", font: "courier", halign: "center", cellWidth: 18 },
+        1: { cellWidth: 45 },
+        2: { halign: "center", cellWidth: 22 },
+        3: { halign: "center", cellWidth: 18 },
+        4: { halign: "center", cellWidth: 20 },
+        5: { halign: "right", cellWidth: 22 },
+        6: { halign: "right", fontStyle: "bold", cellWidth: 20 },
+        7: { halign: "right", fontStyle: "bold", cellWidth: 25 },
+      },
+    });
+
+    let finalY = (doc as any).lastAutoTable.finalY + 12;
+
+    // Check if we need a new page for signature and certificate
+    if (finalY > 210) {
+      doc.addPage();
+      finalY = 20;
+    }
+
+    // 4. NOTES / COMMENTS OF OPERATOR (if present)
+    if (eodNotes && eodNotes.trim()) {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.5);
+      doc.setTextColor(39, 39, 42);
+      doc.text("OBSERVACIONES / COMENTARIOS DEL CIERRE:", margin, finalY);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(63, 63, 70); // Zinc-700
+      const splitNotes = doc.splitTextToSize(eodNotes.trim(), pageWidth - (margin * 2));
+      doc.text(splitNotes, margin, finalY + 4);
+      finalY += splitNotes.length * 4 + 8;
+    }
+
+    // 5. REGULATORY DISCLOSURE / LEGAL STATEMENT
+    doc.setDrawColor(244, 244, 245);
+    doc.setFillColor(250, 250, 250);
+    doc.rect(margin, finalY, pageWidth - (margin * 2), 14, "F");
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7.5);
+    doc.setTextColor(120, 113, 108); // Stone-500
+    doc.text("DECLARACIÓN JURADA DE CONCILIACIÓN DIARIA Y CUMPLIMIENTO REGULATORIO:", margin + 3, finalY + 4.5);
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(6.8);
+    const statementText = "El operador de turno abajo firmante certifica la veracidad del presente informe de compras consolidadas. Se hace constar que los materiales han sido debidamente analizados en pureza, pesados en básculas calibradas y se han verificado los antecedentes del cliente conforme a los protocolos internos de prevención de lavado de activos y transparencia transaccional.";
+    const splitStatement = doc.splitTextToSize(statementText, pageWidth - (margin * 2) - 6);
+    doc.text(splitStatement, margin + 3, finalY + 8);
+    finalY += 18;
+
+    if (finalY > 230) {
+      doc.addPage();
+      finalY = 20;
+    }
+
+    // 6. SIGNATURE SECTION (Two Columns: Handwritten Canvas and Security Seal side-by-side)
+    const colWidth = (pageWidth - (margin * 2) - 10) / 2;
+
+    // LEFT COLUMN: HANDWRITTEN SIGNATURE
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(63, 63, 70);
+    doc.text("OPERADOR DE TURNO (FIRMA MANUSCRITA):", margin, finalY);
+
+    // Add signature image from canvas
+    const sigImg = canvas.toDataURL("image/png");
+    doc.addImage(sigImg, "PNG", margin + 2, finalY + 3, colWidth - 4, 22);
+
+    doc.setDrawColor(161, 161, 170); // Zinc-400
+    doc.setLineWidth(0.3);
+    doc.line(margin, finalY + 26, margin + colWidth, finalY + 26);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(24, 24, 27);
+    doc.text(user?.name?.toUpperCase() || user?.username?.toUpperCase() || "OPERADOR", margin, finalY + 30);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(113, 113, 122);
+    doc.text(`Identificación: ${user?.username || ""}`, margin, finalY + 33);
+    doc.text(`Rol: ${user?.role?.toUpperCase() || "OPERATOR"}`, margin, finalY + 36);
+
+    // RIGHT COLUMN: DIGITAL CERTIFICATE SEAL
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(63, 63, 70);
+    doc.text("CERTIFICADO DE VALIDEZ DE FIRMA ELECTRÓNICA:", margin + colWidth + 10, finalY);
+
+    // Certificate Box Background
+    doc.setFillColor(240, 253, 244); // Green-50 background (light pastel green)
+    doc.rect(margin + colWidth + 10, finalY + 3, colWidth, 34, "F");
+    doc.setDrawColor(187, 247, 208); // Green-200 border
+    doc.rect(margin + colWidth + 10, finalY + 3, colWidth, 34, "D");
+
+    const hashId = generateEodVerificationHash(user.username, eodReportDate, eodFilteredPurchases.length);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7.5);
+    doc.setTextColor(22, 101, 52); // Green-800
+    doc.text("✓ REGISTRO ELECTRÓNICO FIRMADO", margin + colWidth + 14, finalY + 8);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(6.8);
+    doc.setTextColor(21, 128, 61); // Green-700
+    doc.text(`PIN de Validación: AUTORIZADO (PIN: ****)`, margin + colWidth + 14, finalY + 13);
+    doc.text(`Marca Temporal: ${new Date().toLocaleString()}`, margin + colWidth + 14, finalY + 17);
+    doc.text(`Dispositivo ID: ${user.anonymousUid || "DISP-VERIFIED-01"}`, margin + colWidth + 14, finalY + 21);
+    
+    doc.setFont("helvetica", "bold");
+    doc.text("HASH DE INTEGRIDAD (SHA-256 COMPLIANT):", margin + colWidth + 14, finalY + 26);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(5.8);
+    doc.setTextColor(113, 113, 122); // Zinc-500
+    doc.text(hashId, margin + colWidth + 14, finalY + 30);
+    doc.text("El presente hash sella los lotes incluidos previniendo alteraciones.", margin + colWidth + 14, finalY + 33);
+
+    // Save report PDF
+    const filename = `CIERRE_DIARIO_COMPRAS_${sucursalName.toUpperCase().replace(/\s+/g, "_")}_${eodReportDate}.pdf`;
+    doc.save(filename);
+
+    // Save to Local History
+    const newHistoryRecord = {
+      id: String(Date.now()),
+      date: eodReportDate,
+      branchId: branchMode || "central",
+      branchName: sucursalName,
+      operatorName: user.name,
+      hash: hashId,
+      totalWeight: totalWeight,
+      totalFino: totalFinoSum,
+      totalAmount: totalAmount,
+      totalCount: totalCount,
+      timestamp: new Date().toISOString()
+    };
+
+    const updatedHistory = [newHistoryRecord, ...eodHistory];
+    setEodHistory(updatedHistory);
+    localStorage.setItem("aurum_eod_signatures", JSON.stringify(updatedHistory));
+
+    // Success alert
+    alert(`Consolidado y Cierre de Compras firmado electrónicamente con éxito.\nEl archivo "${filename}" ha sido descargado.\n\nHash de Seguridad: ${hashId}`);
+    
+    // Close modal & reset inputs
+    setShowEodReportModal(false);
+    setEodOperatorPin("");
+    setEodNotes("");
+  }, [
+    eodFilteredPurchases,
+    companySettings,
+    branches,
+    branchMode,
+    clients,
+    eodReportDate,
+    eodOperatorPin,
+    eodNotes,
+    eodHistory,
+    user
   ]);
 
   const handleExportClientHistoryPDF = useCallback(() => {
@@ -9286,9 +9663,50 @@ export default function App() {
     }
   };
 
+  // Escuchar el evento de invalidación de sesión (Single Active Session)
+  useEffect(() => {
+    const onSessionInvalid = () => {
+      handleLogout();
+      setModalAlertState({
+        show: true,
+        title: "Sesión Cerrada",
+        message: "Su sesión ha sido cerrada debido a que se inició sesión en otro dispositivo o navegador (o el servidor se reinició).",
+        type: "warning",
+      });
+    };
+    window.addEventListener("session-invalidated", onSessionInvalid);
+    return () => {
+      window.removeEventListener("session-invalidated", onSessionInvalid);
+    };
+  }, []);
+
+  // Validación periódica de sesión activa para reacción inmediata
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(async () => {
+      if (document.hidden) return; // Omitir si la pestaña está en segundo plano
+      try {
+        const res = await fetch("/api/auth/validate-session", {
+          headers: {
+            "X-Session-ID": user.activeSessionId || "",
+            "X-User-ID": user.id || ""
+          }
+        });
+        if (res.status === 401) {
+          window.dispatchEvent(new CustomEvent("session-invalidated"));
+        }
+      } catch (err) {
+        console.warn("Error al validar sesión en fondo:", err);
+      }
+    }, 10000); // Validar cada 10 segundos
+
+    return () => clearInterval(interval);
+  }, [user?.id, user?.activeSessionId]);
+
   const resetFilters = () => {
     setSearchTerm("");
     setInventoryClientSearch("");
+    setMaterialsMultiSearch("");
     setTypeFilter("all");
     setStatusFilter("disponible");
     setMinPurity(0);
@@ -9302,6 +9720,7 @@ export default function App() {
     view,
     searchTerm,
     inventoryClientSearch,
+    materialsMultiSearch,
     typeFilter,
     statusFilter,
     minPurity,
@@ -9539,7 +9958,7 @@ export default function App() {
       return;
     }
 
-    const currentBranchMode = branchMode || "sede_central";
+    const currentBranchMode = forceCentralBranchForClient ? "sede_central" : (branchMode || "sede_central");
     const branch = branches.find((b) => b.id === currentBranchMode) || { name: "Sede Central", id: "sede_central" };
     const branchName = branch ? branch.name : "Sede Central";
 
@@ -9590,24 +10009,32 @@ export default function App() {
 
       // If we saved a new client, auto-select them and fill in their referrer name if present
       if (!editingClient && savedClient && savedClient.id) {
-        let referrerName = purchaseHeader.referrerName;
-        if (savedClient.recommendedBy) {
-          const matchedRef = referrers.find(
-            (r) =>
-              (r.branchId === branchMode || (branchMode === null && (!r.branchId || r.branchId === "sede_central"))) &&
-              r.name.toLowerCase() === savedClient.recommendedBy.toLowerCase(),
-          );
-          if (matchedRef) {
-            referrerName = matchedRef.name;
-          } else {
-            referrerName = savedClient.recommendedBy;
+        if (forceCentralBranchForClient) {
+          setExportFormData((prev) => ({
+            ...prev,
+            client: savedClient.name,
+          }));
+          setForceCentralBranchForClient(false);
+        } else {
+          let referrerName = purchaseHeader.referrerName;
+          if (savedClient.recommendedBy) {
+            const matchedRef = referrers.find(
+              (r) =>
+                (r.branchId === branchMode || (branchMode === null && (!r.branchId || r.branchId === "sede_central"))) &&
+                r.name.toLowerCase() === savedClient.recommendedBy.toLowerCase(),
+            );
+            if (matchedRef) {
+              referrerName = matchedRef.name;
+            } else {
+              referrerName = savedClient.recommendedBy;
+            }
           }
+          setPurchaseHeader((prev) => ({
+            ...prev,
+            clientId: savedClient.id,
+            referrerName: referrerName,
+          }));
         }
-        setPurchaseHeader((prev) => ({
-          ...prev,
-          clientId: savedClient.id,
-          referrerName: referrerName,
-        }));
       }
     } catch (error) {
       handleApiError(
@@ -10114,6 +10541,42 @@ export default function App() {
       );
     } finally {
       setIsVoiding(false);
+    }
+  };
+
+  const handlePerformDelete = async () => {
+    if (!deletingPurchase || !deletePasswordInput.trim() || !user) {
+      alert("Por favor complete todos los datos requeridos.");
+      return;
+    }
+
+    setIsDeletingPurchase(true);
+    try {
+      await apiFetch(`/api/gold-purchases/${deletingPurchase.id}`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          "x-delete-password": deletePasswordInput.trim(),
+        },
+      });
+
+      await fetchData(true);
+
+      setShowDeletePurchaseModal(false);
+      setDeletingPurchase(null);
+      setDeletePasswordInput("");
+
+      alert(
+        `Compra #${deletingPurchase.receiptNumber} eliminada físicamente de forma exitosa, junto con sus registros de pago y datos de inventario.`
+      );
+    } catch (error: any) {
+      handleApiError(
+        error,
+        OperationType.DELETE,
+        `gold-purchases/${deletingPurchase.id}`
+      );
+    } finally {
+      setIsDeletingPurchase(false);
     }
   };
 
@@ -11311,7 +11774,7 @@ export default function App() {
       message += `*Adelantos:* ${formatNumber(totalAdvances)} BS\n\n`;
     }
 
-    message += `Gracias por confiar en *${companySettings?.name || "Aurum Manager"}*.`;
+    message += `Gracias por confiar en *Aurum Manager - Almacén*.`;
 
     // Format phone: use country code if available, otherwise fallback to auto-detection
     const countryCode = client.phoneCountryCode || "591";
@@ -11324,6 +11787,116 @@ export default function App() {
 
     const url = `https://wa.me/${cleanPhone}/?text=${encodeURIComponent(message)}`;
     window.open(url, "_blank");
+  };
+
+  const handleExportFilteredBranchInventoryExcel = () => {
+    if (filteredBranchItems.length === 0) {
+      alert("No hay ítems en el inventario actual filtrado para exportar.");
+      return;
+    }
+
+    const branch = branches.find((b) => b.id === branchMode);
+    const branchName = branch?.name || "Sucursal";
+
+    // Build worksheet data
+    const dataRows = filteredBranchItems.map((item, index) => {
+      const fDate = item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : "N/A";
+      const statusText = !item.isTransferred
+        ? "Disponible"
+        : !item.isVerifiedInCentral
+          ? "En Tránsito"
+          : "En Central";
+      const isPct = item.purity > 1;
+      const pctValue = isPct ? item.purity : item.purity * 100;
+      const itemLey = (pctValue * 10).toFixed(0);
+
+      return {
+        "#": index + 1,
+        "ID de Ítem": item.id || "N/A",
+        "Fecha Compra": fDate,
+        "Nro Recibo": `#${item.purchaseReceiptNumber || ""}`,
+        "Cliente": item.clientName || "N/A",
+        "Tipo Material": (item.type || "pieza").toUpperCase(),
+        "Peso Inicial (g)": item.initialWeight || 0,
+        "Peso Final/Neto (g)": item.finalWeight || 0,
+        "Merma (g)": item.loss || 0,
+        "Ley (%)": pctValue.toFixed(2) + "%",
+        "Equivalente Ley": itemLey,
+        "Cotización (BS/g)": item.marketPrice || 0,
+        "Precio por Gramo 100% (BS)": item.pricePerGram100 || 0,
+        "Tipo Compra": (item.purchaseType || "N/A").toUpperCase(),
+        "Estado": statusText,
+        "Usuario Registro": item.operatorName || "N/A",
+        "Total (BS)": item.total || 0,
+      };
+    });
+
+    // Calculate totals
+    const totalWeightInitial = filteredBranchItems.reduce((acc, curr) => acc + (curr.initialWeight || 0), 0);
+    const totalWeightFinal = filteredBranchItems.reduce((acc, curr) => acc + (curr.finalWeight || 0), 0);
+    const totalLoss = filteredBranchItems.reduce((acc, curr) => acc + (curr.loss || 0), 0);
+    const totalAmount = filteredBranchItems.reduce((acc, curr) => acc + (curr.total || 0), 0);
+
+    // Add totals row
+    dataRows.push({
+      "#": "",
+      "ID de Ítem": "TOTALES",
+      "Fecha Compra": "",
+      "Nro Recibo": "",
+      "Cliente": "",
+      "Tipo Material": "",
+      "Peso Inicial (g)": totalWeightInitial,
+      "Peso Final/Neto (g)": totalWeightFinal,
+      "Merma (g)": totalLoss,
+      "Ley (%)": "",
+      "Equivalente Ley": "",
+      "Cotización (BS/g)": "",
+      "Precio por Gramo 100% (BS)": "",
+      "Tipo Compra": "",
+      "Estado": "",
+      "Usuario Registro": "",
+      "Total (BS)": totalAmount,
+    } as any);
+
+    const ws = XLSX.utils.json_to_sheet(dataRows);
+
+    // Auto-fit column widths
+    if (dataRows.length > 0) {
+      const maxLens = Object.keys(dataRows[0]).map((key) => {
+        let maxLen = key.length;
+        dataRows.forEach((row: any) => {
+          const val = row[key];
+          if (val !== null && val !== undefined) {
+            const str = String(val);
+            if (str.length > maxLen) {
+              maxLen = str.length;
+            }
+          }
+        });
+        return { wch: maxLen + 3 };
+      });
+      ws["!cols"] = maxLens;
+    }
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Inventario Filtrado");
+
+    // File name with branch name, start date, end date if present
+    let dateSuffix = "";
+    if (branchInventoryStartDate && branchInventoryEndDate) {
+      dateSuffix = `_${branchInventoryStartDate}_al_${branchInventoryEndDate}`;
+    } else if (branchInventoryStartDate) {
+      dateSuffix = `_desde_${branchInventoryStartDate}`;
+    } else if (branchInventoryEndDate) {
+      dateSuffix = `_hasta_${branchInventoryEndDate}`;
+    } else {
+      dateSuffix = `_${getLocalCurrentDateString()}`;
+    }
+
+    XLSX.writeFile(
+      wb,
+      `Inventario_Detallado_${branchName.replace(/\s+/g, "_")}${dateSuffix}.xlsx`
+    );
   };
 
   const handlePrintBranchInventoryReport = () => {
@@ -13468,6 +14041,42 @@ export default function App() {
         const matchesClientSearch = m.client
           .toLowerCase()
           .includes(inventoryClientSearch.toLowerCase());
+        
+        let matchesMultiSearch = true;
+        if (materialsMultiSearch.trim()) {
+          const tokens = materialsMultiSearch.toLowerCase().trim().split(/\s+/);
+          matchesMultiSearch = tokens.every((token) => {
+            // Match tipo (type)
+            const typeStr = m.type === "pieza" ? "pieza" : m.type === "barra" ? "barra" : m.type === "puro" ? "puro" : m.type === "cerrado" ? "cerrado" : "";
+            if (typeStr.includes(token)) return true;
+
+            // Match ley (purity / ley)
+            const purityStr = m.purity ? m.purity.toString() : "";
+            if (purityStr.includes(token)) return true;
+            // Support karat-specific lookups
+            if (token === "18k" || token === "18") {
+              if (m.purity >= 74 && m.purity <= 76) return true;
+            }
+            if (token === "24k" || token === "24") {
+              if (m.purity >= 99) return true;
+            }
+            if (token === "14k" || token === "14") {
+              if (m.purity >= 57 && m.purity <= 59) return true;
+            }
+
+            // Match peso (initialWeight / finalWeight)
+            const weightToken = token.endsWith("g") ? token.slice(0, -1) : token;
+            if (m.finalWeight && m.finalWeight.toString().includes(weightToken)) return true;
+            if (m.initialWeight && m.initialWeight.toString().includes(weightToken)) return true;
+
+            // Match client or receipt number
+            if (m.client && m.client.toLowerCase().includes(token)) return true;
+            if (m.receiptNumber && m.receiptNumber.toLowerCase().includes(token)) return true;
+
+            return false;
+          });
+        }
+
         const matchesType = typeFilter === "all" || m.type === typeFilter;
         const matchesStatus =
           statusFilter === "all" || m.status === statusFilter;
@@ -13475,6 +14084,7 @@ export default function App() {
         return (
           matchesSearch &&
           matchesClientSearch &&
+          matchesMultiSearch &&
           matchesType &&
           matchesStatus &&
           matchesPurity
@@ -13489,11 +14099,106 @@ export default function App() {
     materials,
     searchTerm,
     inventoryClientSearch,
+    materialsMultiSearch,
     typeFilter,
     statusFilter,
     minPurity,
     maxPurity,
   ]);
+
+  const handleExportInventoryExcel = useCallback(() => {
+    if (filteredMaterials.length === 0) {
+      alert("No hay materiales en el inventario actual filtrado para exportar.");
+      return;
+    }
+
+    const branchName =
+      branches.find((b) => b.id === branchMode)?.name || "Sucursal";
+
+    const dataRows = filteredMaterials.map((m, index) => {
+      const fDate = m.registrationDate ? new Date(m.registrationDate).toLocaleDateString() : "N/A";
+      const statusText = m.status === "disponible"
+        ? "Disponible"
+        : m.status === "no disponible"
+          ? "No Disponible"
+          : m.status === "fundido"
+            ? "Fundido"
+            : m.status === "exportado"
+              ? "Vendido"
+              : m.status || "N/A";
+
+      return {
+        "#": index + 1,
+        "Nro Recibo": `#${m.receiptNumber || ""}`,
+        "Cliente": m.client || "N/A",
+        "Tipo Material": (m.type || "pieza").toUpperCase(),
+        "Peso Inicial (g)": m.initialWeight || 0,
+        "Peso Final/Neto (g)": m.finalWeight || 0,
+        "Merma (g)": m.loss || 0,
+        "Ley (%)": (m.purity || 0).toFixed(2) + "%",
+        "Cotización (USD/g)": m.marketPrice || 0,
+        "Tasa Cambio (USD->BS)": m.usdToBs || 0,
+        "Precio por Gramo (BS)": m.pricePerGram || 0,
+        "Estado": statusText,
+        "Usuario Registro": m.createdBy || "N/A",
+        "Fecha Registro": fDate,
+        "Total (BS)": m.total || 0,
+      };
+    });
+
+    // Calculate totals
+    const totalWeightInitial = filteredMaterials.reduce((acc, curr) => acc + (curr.initialWeight || 0), 0);
+    const totalWeightFinal = filteredMaterials.reduce((acc, curr) => acc + (curr.finalWeight || 0), 0);
+    const totalLoss = filteredMaterials.reduce((acc, curr) => acc + (curr.loss || 0), 0);
+    const totalAmount = filteredMaterials.reduce((acc, curr) => acc + (curr.total || 0), 0);
+
+    // Add totals row
+    dataRows.push({
+      "#": "",
+      "Nro Recibo": "TOTALES",
+      "Cliente": "",
+      "Tipo Material": "",
+      "Peso Inicial (g)": totalWeightInitial,
+      "Peso Final/Neto (g)": totalWeightFinal,
+      "Merma (g)": totalLoss,
+      "Ley (%)": "",
+      "Cotización (USD/g)": "",
+      "Tasa Cambio (USD->BS)": "",
+      "Precio por Gramo (BS)": "",
+      "Estado": "",
+      "Usuario Registro": "",
+      "Fecha Registro": "",
+      "Total (BS)": totalAmount,
+    } as any);
+
+    const ws = XLSX.utils.json_to_sheet(dataRows);
+
+    // Auto-fit column widths
+    if (dataRows.length > 0) {
+      const maxLens = Object.keys(dataRows[0]).map((key) => {
+        let maxLen = key.length;
+        dataRows.forEach((row: any) => {
+          const val = row[key];
+          if (val !== null && val !== undefined) {
+            const str = String(val);
+            if (str.length > maxLen) {
+              maxLen = str.length;
+            }
+          }
+        });
+        return { wch: maxLen + 3 };
+      });
+      ws["!cols"] = maxLens;
+    }
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Inventario Filtrado");
+
+    XLSX.writeFile(
+      wb,
+      `Inventario_Filtrado_${branchName.replace(/\s+/g, "_")}_${getLocalCurrentDateString()}.xlsx`
+    );
+  }, [filteredMaterials, branchMode, branches]);
 
   const deletedMaterials = useMemo(() => {
     return materials.filter((m) => {
@@ -13614,18 +14319,7 @@ export default function App() {
         }),
       });
       setShowAddModal(false);
-      setFormData({
-        receiptNumber: "",
-        client: "",
-        initialWeight: 0,
-        finalWeight: 0,
-        marketPrice: 0,
-        loss: 0,
-        purity: 100,
-        usdToBs: 6.96,
-        pricePerGram: 0,
-        type: "pieza",
-      });
+      resetFormData();
       fetchData();
     } catch (error) {
       handleApiError(error, OperationType.CREATE, "materials");
@@ -14801,17 +15495,17 @@ export default function App() {
               >
                 {/* Filters */}
                 <div className="flex flex-wrap gap-3 mb-6">
-                  <div className="flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-2xl border border-white/5 shadow-sm min-w-[200px]">
-                    <Search className="w-4 h-4 text-zinc-500" />
+                  <div className="flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-2xl border border-white/5 shadow-sm md:flex-1 min-w-[280px]">
+                    <Search className="w-4 h-4 text-amber-500" />
                     <input
                       type="text"
-                      placeholder="Buscar por cliente..."
-                      value={inventoryClientSearch}
-                      onChange={(e) => setInventoryClientSearch(e.target.value)}
-                      className="text-xs font-bold bg-transparent focus:outline-none text-zinc-300 w-full placeholder:text-zinc-600"
+                      placeholder="Buscar por ley, tipo, peso o cliente (ej: barra 18k 50g)..."
+                      value={materialsMultiSearch}
+                      onChange={(e) => setMaterialsMultiSearch(e.target.value)}
+                      className="text-xs font-bold bg-transparent focus:outline-none text-zinc-300 w-full placeholder:text-zinc-500"
                     />
-                    {inventoryClientSearch && (
-                      <button onClick={() => setInventoryClientSearch("")}>
+                    {materialsMultiSearch && (
+                      <button onClick={() => setMaterialsMultiSearch("")}>
                         <X className="w-3 h-3 text-zinc-500 hover:text-zinc-300" />
                       </button>
                     )}
@@ -14897,6 +15591,7 @@ export default function App() {
                     statusFilter !== "disponible" ||
                     searchTerm !== "" ||
                     inventoryClientSearch !== "" ||
+                    materialsMultiSearch !== "" ||
                     minPurity > 0 ||
                     maxPurity < 100) && (
                     <motion.button
@@ -14909,15 +15604,83 @@ export default function App() {
                       Limpiar Filtros
                     </motion.button>
                   )}
+
+                  <div className="flex items-center gap-3 ml-auto flex-wrap">
+                    {/* View Mode Switcher */}
+                    <div className="flex bg-zinc-950 p-1 rounded-2xl border border-white/5">
+                      <button
+                        type="button"
+                        onClick={() => setInventoryViewMode("grid")}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] uppercase font-bold transition-all cursor-pointer ${
+                          inventoryViewMode === "grid"
+                            ? "bg-amber-500 text-zinc-950 shadow"
+                            : "text-zinc-400 hover:text-zinc-200"
+                        }`}
+                        title="Vista de Tarjetas"
+                      >
+                        <LayoutGrid className="w-3.5 h-3.5" />
+                        <span>Tarjetas</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setInventoryViewMode("table")}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] uppercase font-bold transition-all cursor-pointer ${
+                          inventoryViewMode === "table"
+                            ? "bg-amber-500 text-zinc-950 shadow"
+                            : "text-zinc-400 hover:text-zinc-200"
+                        }`}
+                        title="Vista Rápida en Tabla"
+                      >
+                        <List className="w-3.5 h-3.5" />
+                        <span>Vista Rápida</span>
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleExportInventoryExcel}
+                      className="flex items-center gap-2 px-4 py-2 bg-emerald-600/10 text-emerald-400 rounded-2xl border border-emerald-500/20 text-[10px] uppercase font-bold hover:bg-emerald-600/20 transition-all shadow-sm cursor-pointer"
+                      title="Exportar inventario actual filtrado a Excel (XLSX) detallado"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Exportar Excel</span>
+                    </button>
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-                  {paginatedInventory.map((m) => (
-                    <MaterialCard
-                      key={m.id}
-                      material={m}
+                {inventoryViewMode === "grid" ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                    {paginatedInventory.map((m) => (
+                      <MaterialCard
+                        key={m.id}
+                        material={m}
+                        systemUsers={systemUsers}
+                        onViewSource={setViewingSourceMaterial}
+                        onEdit={(m) => {
+                          setEditingMaterial(m);
+                          setShowEditModal(true);
+                        }}
+                        onDelete={(mat) => setDeletingMaterial(mat)}
+                        canEdit={user?.role === "admin"}
+                        allMaterials={materials}
+                      />
+                    ))}
+                    {filteredMaterials.length === 0 && (
+                      <div className="col-span-full py-20 text-center">
+                        <div className="w-16 h-16 bg-zinc-900 rounded-full flex items-center justify-center mx-auto mb-4 border border-white/5">
+                          <AlertCircle className="text-zinc-500 w-8 h-8" />
+                        </div>
+                        <p className="text-zinc-500 font-medium">
+                          No se encontraron materiales con los filtros aplicados
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="mb-6">
+                    <MaterialTable
+                      materials={paginatedInventory}
                       systemUsers={systemUsers}
-                      onViewSource={setViewingSourceMaterial}
                       onEdit={(m) => {
                         setEditingMaterial(m);
                         setShowEditModal(true);
@@ -14926,18 +15689,8 @@ export default function App() {
                       canEdit={user?.role === "admin"}
                       allMaterials={materials}
                     />
-                  ))}
-                  {filteredMaterials.length === 0 && (
-                    <div className="col-span-full py-20 text-center">
-                      <div className="w-16 h-16 bg-zinc-900 rounded-full flex items-center justify-center mx-auto mb-4 border border-white/5">
-                        <AlertCircle className="text-zinc-500 w-8 h-8" />
-                      </div>
-                      <p className="text-zinc-500 font-medium">
-                        No se encontraron materiales con los filtros aplicados
-                      </p>
-                    </div>
-                  )}
-                </div>
+                  </div>
+                )}
                 <Pagination
                   totalItems={filteredMaterials.length}
                   currentPage={currentPage}
@@ -15448,22 +16201,107 @@ export default function App() {
                             Datos de Venta
                           </h4>
                           <div className="grid grid-cols-1 gap-4">
-                            <div className="space-y-1">
-                              <label className="text-[10px] font-bold uppercase text-zinc-500">
-                                Cliente / Destino
+                            <div className="space-y-1 relative">
+                              <label className="text-[10px] font-bold uppercase text-zinc-500 flex justify-between items-center">
+                                <span>Cliente / Destino</span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setClientFormData({
+                                      name: "",
+                                      phone: "",
+                                      phoneCountryCode: "591",
+                                      email: "",
+                                      ci: "",
+                                      workplace: "",
+                                      isMineCooperative: false,
+                                      recommendedBy: "",
+                                      referentialPhone: "",
+                                      referentialCountryCode: "591",
+                                      photo: "",
+                                      documentPhoto: "",
+                                      documentPhotoBack: "",
+                                      documentTypeOption: "single",
+                                    });
+                                    setForceCentralBranchForClient(true);
+                                    setShowAddClientModal(true);
+                                  }}
+                                  className="text-[9px] text-emerald-500 hover:text-emerald-400 font-bold uppercase tracking-wider flex items-center gap-1 transition-all"
+                                >
+                                  <Plus className="w-3 h-3" /> Registrar Cliente Central
+                                </button>
                               </label>
-                              <input
-                                type="text"
-                                placeholder="Nombre del comprador"
-                                value={exportFormData.client || ""}
-                                onChange={(e) =>
-                                  setExportFormData((prev) => ({
-                                    ...prev,
-                                    client: e.target.value,
-                                  }))
-                                }
-                                className="w-full p-2 bg-zinc-900 rounded-lg border border-white/5 text-sm font-medium text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
-                              />
+                              <div className="relative">
+                                <input
+                                  type="text"
+                                  placeholder="Escriba o seleccione un cliente"
+                                  value={exportFormData.client || ""}
+                                  onFocus={() => setShowClientSuggestions(true)}
+                                  onBlur={() => {
+                                    // Delay hiding suggestions to allow clicking options
+                                    setTimeout(() => setShowClientSuggestions(false), 200);
+                                  }}
+                                  onChange={(e) => {
+                                    setExportFormData((prev) => ({
+                                      ...prev,
+                                      client: e.target.value,
+                                    }));
+                                  }}
+                                  className="w-full p-2 bg-zinc-900 rounded-lg border border-white/5 text-sm font-medium text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 pr-8"
+                                />
+                                <div className="absolute right-2 top-2.5 pointer-events-none text-zinc-500">
+                                  <Search className="w-4 h-4" />
+                                </div>
+                              </div>
+
+                              {showClientSuggestions && (
+                                <div className="absolute left-0 right-0 top-full mt-1.5 bg-zinc-900 border border-white/10 rounded-xl shadow-xl max-h-52 overflow-y-auto z-50 divide-y divide-white/5 custom-scrollbar">
+                                  {(() => {
+                                    const centralClients = clients.filter(
+                                      (c) =>
+                                        !c.branchId ||
+                                        c.branchId === "sede_central" ||
+                                        c.branchId === "central" ||
+                                        c.branchId === ""
+                                    );
+                                    const filtered = centralClients.filter(
+                                      (c) =>
+                                        c.name.toLowerCase().includes((exportFormData.client || "").toLowerCase()) ||
+                                        c.ci.toLowerCase().includes((exportFormData.client || "").toLowerCase())
+                                    );
+
+                                    if (filtered.length === 0) {
+                                      return (
+                                        <div className="p-3 text-xs text-zinc-500 text-center">
+                                          No se encontraron clientes de Sede Central.
+                                        </div>
+                                      );
+                                    }
+
+                                    return filtered.map((c) => (
+                                      <button
+                                        key={c.id}
+                                        type="button"
+                                        onMouseDown={() => {
+                                          setExportFormData((prev) => ({
+                                            ...prev,
+                                            client: c.name,
+                                          }));
+                                          setShowClientSuggestions(false);
+                                        }}
+                                        className="w-full text-left p-3 hover:bg-zinc-850 transition-colors flex flex-col gap-0.5"
+                                      >
+                                        <span className="text-xs font-semibold text-zinc-200">
+                                          {c.name}
+                                        </span>
+                                        <span className="text-[10px] font-mono text-zinc-500">
+                                          CI: {c.ci || "Sin documento"} — {c.phone || "Sin teléfono"}
+                                        </span>
+                                      </button>
+                                    ));
+                                  })()}
+                                </div>
+                              )}
                             </div>
                             <div className="space-y-1">
                               <label className="text-[10px] font-bold uppercase text-zinc-500">
@@ -16416,12 +17254,12 @@ export default function App() {
                   </div>
 
                   {/* KPI indicators card row */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                    {/* KPI 1: Volumen Total Comprado */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6">
+                    {/* KPI 1: Volumen Total Recibido */}
                     <div className="bg-gradient-to-br from-zinc-900 to-zinc-900/60 p-6 rounded-3xl border border-white/5 relative overflow-hidden group">
                       <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/5 rounded-full blur-2xl group-hover:bg-amber-500/10 transition-all pointer-events-none" />
                       <div className="flex justify-between items-start mb-4">
-                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold">
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold font-extrabold">
                           Volumen Total Recibido
                         </p>
                         <div className="p-2.5 bg-amber-500/10 rounded-2xl text-amber-500">
@@ -16467,7 +17305,7 @@ export default function App() {
                     <div className="bg-gradient-to-br from-zinc-900 to-zinc-900/60 p-6 rounded-3xl border border-white/5 relative overflow-hidden group">
                       <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl group-hover:bg-blue-500/10 transition-all pointer-events-none" />
                       <div className="flex justify-between items-start mb-4">
-                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold font-extrabold">
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold">
                           Transacciones Realizadas
                         </p>
                         <div className="p-2.5 bg-blue-500/10 rounded-2xl text-blue-500">
@@ -16489,7 +17327,7 @@ export default function App() {
                     <div className="bg-gradient-to-br from-zinc-900 to-zinc-900/60 p-6 rounded-3xl border border-white/5 relative overflow-hidden group">
                       <div className="absolute top-0 right-0 w-24 h-24 bg-purple-500/5 rounded-full blur-2xl group-hover:bg-purple-500/10 transition-all pointer-events-none" />
                       <div className="flex justify-between items-start mb-4">
-                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold font-extrabold">
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold">
                           Peso Promedio Transacción
                         </p>
                         <div className="p-2.5 bg-purple-500/10 rounded-2xl text-purple-400">
@@ -16506,6 +17344,30 @@ export default function App() {
                       </p>
                       <p className="text-[10px] text-zinc-500 mt-1">
                         Volumen promedio de oro recibido por cliente.
+                      </p>
+                    </div>
+
+                    {/* KPI 5: Stock Físico Actual */}
+                    <div className="bg-gradient-to-br from-zinc-900 to-zinc-900/60 p-6 rounded-3xl border border-white/5 relative overflow-hidden group border-amber-500/10">
+                      <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/5 rounded-full blur-2xl group-hover:bg-amber-500/10 transition-all pointer-events-none" />
+                      <div className="flex justify-between items-start mb-4">
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-extrabold">
+                          Stock Físico Actual
+                        </p>
+                        <div className="p-2.5 bg-amber-500/10 rounded-2xl text-amber-500">
+                          <Scale className="w-4 h-4 text-amber-400" />
+                        </div>
+                      </div>
+                      <p className="text-2xl font-mono font-bold text-amber-400 tracking-tight">
+                        {formatNumber(
+                          executiveDashboardData.kpis.currentStockWeight,
+                        )}{" "}
+                        <span className="text-xs font-sans font-medium text-zinc-400">
+                          g
+                        </span>
+                      </p>
+                      <p className="text-[10px] text-zinc-500 mt-1">
+                        Material disponible en custodia ({executiveDashboardData.kpis.currentStockItemsCount} unidades).
                       </p>
                     </div>
                   </div>
@@ -17265,6 +18127,116 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Chart: Tendencia de Volumen por Sucursal (Últimos 30 días) */}
+                  <div className="bg-zinc-900 rounded-3xl border border-white/5 p-6 flex flex-col justify-between">
+                    <div>
+                      <h3 className="text-lg font-bold text-zinc-200">
+                        Tendencia de Volumen de Oro por Sucursal (Últimos 30 Días)
+                      </h3>
+                      <p className="text-xs text-zinc-500 mt-0.5">
+                        Evolución diaria comparada del volumen de oro (g) recibido en cada sucursal durante el último mes.
+                      </p>
+                    </div>
+
+                    <div className="h-80 w-full mt-6">
+                      {executiveDashboardData.last30DaysVolumeTrend.length > 0 ? (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart
+                            data={executiveDashboardData.last30DaysVolumeTrend}
+                            margin={{
+                              top: 15,
+                              right: 20,
+                              bottom: 10,
+                              left: -10,
+                            }}
+                          >
+                            <CartesianGrid
+                              strokeDasharray="3 3"
+                              stroke="#27272a"
+                              strokeOpacity={0.5}
+                            />
+                            <XAxis
+                              dataKey="name"
+                              stroke="#71717a"
+                              fontSize={10}
+                              tickLine={false}
+                            />
+                            <YAxis
+                              stroke="#71717a"
+                              fontSize={10}
+                              tickLine={false}
+                              axisLine={false}
+                              unit="g"
+                              label={{
+                                value: "Volumen Recibido (g)",
+                                angle: -90,
+                                position: "insideLeft",
+                                fill: "#71717a",
+                                fontSize: 10,
+                                offset: 10,
+                              }}
+                            />
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: "#18181b",
+                                borderColor: "#27272a",
+                                borderRadius: "16px",
+                                padding: "12px",
+                              }}
+                              labelStyle={{
+                                color: "#f4f4f5",
+                                fontWeight: "bold",
+                                fontSize: "11px",
+                                marginBottom: "4px",
+                              }}
+                              itemStyle={{
+                                fontSize: "11px",
+                                padding: "2px 0",
+                              }}
+                            />
+                            <Legend
+                              wrapperStyle={{
+                                fontSize: "10px",
+                                paddingTop: "10px",
+                              }}
+                            />
+                            {executiveDashboardData.trendBranchNames.map((name, idx) => {
+                              const colors = [
+                                "#f59e0b", // Sede Central (Amber)
+                                "#3b82f6", // Blue
+                                "#10b981", // Emerald
+                                "#ec4899", // Pink
+                                "#8b5cf6", // Violet
+                                "#06b6d4", // Cyan
+                                "#f43f5e", // Rose
+                                "#eab308", // Yellow
+                              ];
+                              const strokeColor = colors[idx % colors.length];
+                              return (
+                                <Line
+                                  key={name}
+                                  type="monotone"
+                                  dataKey={name}
+                                  stroke={strokeColor}
+                                  strokeWidth={2}
+                                  dot={{ r: 1.5, fill: strokeColor }}
+                                  activeDot={{ r: 4 }}
+                                />
+                              );
+                            })}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      ) : (
+                        <div className="h-full flex flex-col items-center justify-center text-zinc-650 gap-2 font-medium">
+                          <TrendingUp className="w-10 h-10 opacity-30 text-zinc-500 animate-pulse" />
+                          <p className="text-xs">
+                            Sin información de flujo de volumen en los últimos 30 días.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
                   {/* Leaderboard Section: Rendimiento de Sucursales */}
                   <div className="bg-zinc-900 rounded-3xl border border-white/5 overflow-hidden">
                     <div className="p-6 border-b border-white/5 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
@@ -17941,7 +18913,7 @@ export default function App() {
                 className="space-y-6"
               >
                 {/* Daily Closure Compliance Notice */}
-                <div
+                <motion.div
                   className={`p-6 rounded-[24px] border transition-all duration-300 flex flex-col md:flex-row md:items-center justify-between gap-6 ${
                     closureComplianceStats.status === "compliant"
                       ? "bg-emerald-500/5 border-emerald-500/10 text-emerald-100"
@@ -17949,6 +18921,38 @@ export default function App() {
                         ? "bg-amber-500/5 border-amber-500/10 text-amber-100"
                         : "bg-red-500/5 border-red-500/15 text-red-100 shadow-lg shadow-red-500/5"
                   }`}
+                  animate={
+                    (closureComplianceStats.status === "breach" ||
+                      closureComplianceStats.status === "no_records")
+                      ? {
+                          backgroundColor: [
+                            "rgba(239, 68, 68, 0.05)",
+                            "rgba(239, 68, 68, 0.22)",
+                            "rgba(239, 68, 68, 0.05)",
+                          ],
+                          borderColor: [
+                            "rgba(239, 68, 68, 0.15)",
+                            "rgba(239, 68, 68, 0.65)",
+                            "rgba(239, 68, 68, 0.15)",
+                          ],
+                          boxShadow: [
+                            "0 0 0px rgba(239, 68, 68, 0)",
+                            "0 0 20px rgba(239, 68, 68, 0.35)",
+                            "0 0 0px rgba(239, 68, 68, 0)",
+                          ],
+                        }
+                      : {}
+                  }
+                  transition={
+                    (closureComplianceStats.status === "breach" ||
+                      closureComplianceStats.status === "no_records")
+                      ? {
+                          duration: 1.8,
+                          repeat: Infinity,
+                          ease: "easeInOut",
+                        }
+                      : {}
+                  }
                 >
                   <div className="flex items-start gap-4">
                     <div
@@ -18026,7 +19030,7 @@ export default function App() {
                       <Lock className="w-4 h-4" /> Realizar Cierre de Caja
                     </button>
                   )}
-                </div>
+                </motion.div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                   <div className="bg-zinc-900 p-6 rounded-3xl border border-white/5 shadow-sm">
@@ -21308,6 +22312,14 @@ export default function App() {
                               <Truck className="w-3.5 h-3.5" /> Reporte
                               Traspasos PDF
                             </button>
+                            <button
+                              type="button"
+                              onClick={handleExportFilteredBranchInventoryExcel}
+                              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2.5 rounded-xl transition-all shadow-lg shadow-emerald-600/10 flex items-center gap-1.5 cursor-pointer"
+                              title="Exportar inventario actual filtrado a formato Excel (XLSX) detallado"
+                            >
+                              <Download className="w-3.5 h-3.5" /> Exportar Stock Excel
+                            </button>
                             {(branchInventoryStartDate ||
                               branchInventoryEndDate) && (
                               <button
@@ -21470,37 +22482,8 @@ export default function App() {
                           </select>
                         </div>
 
-                        <div className="text-zinc-500 text-[10px] font-mono font-bold ml-auto px-2 flex items-center gap-4">
-                          <span>Mostrando {filteredBranchItems.length} registros</span>
-                          <div className="w-px h-3.5 bg-white/10" />
-                          <div className="flex items-center gap-1 bg-zinc-900 p-1 rounded-xl border border-white/5">
-                            <button
-                              type="button"
-                              onClick={() => setBranchInventoryViewMode("cuadros")}
-                              className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
-                                branchInventoryViewMode === "cuadros"
-                                  ? "bg-violet-650 text-white font-black shadow-lg"
-                                  : "text-zinc-500 hover:text-zinc-300"
-                              }`}
-                              title="Vista Cuadros (Tarjetas)"
-                            >
-                              <LayoutGrid className="w-3.5 h-3.5" />
-                              <span className="hidden sm:inline text-[9px] uppercase tracking-wider">Cuadros</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setBranchInventoryViewMode("tabla")}
-                              className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
-                                branchInventoryViewMode === "tabla"
-                                  ? "bg-violet-650 text-white font-black shadow-lg"
-                                  : "text-zinc-500 hover:text-zinc-300"
-                              }`}
-                              title="Vista Tabla"
-                            >
-                              <List className="w-3.5 h-3.5" />
-                              <span className="hidden sm:inline text-[9px] uppercase tracking-wider">Tabla</span>
-                            </button>
-                          </div>
+                        <div className="text-zinc-500 text-[10px] font-mono font-bold ml-auto px-2">
+                          Mostrando {filteredBranchItems.length} registros
                         </div>
                       </div>
 
@@ -21549,284 +22532,325 @@ export default function App() {
                         </motion.div>
                       )}
 
-                      {/* Grid or Table container depending on layout view mode */}
-                      {branchInventoryViewMode === "cuadros" ? (
-                        <div className="space-y-6">
-                          {/* Grid "Seleccionar Todos" indicator if we have items that can be selected */}
-                          {paginatedItems.filter(
-                            (i) =>
-                              !i.isTransferred &&
-                              !i.isHistoric &&
-                              i.purchaseType === "cerrado",
-                          ).length > 0 && (
-                            <div className="bg-zinc-900/40 p-4 rounded-2xl border border-white/5 flex items-center gap-3">
-                              <input
-                                type="checkbox"
-                                checked={
-                                  paginatedItems.filter(
-                                    (i) =>
-                                      !i.isTransferred &&
-                                      !i.isHistoric &&
-                                      i.purchaseType === "cerrado",
-                                  ).length > 0 &&
-                                  paginatedItems
-                                    .filter(
-                                      (i) =>
-                                        !i.isTransferred &&
-                                        !i.isHistoric &&
-                                        i.purchaseType === "cerrado",
-                                    )
-                                    .every((i) =>
-                                      selectedInventoryItems.includes(
-                                        i.id!,
-                                      ),
-                                    )
-                                }
-                                onChange={(e) => {
-                                  const availableIds = paginatedItems
-                                    .filter(
-                                      (i) =>
-                                        !i.isTransferred &&
-                                        !i.isHistoric &&
-                                        i.purchaseType === "cerrado",
-                                    )
-                                    .map((i) => i.id!);
-                                  if (e.target.checked) {
-                                    setSelectedInventoryItems((prev) => {
-                                      const newSels = [...prev];
-                                      availableIds.forEach((id) => {
-                                        if (!newSels.includes(id))
-                                          newSels.push(id);
-                                      });
-                                      return newSels;
-                                    });
-                                  } else {
-                                    setSelectedInventoryItems((prev) =>
-                                      prev.filter(
-                                        (id) => !availableIds.includes(id),
-                                      ),
-                                    );
-                                  }
-                                }}
-                                className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
-                                id="select_all_grid"
-                              />
-                              <label htmlFor="select_all_grid" className="text-xs font-bold text-zinc-350 uppercase cursor-pointer select-none">
-                                Seleccionar todos los materiales disponibles de esta página para transferencia masiva
-                              </label>
-                            </div>
-                          )}
-
-                          {/* Cards Grid */}
-                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-                            {paginatedItems.map((item) => {
-                              const lossPercent =
-                                item.lossPercentage ||
-                                (item.initialWeight > 0
-                                  ? (item.loss / item.initialWeight) * 100
-                                  : 0);
-                              const isSelected =
-                                selectedInventoryItems.includes(item.id!);
-                              const isEligibleForTransfer =
-                                !item.isTransferred &&
-                                !item.isHistoric &&
-                                item.purchaseType === "cerrado";
-
-                              const isPct = item.purity > 1;
-                              const pctValue = isPct ? item.purity : item.purity * 100;
-                              const leyValue = (pctValue * 10).toFixed(0);
-
-                              return (
-                                <motion.div
-                                  key={item.id}
-                                  layout
-                                  initial={{ opacity: 0, scale: 0.95 }}
-                                  animate={{ opacity: 1, scale: 1 }}
-                                  className={`p-5 rounded-3xl border transition-all relative flex flex-col justify-between cursor-pointer group ${
-                                    isSelected
-                                      ? "bg-violet-950/20 border-violet-500 shadow-xl shadow-violet-950/15 ring-2 ring-violet-500/10"
-                                      : "bg-zinc-900/60 border-white/5 hover:border-violet-500/40 hover:bg-zinc-850"
-                                  }`}
-                                  onClick={(e) => {
-                                    // Make clicking the card toggle selection if eligible, but exclude buttons, checkboxes and images
-                                    const target = e.target as HTMLElement;
-                                    if (
-                                      isEligibleForTransfer &&
-                                      !target.closest("button") &&
-                                      !target.closest("input[type=checkbox]") &&
-                                      !target.closest("img")
-                                    ) {
-                                      setSelectedInventoryItems((prev) =>
-                                        prev.includes(item.id!)
-                                          ? prev.filter((id) => id !== item.id!)
-                                          : [...prev, item.id!]
-                                      );
+                      {/* Table of materials */}
+                      <div className="bg-zinc-950 rounded-3xl border border-white/5 shadow-2xl overflow-hidden">
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-white/5 bg-zinc-900/50 text-[10px] font-black uppercase tracking-wider text-zinc-400">
+                                <th className="px-4 py-4 w-[50px] text-center">
+                                  <input
+                                    type="checkbox"
+                                    checked={
+                                      paginatedItems.filter(
+                                        (i) =>
+                                          !i.isTransferred &&
+                                          !i.isHistoric &&
+                                          i.purchaseType === "cerrado",
+                                      ).length > 0 &&
+                                      paginatedItems
+                                        .filter(
+                                          (i) =>
+                                            !i.isTransferred &&
+                                            !i.isHistoric &&
+                                            i.purchaseType === "cerrado",
+                                        )
+                                        .every((i) =>
+                                          selectedInventoryItems.includes(
+                                            i.id!,
+                                          ),
+                                        )
                                     }
-                                  }}
-                                >
-                                  <div>
-                                    {/* Top Status & Selection Checkbox row */}
-                                    <div className="flex justify-between items-center mb-4">
-                                      <div className="flex items-center gap-2">
-                                        {isEligibleForTransfer && (
-                                          <input
-                                            type="checkbox"
-                                            checked={isSelected}
-                                            onChange={(e) => {
-                                              e.stopPropagation();
-                                              setSelectedInventoryItems((prev) =>
-                                                prev.includes(item.id!)
-                                                  ? prev.filter((id) => id !== item.id!)
-                                                  : [...prev, item.id!]
-                                              );
-                                            }}
-                                            className="w-4 h-4 rounded border-zinc-700 bg-zinc-950 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                                    onChange={(e) => {
+                                      const availableIds = paginatedItems
+                                        .filter(
+                                          (i) =>
+                                            !i.isTransferred &&
+                                            !i.isHistoric &&
+                                            i.purchaseType === "cerrado",
+                                        )
+                                        .map((i) => i.id!);
+                                      if (e.target.checked) {
+                                        setSelectedInventoryItems((prev) => {
+                                          const newSels = [...prev];
+                                          availableIds.forEach((id) => {
+                                            if (!newSels.includes(id))
+                                              newSels.push(id);
+                                          });
+                                          return newSels;
+                                        });
+                                      } else {
+                                        setSelectedInventoryItems((prev) =>
+                                          prev.filter(
+                                            (id) => !availableIds.includes(id),
+                                          ),
+                                        );
+                                      }
+                                    }}
+                                    disabled={
+                                      paginatedItems.filter(
+                                        (i) =>
+                                          !i.isTransferred &&
+                                          !i.isHistoric &&
+                                          i.purchaseType === "cerrado",
+                                      ).length === 0
+                                    }
+                                    className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                                    title="Seleccionar todos los disponibles en esta página"
+                                  />
+                                </th>
+                                <th className="px-4 py-4 w-[80px]">Foto</th>
+                                <th className="px-4 py-4">Recibo Compra</th>
+                                <th className="px-4 py-4">Cliente</th>
+                                <th className="px-4 py-4">Detalle / Tipo</th>
+                                <th className="px-4 py-4">Pureza (Ley)</th>
+                                <th className="px-4 py-4 text-right">
+                                  Peso (Inic / Final)
+                                </th>
+                                <th className="px-4 py-4 text-right">
+                                  Merma / Pérdida
+                                </th>
+                                <th className="px-4 py-4 text-right">
+                                  Importe
+                                </th>
+                                <th className="px-4 py-4 text-center">
+                                  Estado
+                                </th>
+                                <th className="px-6 py-4 text-center">
+                                  Acciones
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-white/5 text-zinc-300">
+                              {paginatedItems.map((item) => {
+                                const lossPercent =
+                                  item.lossPercentage ||
+                                  (item.initialWeight > 0
+                                    ? (item.loss / item.initialWeight) * 100
+                                    : 0);
+                                const isSelected =
+                                  selectedInventoryItems.includes(item.id!);
+
+                                return (
+                                  <tr
+                                    key={item.id}
+                                    className="hover:bg-zinc-900/10 text-xs transition-colors duration-155"
+                                  >
+                                    {/* Multi-selection Checkbox */}
+                                    <td className="px-4 py-3 text-center whitespace-nowrap">
+                                      {!item.isTransferred &&
+                                      !item.isHistoric &&
+                                      item.purchaseType === "cerrado" ? (
+                                        <input
+                                          type="checkbox"
+                                          checked={isSelected}
+                                          onChange={() => {
+                                            setSelectedInventoryItems((prev) =>
+                                              prev.includes(item.id!)
+                                                ? prev.filter(
+                                                    (id) => id !== item.id!,
+                                                  )
+                                                : [...prev, item.id!],
+                                            );
+                                          }}
+                                          className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                                        />
+                                      ) : (
+                                        <input
+                                          type="checkbox"
+                                          disabled
+                                          className="w-4 h-4 rounded border-zinc-900 bg-zinc-950 text-zinc-700 opacity-20 cursor-not-allowed"
+                                          title={
+                                            item.isHistoric
+                                              ? "Registro histórico no disponible para transferencia"
+                                              : item.purchaseType === "abierto"
+                                                ? "Lote de compra abierto (Pendiente de Liquidar)"
+                                                : "Material ya transferido o verificado"
+                                          }
+                                        />
+                                      )}
+                                    </td>
+
+                                    {/* Photo Column */}
+                                    <td className="px-4 py-3 whitespace-nowrap">
+                                      {item.photo ? (
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setZoomedImage(item.photo)
+                                          }
+                                          className="relative group block w-11 h-11 rounded-lg overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none"
+                                          title="Ver foto ampliada"
+                                        >
+                                          <img
+                                            src={item.photo}
+                                            alt="Material"
+                                            referrerPolicy="no-referrer"
+                                            className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-200"
                                           />
-                                        )}
-                                        <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg text-[10px]">
-                                          #{item.purchaseReceiptNumber}
-                                        </span>
-                                      </div>
-                                      
-                                      {/* Status tag */}
-                                      <div className="shrink-0">
-                                        {item.isHistoric ? (
-                                          <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
-                                            No Disp
-                                          </span>
-                                        ) : item.purchaseType === "abierto" ? (
-                                          <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
-                                            Abierto
-                                          </span>
-                                        ) : !item.isTransferred ? (
-                                          <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider">
-                                            Disponible
-                                          </span>
-                                        ) : !item.isVerifiedInCentral ? (
-                                          <span className="text-[9px] inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/25 px-2 py-0.5 rounded-full font-black uppercase tracking-wider">
-                                            Tránsito
-                                          </span>
-                                        ) : (
-                                          <span className="text-[9px] inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/25 px-2 py-0.5 rounded-full font-black uppercase tracking-wider">
-                                            Central
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-
-                                    {/* Photo & Client Information Block */}
-                                    <div className="flex gap-4 mb-4 items-start">
-                                      {/* Material image */}
-                                      <div className="shrink-0">
-                                        {item.photo ? (
-                                          <button
-                                            type="button"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setZoomedImage(item.photo);
-                                            }}
-                                            className="relative group block w-16 h-16 rounded-2xl overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none bg-zinc-950"
-                                            title="Ver foto ampliada"
-                                          >
-                                            <img
-                                              src={item.photo}
-                                              alt="Material"
-                                              referrerPolicy="no-referrer"
-                                              className="w-full h-full object-cover group-hover:scale-115 transition-transform duration-250"
-                                            />
-                                            <div className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
-                                              <Eye className="w-4 h-4 text-white" />
-                                            </div>
-                                          </button>
-                                        ) : (
-                                          <div className="w-16 h-16 rounded-2xl bg-zinc-950 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-1" title="Sin foto">
-                                            <ImageIcon className="w-5 h-5 text-zinc-700 font-bold" />
-                                            <span className="text-zinc-600 scale-90">Sin Foto</span>
+                                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                            <Eye className="w-3.5 h-3.5 text-white" />
                                           </div>
-                                        )}
-                                      </div>
-
-                                      {/* Client & Date */}
-                                      <div className="flex-1 min-w-0">
-                                        <h4 className="font-bold text-zinc-200 capitalize truncate text-sm" title={item.clientName}>
-                                          {item.clientName}
-                                        </h4>
-                                        <div className="flex items-center gap-1.5 mt-1.5 mb-1">
-                                          <span className="px-2 py-0.5 text-[9px] font-black uppercase tracking-widest rounded bg-zinc-950 text-zinc-400 border border-white/5 capitalize">
-                                            {item.type || "pieza"}
+                                        </button>
+                                      ) : (
+                                        <div
+                                          className="w-11 h-11 rounded-lg bg-zinc-905 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-0.5"
+                                          title="Sin foto"
+                                        >
+                                          <ImageIcon className="w-3.5 h-3.5 text-zinc-700" />
+                                          <span className="text-zinc-650 scale-90">
+                                            Sin Foto
                                           </span>
                                         </div>
-                                        <span className="text-[9px] text-zinc-500 font-mono mt-1 block font-bold">
-                                          Op: {item.operatorName || "System"}
-                                        </span>
-                                      </div>
-                                    </div>
+                                      )}
+                                    </td>
 
-                                    {/* Detailed Stats Grid */}
-                                    <div className="grid grid-cols-2 gap-3 p-3 bg-zinc-950/40 rounded-2xl border border-white/5 font-mono text-[10px] mb-4">
-                                      <div className="space-y-0.5">
-                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Ley (Purity)</span>
-                                        <span className="font-bold text-zinc-200 text-[11px] block">
-                                          {leyValue} Ley / {formatNumber(pctValue)}%
+                                    {/* Receipt Number */}
+                                    <td className="px-4 py-3 whitespace-nowrap">
+                                      <div className="flex flex-col">
+                                        <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg w-fit text-[11px]">
+                                          #{item.purchaseReceiptNumber}
+                                        </span>
+                                        <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
+                                          {new Date(
+                                            item.purchaseDate,
+                                          ).toLocaleDateString()}
                                         </span>
                                       </div>
-                                      <div className="space-y-0.5">
-                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block font-bold text-violet-400">Peso Final</span>
-                                        <span className="font-bold text-white text-[11.5px] block font-black">
+                                    </td>
+
+                                    {/* Client */}
+                                    <td className="px-4 py-3 whitespace-nowrap">
+                                      <div className="flex flex-col">
+                                        <span className="font-bold text-zinc-200 capitalize">
+                                          {item.clientName}
+                                        </span>
+                                        <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
+                                          Responsable:{" "}
+                                          {item.operatorName || "System"}
+                                        </span>
+                                      </div>
+                                    </td>
+
+                                    {/* Type */}
+                                    <td className="px-4 py-3 whitespace-nowrap">
+                                      <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-zinc-900 text-zinc-300 border border-white/5 capitalize text-center block w-fit">
+                                        {item.type || "pieza"}
+                                      </span>
+                                    </td>
+
+                                    {/* Purity */}
+                                    <td className="px-4 py-3 whitespace-nowrap">
+                                      {(() => {
+                                        const isPct = item.purity > 1;
+                                        const pctValue = isPct ? item.purity : item.purity * 100;
+                                        const leyValue = (pctValue * 10).toFixed(0);
+                                        return (
+                                          <div className="flex flex-col">
+                                            <span className="font-mono font-bold text-zinc-200">
+                                              {leyValue} Ley / {formatNumber(pctValue)}%
+                                            </span>
+                                            <span className="text-[9px] text-zinc-500 font-bold mt-0.5">
+                                              {pctValue >= 99
+                                                ? "Oro Pureza 24K"
+                                                : pctValue >= 75
+                                                  ? "Oro 18K (750)"
+                                                  : "Ley Especial"}
+                                            </span>
+                                          </div>
+                                        );
+                                      })()}
+                                    </td>
+
+                                    {/* Weight Info */}
+                                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                                      <div className="flex flex-col font-mono">
+                                        <span className="text-zinc-200 font-bold">
                                           {formatNumber(item.finalWeight)} g
                                         </span>
-                                      </div>
-                                      <div className="space-y-0.5">
-                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Peso Inicial</span>
-                                        <span className="font-medium text-zinc-400 block">
+                                        <span className="text-[10px] text-zinc-555">
+                                          Inicial:{" "}
                                           {formatNumber(item.initialWeight)} g
                                         </span>
                                       </div>
-                                      <div className="space-y-0.5">
-                                        <span className="text-[8px] text-zinc-500 uppercase font-black tracking-wider block">Merma / Pérdida</span>
-                                        {item.loss > 0 ? (
-                                          <span className="font-bold text-amber-500 block">
-                                            -{formatNumber(item.loss)} g (-{formatNumber(lossPercent)}%)
+                                    </td>
+
+                                    {/* Loss Info */}
+                                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                                      {item.loss > 0 ? (
+                                        <div className="flex flex-col font-mono text-amber-500">
+                                          <span className="font-bold">
+                                            -{formatNumber(item.loss)} g
                                           </span>
-                                        ) : (
-                                          <span className="text-zinc-650 block italic">Sin mermas</span>
-                                        )}
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  {/* Total Value & Action Buttons Footer */}
-                                  <div>
-                                    <div className="flex items-center justify-between gap-2 py-2 border-t border-white/5 bg-zinc-950/20 px-2 rounded-xl mb-3">
-                                      <span className="text-[9px] text-zinc-500 font-mono">FECHA COMPRA: {new Date(item.purchaseDate).toLocaleDateString()}</span>
-                                      <div className="text-right">
-                                        <span className="text-[9px] text-emerald-400 block uppercase font-mono font-bold leading-none mb-0.5">IMPORTE PAGADO</span>
-                                        <span className="text-xs font-black text-emerald-400 font-mono">
-                                          {formatNumber(item.total)} BS
+                                          <span className="text-[10px] opacity-75">
+                                            -{formatNumber(lossPercent)}%
+                                          </span>
+                                        </div>
+                                      ) : (
+                                        <span className="text-zinc-650 font-mono italic">
+                                          -
                                         </span>
-                                      </div>
-                                    </div>
+                                      )}
+                                    </td>
 
-                                    {/* Action Buttons */}
-                                    <div className="flex flex-col gap-1.5">
-                                      <div className="grid grid-cols-2 gap-2">
+                                    {/* Total Purchase Paid for Item */}
+                                    <td className="px-4 py-3 text-right whitespace-nowrap font-mono font-bold text-emerald-400">
+                                      {formatNumber(item.total)} BS
+                                    </td>
+
+                                    {/* Item Status */}
+                                    <td className="px-4 py-3 text-center whitespace-nowrap">
+                                      {item.isHistoric ? (
+                                        <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                          <span className="w-1.5 h-1.5 rounded-full bg-red-500" />{" "}
+                                          No Disponible
+                                        </span>
+                                      ) : item.purchaseType === "abierto" ? (
+                                        <span
+                                          className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide"
+                                          title="Lote de compra abierto - No liquidado aún"
+                                        >
+                                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />{" "}
+                                          Compra Abierta
+                                        </span>
+                                      ) : !item.isTransferred ? (
+                                        <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />{" "}
+                                          Disponible
+                                        </span>
+                                      ) : !item.isVerifiedInCentral ? (
+                                        <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                          <Truck className="w-3 h-3 text-amber-400" />{" "}
+                                          En Tránsito
+                                        </span>
+                                      ) : (
+                                        <span className="inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
+                                          <CheckCircle2 className="w-3 h-3 text-sky-400" />{" "}
+                                          En Central
+                                        </span>
+                                      )}
+                                    </td>
+
+                                    {/* Actions Column */}
+                                    <td className="px-6 py-3 text-center whitespace-nowrap">
+                                      <div className="flex items-center justify-center gap-1.5">
+                                        {/* Info button */}
                                         <button
                                           type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setViewingItemDetail(item);
-                                          }}
-                                          className="py-2 px-3 rounded-xl bg-zinc-950 hover:bg-zinc-800 text-zinc-300 hover:text-white border border-white/5 transition-all text-[11px] font-bold flex items-center justify-center gap-1.5"
+                                          onClick={() =>
+                                            setViewingItemDetail(item)
+                                          }
+                                          className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-zinc-850 hover:text-white border border-white/5 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
                                           title="Ver detalles de registro"
                                         >
-                                          <Eye className="w-3.5 h-3.5 text-zinc-400" />
-                                          Detalles
+                                          <Eye className="w-3.5 h-3.5 text-zinc-400" />{" "}
+                                          Ver Detalles
                                         </button>
 
+                                        {/* PDF receipt button */}
                                         <button
                                           type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
+                                          onClick={() => {
                                             const purchase = goldPurchases.find(
                                               (p) => p.id === item.purchaseId,
                                             );
@@ -21838,461 +22862,72 @@ export default function App() {
                                                   : "cierre",
                                               );
                                             } else {
-                                              alert("Operación de compra origen no encontrada");
+                                              alert(
+                                                "No se pudo encontrar el lote original para este material.",
+                                              );
                                             }
                                           }}
-                                          className="py-2 px-3 rounded-xl bg-zinc-950 hover:bg-zinc-800 text-zinc-300 hover:text-white border border-white/5 transition-all text-[11px] font-bold flex items-center justify-center gap-1.5"
-                                          title="Descargar Comprobante de Compra PDF"
+                                          className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-violet-950/40 hover:text-violet-400 border border-white/5 hover:border-violet-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                          title="Descargar PDF de recibo de compra"
                                         >
-                                          <FileText className="w-3.5 h-3.5 text-zinc-400 hover:text-red-400" />
+                                          <FileText className="w-3.5 h-3.5 text-red-400/80" />{" "}
                                           Recibo PDF
                                         </button>
-                                      </div>
 
-                                      {/* Individual direct transfer action button if eligible */}
-                                      {isEligibleForTransfer && (
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setSelectedTransferMaterials([
-                                              item.id!,
-                                            ]);
-                                            setShowTransferModal(true);
-                                          }}
-                                          className="w-full py-2 px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-bold transition-all text-[11px] flex items-center justify-center gap-1.5 shadow shadow-violet-650/40"
-                                          title="Enviar de forma independiente a la Central"
-                                        >
-                                          <ArrowUpRight className="w-3.5 h-3.5 text-white" />
-                                          Enviar a Sede Central
-                                        </button>
-                                      )}
-                                    </div>
-                                  </div>
-                                </motion.div>
-                              );
-                            })}
-
-                            {filteredBranchItems.length === 0 && (
-                              <div className="col-span-full py-16 bg-zinc-950/20 rounded-3xl border border-dashed border-white/5 text-center text-zinc-500">
-                                <AlertCircle className="w-8 h-8 text-zinc-650 mx-auto mb-3" />
-                                <p className="text-xs font-bold uppercase tracking-wider">No se encontraron piezas registradas en esta sucursal</p>
-                                <p className="text-[10px] text-zinc-600 mt-1">Intente ajustar los filtros de búsqueda o fechas arriba</p>
-                              </div>
-                            )}
-                          </div>
-
-                          {/* Pagination segment (shared) */}
-                          {filteredBranchItems.length > itemsPerPage && (
-                            <div className="p-4 bg-zinc-900/30 rounded-3xl border border-white/5">
-                              <Pagination
-                                totalItems={filteredBranchItems.length}
-                                currentPage={branchInventoryPage}
-                                onPageChange={(page) =>
-                                  setBranchInventoryPage(page)
-                                }
-                                itemsPerPage={itemsPerPage}
-                              />
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="bg-zinc-950 rounded-3xl border border-white/5 shadow-2xl overflow-hidden">
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-left border-collapse">
-                              <thead>
-                                <tr className="border-b border-white/5 bg-zinc-900/50 text-[10px] font-black uppercase tracking-wider text-zinc-400">
-                                  <th className="px-4 py-4 w-[50px] text-center">
-                                    <input
-                                      type="checkbox"
-                                      checked={
-                                        paginatedItems.filter(
-                                          (i) =>
-                                            !i.isTransferred &&
-                                            !i.isHistoric &&
-                                            i.purchaseType === "cerrado",
-                                        ).length > 0 &&
-                                        paginatedItems
-                                          .filter(
-                                            (i) =>
-                                              !i.isTransferred &&
-                                              !i.isHistoric &&
-                                              i.purchaseType === "cerrado",
-                                          )
-                                          .every((i) =>
-                                            selectedInventoryItems.includes(
-                                              i.id!,
-                                            ),
-                                          )
-                                      }
-                                      onChange={(e) => {
-                                        const availableIds = paginatedItems
-                                          .filter(
-                                            (i) =>
-                                              !i.isTransferred &&
-                                              !i.isHistoric &&
-                                              i.purchaseType === "cerrado",
-                                          )
-                                          .map((i) => i.id!);
-                                        if (e.target.checked) {
-                                          setSelectedInventoryItems((prev) => {
-                                            const newSels = [...prev];
-                                            availableIds.forEach((id) => {
-                                              if (!newSels.includes(id))
-                                                newSels.push(id);
-                                            });
-                                            return newSels;
-                                          });
-                                        } else {
-                                          setSelectedInventoryItems((prev) =>
-                                            prev.filter(
-                                              (id) => !availableIds.includes(id),
-                                            ),
-                                          );
-                                        }
-                                      }}
-                                      disabled={
-                                        paginatedItems.filter(
-                                          (i) =>
-                                            !i.isTransferred &&
-                                            !i.isHistoric &&
-                                            i.purchaseType === "cerrado",
-                                        ).length === 0
-                                      }
-                                      className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                                      title="Seleccionar todos los disponibles en esta página"
-                                    />
-                                  </th>
-                                  <th className="px-4 py-4 w-[80px]">Foto</th>
-                                  <th className="px-4 py-4">Recibo Compra</th>
-                                  <th className="px-4 py-4">Cliente</th>
-                                  <th className="px-4 py-4">Detalle / Tipo</th>
-                                  <th className="px-4 py-4">Pureza (Ley)</th>
-                                  <th className="px-4 py-4 text-right">
-                                    Peso (Inic / Final)
-                                  </th>
-                                  <th className="px-4 py-4 text-right">
-                                    Merma / Pérdida
-                                  </th>
-                                  <th className="px-4 py-4 text-right">
-                                    Importe
-                                  </th>
-                                  <th className="px-4 py-4 text-center">
-                                    Estado
-                                  </th>
-                                  <th className="px-6 py-4 text-center">
-                                    Acciones
-                                  </th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-white/5 text-zinc-300">
-                                {paginatedItems.map((item) => {
-                                  const lossPercent =
-                                    item.lossPercentage ||
-                                    (item.initialWeight > 0
-                                      ? (item.loss / item.initialWeight) * 100
-                                      : 0);
-                                  const isSelected =
-                                    selectedInventoryItems.includes(item.id!);
-
-                                  return (
-                                    <tr
-                                      key={item.id}
-                                      className="hover:bg-zinc-900/10 text-xs transition-colors duration-155"
-                                    >
-                                      {/* Multi-selection Checkbox */}
-                                      <td className="px-4 py-3 text-center whitespace-nowrap">
+                                        {/* Transfer individual button */}
                                         {!item.isTransferred &&
-                                        !item.isHistoric &&
-                                        item.purchaseType === "cerrado" ? (
-                                          <input
-                                            type="checkbox"
-                                            checked={isSelected}
-                                            onChange={() => {
-                                              setSelectedInventoryItems((prev) =>
-                                                prev.includes(item.id!)
-                                                  ? prev.filter(
-                                                      (id) => id !== item.id!,
-                                                    )
-                                                  : [...prev, item.id!],
-                                              );
-                                            }}
-                                            className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
-                                          />
-                                        ) : (
-                                          <input
-                                            type="checkbox"
-                                            disabled
-                                            className="w-4 h-4 rounded border-zinc-900 bg-zinc-950 text-zinc-700 opacity-20 cursor-not-allowed"
-                                            title={
-                                              item.isHistoric
-                                                ? "Registro histórico no disponible para transferencia"
-                                                : item.purchaseType === "abierto"
-                                                  ? "Lote de compra abierto (Pendiente de Liquidar)"
-                                                  : "Material ya transferido o verificado"
-                                            }
-                                          />
-                                        )}
-                                      </td>
-
-                                      {/* Photo Column */}
-                                      <td className="px-4 py-3 whitespace-nowrap">
-                                        {item.photo ? (
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              setZoomedImage(item.photo)
-                                            }
-                                            className="relative group block w-11 h-11 rounded-lg overflow-hidden border border-white/10 hover:border-violet-500 transition-all focus:outline-none"
-                                            title="Ver foto ampliada"
-                                          >
-                                            <img
-                                              src={item.photo}
-                                              alt="Material"
-                                              referrerPolicy="no-referrer"
-                                              className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-200"
-                                            />
-                                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
-                                              <Eye className="w-3.5 h-3.5 text-white" />
-                                            </div>
-                                          </button>
-                                        ) : (
-                                          <div
-                                            className="w-11 h-11 rounded-lg bg-zinc-905 border border-white/5 flex flex-col items-center justify-center text-[8px] text-zinc-650 font-bold uppercase gap-0.5"
-                                            title="Sin foto"
-                                          >
-                                            <ImageIcon className="w-3.5 h-3.5 text-zinc-700" />
-                                            <span className="text-zinc-655 scale-90">
-                                              Sin Foto
-                                            </span>
-                                          </div>
-                                        )}
-                                      </td>
-
-                                      {/* Receipt Number */}
-                                      <td className="px-4 py-3 whitespace-nowrap">
-                                        <div className="flex flex-col">
-                                          <span className="font-mono font-black text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-lg w-fit text-[11px]">
-                                            #{item.purchaseReceiptNumber}
-                                          </span>
-                                          <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
-                                            {new Date(
-                                              item.purchaseDate,
-                                            ).toLocaleDateString()}
-                                          </span>
-                                        </div>
-                                      </td>
-
-                                      {/* Client */}
-                                      <td className="px-4 py-3 whitespace-nowrap">
-                                        <div className="flex flex-col">
-                                          <span className="font-bold text-zinc-200 capitalize">
-                                            {item.clientName}
-                                          </span>
-                                          <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
-                                            Responsable:{" "}
-                                            {item.operatorName || "System"}
-                                          </span>
-                                        </div>
-                                      </td>
-
-                                      {/* Type */}
-                                      <td className="px-4 py-3 whitespace-nowrap">
-                                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-zinc-900 text-zinc-300 border border-white/5 capitalize text-center block w-fit">
-                                          {item.type || "pieza"}
-                                        </span>
-                                      </td>
-
-                                      {/* Purity */}
-                                      <td className="px-4 py-3 whitespace-nowrap">
-                                        {(() => {
-                                          const isPct = item.purity > 1;
-                                          const pctValue = isPct ? item.purity : item.purity * 100;
-                                          const leyValue = (pctValue * 10).toFixed(0);
-                                          return (
-                                            <div className="flex flex-col">
-                                              <span className="font-mono font-bold text-zinc-200">
-                                                {leyValue} Ley / {formatNumber(pctValue)}%
-                                              </span>
-                                              <span className="text-[9px] text-zinc-500 font-bold mt-0.5">
-                                                {pctValue >= 99
-                                                  ? "Oro Pureza 24K"
-                                                  : pctValue >= 75
-                                                    ? "Oro 18K (750)"
-                                                    : "Ley Especial"}
-                                              </span>
-                                            </div>
-                                          );
-                                        })()}
-                                      </td>
-
-                                      {/* Weight Info */}
-                                      <td className="px-4 py-3 text-right whitespace-nowrap">
-                                        <div className="flex flex-col font-mono">
-                                          <span className="text-zinc-200 font-bold">
-                                            {formatNumber(item.finalWeight)} g
-                                          </span>
-                                          <span className="text-[10px] text-zinc-555">
-                                            Inicial:{" "}
-                                            {formatNumber(item.initialWeight)} g
-                                          </span>
-                                        </div>
-                                      </td>
-
-                                      {/* Loss Info */}
-                                      <td className="px-4 py-3 text-right whitespace-nowrap">
-                                        {item.loss > 0 ? (
-                                          <div className="flex flex-col font-mono text-amber-500">
-                                            <span className="font-bold">
-                                              -{formatNumber(item.loss)} g
-                                            </span>
-                                            <span className="text-[10px] opacity-75">
-                                              -{formatNumber(lossPercent)}%
-                                            </span>
-                                          </div>
-                                        ) : (
-                                          <span className="text-zinc-650 font-mono italic">
-                                            -
-                                          </span>
-                                        )}
-                                      </td>
-
-                                      {/* Total Purchase Paid for Item */}
-                                      <td className="px-4 py-3 text-right whitespace-nowrap font-mono font-bold text-emerald-400">
-                                        {formatNumber(item.total)} BS
-                                      </td>
-
-                                      {/* Item Status */}
-                                      <td className="px-4 py-3 text-center whitespace-nowrap">
-                                        {item.isHistoric ? (
-                                          <span className="inline-flex items-center gap-1 bg-red-500/10 text-red-400 border border-red-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-red-500" />{" "}
-                                            No Disponible
-                                          </span>
-                                        ) : item.purchaseType === "abierto" ? (
-                                          <span
-                                            className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide"
-                                            title="Lote de compra abierto - No liquidado aún"
-                                          >
-                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />{" "}
-                                            Compra Abierta
-                                          </span>
-                                        ) : !item.isTransferred ? (
-                                          <span className="inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />{" "}
-                                            Disponible
-                                          </span>
-                                        ) : !item.isVerifiedInCentral ? (
-                                          <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                            <Truck className="w-3 h-3 text-amber-400" />{" "}
-                                            En Tránsito
-                                          </span>
-                                        ) : (
-                                          <span className="inline-flex items-center gap-1 bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wide">
-                                            <CheckCircle2 className="w-3 h-3 text-sky-400" />{" "}
-                                            En Central
-                                          </span>
-                                        )}
-                                      </td>
-
-                                      {/* Actions Column */}
-                                      <td className="px-6 py-3 text-center whitespace-nowrap">
-                                        <div className="flex items-center justify-center gap-1.5">
-                                          {/* Info button */}
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              setViewingItemDetail(item)
-                                            }
-                                            className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-zinc-850 hover:text-white border border-white/5 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
-                                            title="Ver detalles de registro"
-                                          >
-                                            <Eye className="w-3.5 h-3.5 text-zinc-400" />{" "}
-                                            Ver Detalles
-                                          </button>
-
-                                          {/* PDF receipt button */}
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              const purchase = goldPurchases.find(
-                                                (p) => p.id === item.purchaseId,
-                                              );
-                                              if (purchase) {
-                                                handlePrintPurchaseReceipt(
-                                                  purchase,
-                                                  purchase.type === "abierto"
-                                                    ? "abierto"
-                                                    : "cierre",
-                                                );
-                                              } else {
-                                                alert(
-                                                  "No se pudo encontrar el lote original para este material.",
-                                                );
-                                              }
-                                            }}
-                                            className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-violet-950/40 hover:text-violet-400 border border-white/5 hover:border-violet-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
-                                            title="Descargar PDF de recibo de compra"
-                                          >
-                                            <FileText className="w-3.5 h-3.5 text-red-400/80" />{" "}
-                                            Recibo PDF
-                                          </button>
-
-                                          {/* Transfer individual button */}
-                                          {!item.isTransferred &&
-                                            !item.isHistoric &&
-                                            item.purchaseType === "cerrado" && (
-                                              <button
-                                                type="button"
-                                                onClick={() => {
-                                                  setSelectedTransferMaterials([
-                                                    item.id!,
-                                                  ]);
-                                                  setShowTransferModal(true);
-                                                }}
-                                                className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-emerald-950/40 hover:text-emerald-400 border border-white/5 hover:border-emerald-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
-                                                title="Transferir a Central ahora"
-                                              >
-                                                <ArrowUpRight className="w-3.5 h-3.5 text-emerald-400/80" />{" "}
-                                                Enviar
-                                              </button>
-                                            )}
-                                        </div>
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-
-                                {filteredBranchItems.length === 0 && (
-                                  <tr>
-                                    <td
-                                      colSpan={11}
-                                      className="px-6 py-20 text-center text-zinc-500 italic text-xs"
-                                    >
-                                      No hay materiales que coincidan con la
-                                      búsqueda o filtros.
+                                          !item.isHistoric &&
+                                          item.purchaseType === "cerrado" && (
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setSelectedTransferMaterials([
+                                                  item.id!,
+                                                ]);
+                                                setShowTransferModal(true);
+                                              }}
+                                              className="p-1 px-2.5 rounded-lg bg-zinc-900 hover:bg-emerald-950/40 hover:text-emerald-400 border border-white/5 hover:border-emerald-500/20 transition-all flex items-center gap-1 text-[10px] font-bold text-zinc-400"
+                                              title="Transferir a Central ahora"
+                                            >
+                                              <ArrowUpRight className="w-3.5 h-3.5 text-emerald-400/80" />{" "}
+                                              Enviar
+                                            </button>
+                                          )}
+                                      </div>
                                     </td>
                                   </tr>
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
+                                );
+                              })}
 
-                          {/* Pagination segment */}
-                          {filteredBranchItems.length > itemsPerPage && (
-                            <div className="p-4 border-t border-white/5 bg-zinc-900/30">
-                              <Pagination
-                                totalItems={filteredBranchItems.length}
-                                currentPage={branchInventoryPage}
-                                onPageChange={(page) =>
-                                  setBranchInventoryPage(page)
-                                }
-                                itemsPerPage={itemsPerPage}
-                              />
-                            </div>
-                          )}
+                              {filteredBranchItems.length === 0 && (
+                                <tr>
+                                  <td
+                                    colSpan={11}
+                                    className="px-6 py-20 text-center text-zinc-500 italic text-xs"
+                                  >
+                                    No hay materiales que coincidan con la
+                                    búsqueda o filtros.
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
                         </div>
-                      )}
+
+                        {/* Pagination segment */}
+                        {filteredBranchItems.length > itemsPerPage && (
+                          <div className="p-4 border-t border-white/5 bg-zinc-900/30">
+                            <Pagination
+                              totalItems={filteredBranchItems.length}
+                              currentPage={branchInventoryPage}
+                              onPageChange={(page) =>
+                                setBranchInventoryPage(page)
+                              }
+                              itemsPerPage={itemsPerPage}
+                            />
+                          </div>
+                        )}
+                      </div>
                     </div>
                   );
                 })()}
@@ -22356,6 +22991,14 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex gap-2 shrink-0">
+                    <button
+                      onClick={() => {
+                        setShowEodReportModal(true);
+                      }}
+                      className="bg-zinc-800 text-zinc-100 hover:bg-zinc-700 font-bold px-4 py-2 rounded-xl text-sm border border-white/5 shadow-lg transition-all flex items-center gap-2"
+                    >
+                      <PenTool className="w-4 h-4 text-amber-500" /> Cierre Diario (Firma)
+                    </button>
                     <button
                       onClick={() => {
                         setShowPurchaseReportModal(true);
@@ -22736,198 +23379,17 @@ export default function App() {
                                     className="flex items-center justify-end gap-2"
                                     onClick={(e) => e.stopPropagation()}
                                   >
-                                    {/* --- IMPRESION / PDF ICONS GROUPED --- */}
-
-                                    {/* 1. Detalle Base: Origen (Blue) or Cierre (Emerald) */}
-                                    <button
-                                      onClick={() =>
-                                        handlePrintPurchaseReceipt(
-                                          p,
-                                          p.type === "abierto"
-                                            ? "abierto"
-                                            : "cierre",
-                                        )
-                                      }
-                                      className={`p-2 rounded-xl transition-all border ${
-                                        p.type === "abierto"
-                                          ? "bg-blue-500/10 text-blue-500 border-blue-500/20 hover:bg-blue-500 hover:text-white"
-                                          : "bg-emerald-500/10 text-emerald-500 border-emerald-500/20 hover:bg-emerald-500 hover:text-white"
-                                      }`}
-                                      title={`Imprimir Detalle de ${p.type === "abierto" ? "Abierto" : "Cierre"} (PDF)`}
-                                    >
-                                      <FileText className="w-4 h-4" />
-                                    </button>
-
-                                    {/* 2. Recibo de Adelanto (Amber) - only for abierto with advance payment */}
-                                    {p.type === "abierto" &&
-                                      p.advancePayment > 0 && (
-                                        <button
-                                          onClick={() =>
-                                            handlePrintAdvanceReceipt(p)
-                                          }
-                                          className="p-2 bg-amber-500/10 text-amber-500 rounded-xl hover:bg-amber-500 hover:text-zinc-950 transition-all border border-amber-500/20"
-                                          title="Imprimir Recibo de Adelanto (PDF)"
-                                        >
-                                          <FileText className="w-4 h-4" />
-                                        </button>
-                                      )}
-
-                                    {/* 3. Combinado: Ambos Comprobantes (Purple) - only for cerrado/liquidated */}
-                                    {p.type === "cerrado" && (
-                                      <button
-                                        onClick={() =>
-                                          handlePrintPurchaseReceipt(
-                                            p,
-                                            "combined",
-                                          )
-                                        }
-                                        className="p-2 bg-purple-500/10 text-purple-500 rounded-xl hover:bg-purple-500 hover:text-white transition-all border border-purple-500/20"
-                                        title="Imprimir Detalle Combinado (Ambos PDF)"
-                                      >
-                                        <FileText className="w-4 h-4" />
-                                      </button>
-                                    )}
-
-                                    {/* --- OTHER ACTIONS --- */}
-
-                                    <button
-                                      onClick={() => sendWhatsAppReceipt(p)}
-                                      className="p-2 bg-emerald-500/10 text-emerald-500 rounded-xl hover:bg-emerald-500 hover:text-white transition-all border border-emerald-500/20"
-                                      title="Enviar comprobante por WhatsApp"
-                                    >
-                                      <MessageCircle className="w-4 h-4" />
-                                    </button>
-
                                     <button
                                       onClick={() => {
-                                        setViewingPurchase(p);
-                                        setShowViewPurchaseModal(true);
+                                        setSelectedPurchaseForActions(p);
+                                        setActiveActionsTab("comprobantes");
+                                        setShowPurchaseActionsModal(true);
                                       }}
-                                      className="p-2 bg-zinc-800 text-zinc-400 rounded-xl hover:bg-zinc-700 transition-all"
-                                      title="Ver Detalle"
+                                      className="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500 text-amber-500 hover:text-zinc-950 border border-amber-500/20 hover:border-amber-500 rounded-xl text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 cursor-pointer shadow shadow-amber-500/5 hover:shadow-amber-500/20 font-sans"
                                     >
-                                      <Eye className="w-4 h-4" />
+                                      <Settings className="w-3.5 h-3.5" />
+                                      <span>Acciones</span>
                                     </button>
-
-                                    {p.type === "abierto" &&
-                                      (() => {
-                                        const totalOriginalRounded = Math.floor(
-                                          p.total ||
-                                            p.items?.reduce(
-                                              (acc: number, curr: any) =>
-                                                acc + (curr.total || 0),
-                                              0,
-                                            ) ||
-                                            0,
-                                        );
-                                        const advancesRounded = Math.floor(
-                                          (p.advancePayment || 0) +
-                                            (p.advances?.reduce(
-                                              (sum: number, a: any) =>
-                                                sum + a.amount,
-                                              0,
-                                            ) || 0),
-                                        );
-                                        const saldoPendiente =
-                                          totalOriginalRounded -
-                                          advancesRounded;
-                                        return (
-                                          saldoPendiente > 0 && (
-                                            <button
-                                              onClick={() => {
-                                                setCurrentPurchaseForAdvance(p);
-                                                setEditingAdvanceId(null);
-                                                setAdvanceFormData({
-                                                  amount: 0,
-                                                  concept: `Adelanto de la compra #${p.receiptNumber}`,
-                                                  paymentType: "efectivo",
-                                                  cashAmount: 0,
-                                                  bankAmount: 0,
-                                                  sourceBankAccountId: "",
-                                                  clientBank: "",
-                                                  clientAccountNumber: "",
-                                                  date: getLocalCurrentDateString(
-                                                    companySettings?.timezone,
-                                                  ),
-                                                });
-                                                setShowAdvanceModal(true);
-                                              }}
-                                              className="p-2 bg-blue-500/10 text-blue-500 rounded-xl hover:bg-blue-500 hover:text-white transition-all border border-blue-500/20"
-                                              title="Registrar Adelanto"
-                                            >
-                                              <CornerDownRight className="w-4 h-4" />
-                                            </button>
-                                          )
-                                        );
-                                      })()}
-
-                                    {p.type === "abierto" && (
-                                      <button
-                                        onClick={() => {
-                                          setClosingPurchase(p);
-                                          const firstItem = p.items?.[0];
-                                          setCloseMarketPrice(
-                                            firstItem?.marketPrice || 0,
-                                          );
-                                          setCloseUsdToBs(
-                                            firstItem?.usdToBs || 6.96,
-                                          );
-                                          setCloseCustomPrices100({});
-                                          setClosePaymentType("efectivo");
-                                          setClosePayoutChoice("total");
-                                          setClosePaidAmount(0);
-                                          setCloseCashAmount(0);
-                                          setCloseBankAmount(0);
-                                          setCloseSourceBankAccountId("");
-                                          setCloseClientBank("");
-                                          setCloseClientAccountNumber("");
-                                          setCloseSignature("");
-                                          setCloseValidationError("");
-                                          const today = new Date();
-                                          const yyyy = today.getFullYear();
-                                          const mm = String(
-                                            today.getMonth() + 1,
-                                          ).padStart(2, "0");
-                                          const dd = String(
-                                            today.getDate(),
-                                          ).padStart(2, "0");
-                                          setCloseAtDate(`${yyyy}-${mm}-${dd}`);
-                                          setShowClosePurchaseModal(true);
-                                        }}
-                                        className="p-2 bg-amber-500/10 text-amber-500 rounded-xl hover:bg-amber-500 hover:text-zinc-950 transition-all border border-amber-500/20"
-                                        title="Cerrar/Liquidar Compra"
-                                      >
-                                        <Scale className="w-4 h-4" />
-                                      </button>
-                                    )}
-
-                                    {p.type !== "anulado" && (
-                                      <button
-                                        onClick={() => handleInitiateVoid(p)}
-                                        className="p-2 bg-red-500/10 text-red-500 rounded-xl hover:bg-red-500 hover:text-white transition-all border border-red-500/20"
-                                        title="Anular Compra / Pagos"
-                                      >
-                                        <Trash2 className="w-4 h-4" />
-                                      </button>
-                                    )}
-
-                                    {p.type !== "anulado" && !(p.isHistoric === 1 || p.isHistoric === true) && (
-                                      <button
-                                        onClick={() => {
-                                          setHistoricTargetPurchase(p);
-                                          setHistoricValidator(
-                                            user?.name || user?.username || ""
-                                          );
-                                          setValidatorInputMode("select");
-                                          setHistoricReason("");
-                                          setShowToggleHistoricModal(true);
-                                        }}
-                                        className="p-2 bg-indigo-500/10 text-indigo-400 rounded-xl hover:bg-indigo-500 hover:text-white transition-all border border-indigo-500/20"
-                                        title="Cambiar Tipo de Registro"
-                                      >
-                                        <Database className="w-4 h-4" />
-                                      </button>
-                                    )}
                                   </div>
                                 </td>
                               </tr>
@@ -24052,6 +24514,23 @@ export default function App() {
                             />
                           </div>
                           <div className="space-y-2">
+                            <label className="text-[10px] font-bold uppercase text-amber-500 tracking-widest flex items-center gap-1.5">
+                              <span>🔑 Contraseña de Eliminación (Superadmin)</span>
+                            </label>
+                            <input
+                              type="password"
+                              value={companyFormData.deletePurchasePassword || ""}
+                              onChange={(e) =>
+                                setCompanyFormData((prev) => ({
+                                  ...prev,
+                                  deletePurchasePassword: e.target.value,
+                                }))
+                              }
+                              className="w-full p-3 bg-zinc-950 rounded-xl border border-amber-500/10 focus:border-amber-500/30 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/10 font-mono"
+                              placeholder="Ej. SuperSegura123"
+                            />
+                          </div>
+                          <div className="space-y-2">
                             <label className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">
                               Zona Horaria de la Empresa
                             </label>
@@ -24410,6 +24889,207 @@ export default function App() {
                                       <div className="w-9 h-5 bg-zinc-850 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-100 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600"></div>
                                     </div>
                                   </label>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* LÍMITES DE PESO POR TIPO DE MATERIAL */}
+                          <div className="col-span-full bg-zinc-950/40 border border-white/5 p-5 rounded-2xl space-y-4">
+                            <div>
+                              <h4 className="text-xs font-black uppercase tracking-widest text-zinc-200 flex items-center gap-2">
+                                <span className="p-1 rounded bg-amber-500/10 text-amber-500">
+                                  ⚖️
+                                </span>
+                                Límites de Peso Mínimo y Máximo por Material
+                              </h4>
+                              <p className="text-[10px] text-zinc-500 font-medium mt-0.5">
+                                Define los límites de peso (gramos) permitidos al registrar cada tipo de material en la sucursal. Deja vacío para no aplicar límite.
+                              </p>
+                            </div>
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                              {/* Piezas */}
+                              <div className="bg-zinc-900/60 border border-white/[0.03] p-4 rounded-xl space-y-3">
+                                <div className="text-xs font-bold text-zinc-300 border-b border-white/5 pb-1.5 flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
+                                  Piezas
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Min (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.minWeight_pieza !== undefined && companyFormData.minWeight_pieza !== null ? companyFormData.minWeight_pieza : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          minWeight_pieza: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Max (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.maxWeight_pieza !== undefined && companyFormData.maxWeight_pieza !== null ? companyFormData.maxWeight_pieza : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          maxWeight_pieza: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Barras */}
+                              <div className="bg-zinc-900/60 border border-white/[0.03] p-4 rounded-xl space-y-3">
+                                <div className="text-xs font-bold text-zinc-300 border-b border-white/5 pb-1.5 flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                  Barras
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Min (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.minWeight_barra !== undefined && companyFormData.minWeight_barra !== null ? companyFormData.minWeight_barra : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          minWeight_barra: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Max (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.maxWeight_barra !== undefined && companyFormData.maxWeight_barra !== null ? companyFormData.maxWeight_barra : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          maxWeight_barra: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Puro */}
+                              <div className="bg-zinc-900/60 border border-white/[0.03] p-4 rounded-xl space-y-3">
+                                <div className="text-xs font-bold text-zinc-300 border-b border-white/5 pb-1.5 flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                                  Puro
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Min (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.minWeight_puro !== undefined && companyFormData.minWeight_puro !== null ? companyFormData.minWeight_puro : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          minWeight_puro: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Max (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.maxWeight_puro !== undefined && companyFormData.maxWeight_puro !== null ? companyFormData.maxWeight_puro : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          maxWeight_puro: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Cerrado */}
+                              <div className="bg-zinc-900/60 border border-white/[0.03] p-4 rounded-xl space-y-3">
+                                <div className="text-xs font-bold text-zinc-300 border-b border-white/5 pb-1.5 flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                                  Cerrado
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Min (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.minWeight_cerrado !== undefined && companyFormData.minWeight_cerrado !== null ? companyFormData.minWeight_cerrado : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          minWeight_cerrado: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-rose-500"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <label className="text-[9px] font-bold uppercase text-zinc-500 block">Max (g)</label>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      placeholder="Sin lim."
+                                      value={companyFormData.maxWeight_cerrado !== undefined && companyFormData.maxWeight_cerrado !== null ? companyFormData.maxWeight_cerrado : ""}
+                                      onChange={(e) => {
+                                        const val = e.target.value === "" ? "" : parseFloat(e.target.value);
+                                        setCompanyFormData((prev) => ({
+                                          ...prev,
+                                          maxWeight_cerrado: val === "" || isNaN(val) ? undefined : val,
+                                        }));
+                                      }}
+                                      className="w-full p-2 bg-zinc-950 rounded-lg border border-white/5 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-1 focus:ring-rose-500"
+                                    />
+                                  </div>
                                 </div>
                               </div>
                             </div>
@@ -26725,6 +27405,7 @@ DB_NAME=aurum_gestor
           submitLabel="Registrar Material"
           clients={clients}
           fetchData={fetchData}
+          companySettings={companySettings}
         />
 
         {/* Edit Modal */}
@@ -26743,6 +27424,7 @@ DB_NAME=aurum_gestor
           submitLabel="Guardar Cambios"
           clients={clients}
           fetchData={fetchData}
+          companySettings={companySettings}
         />
 
         {/* Delete Confirmation Modal */}
@@ -28208,10 +28890,19 @@ DB_NAME=aurum_gestor
 
                   {/* Add Material Row (Horizontal) */}
                   <div className="p-8 bg-zinc-950 border-t border-white/5 shrink-0">
-                    <form
-                      onSubmit={handleAddPurchase}
-                      className="flex flex-wrap items-end gap-3"
-                    >
+                    {(() => {
+                      const isPurchaseWeightInvalid = (purchaseItem.finalWeight || 0) > (purchaseItem.initialWeight || 0);
+                      return (
+                        <form
+                          onSubmit={(e) => {
+                            if (isPurchaseWeightInvalid) {
+                              e.preventDefault();
+                              return;
+                            }
+                            handleAddPurchase(e);
+                          }}
+                          className="flex flex-wrap items-end gap-3"
+                        >
                       <div className="flex-1 min-w-[90px] space-y-1">
                         <label className="text-[10px] font-bold uppercase text-zinc-500">
                           Tipo Item
@@ -28259,7 +28950,11 @@ DB_NAME=aurum_gestor
                               ),
                             );
                           }}
-                          className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                          className={`w-full p-2.5 bg-zinc-900 rounded-xl border text-xs text-zinc-100 focus:outline-none focus:ring-2 transition-all ${
+                            isPurchaseWeightInvalid
+                              ? "border-rose-500 focus:ring-rose-500/20"
+                              : "border-white/5 focus:ring-amber-500/20"
+                          }`}
                         />
                       </div>
                       <div className="flex-1 min-w-[110px] space-y-1">
@@ -28296,7 +28991,11 @@ DB_NAME=aurum_gestor
                               ),
                             );
                           }}
-                          className="w-full p-2.5 bg-zinc-900 rounded-xl border border-white/5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                          className={`w-full p-2.5 bg-zinc-900 rounded-xl border text-xs text-zinc-100 focus:outline-none focus:ring-2 transition-all ${
+                            isPurchaseWeightInvalid
+                              ? "border-rose-500 focus:ring-rose-500/20"
+                              : "border-white/5 focus:ring-amber-500/20"
+                          }`}
                         />
                       </div>
                       <div className="flex-1 min-w-[70px] space-y-1">
@@ -28590,11 +29289,20 @@ DB_NAME=aurum_gestor
                       </div>
                       <button
                         type="submit"
-                        className="px-6 py-2.5 bg-amber-500 text-zinc-950 rounded-xl font-bold hover:bg-amber-400 transition-all flex items-center gap-2 shadow-lg shadow-amber-500/20"
+                        disabled={isPurchaseWeightInvalid}
+                        className="px-6 py-2.5 bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-zinc-950 rounded-xl font-bold hover:bg-amber-400 transition-all flex items-center gap-2 shadow-lg shadow-amber-500/20"
                       >
                         <Plus className="w-4 h-4" /> Agregar
                       </button>
+                      {isPurchaseWeightInvalid && (
+                        <div className="w-full text-xs text-rose-500 font-bold flex items-center gap-1.5 bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20 mt-2">
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-500" />
+                          <span>Error: El peso final no puede ser superior al peso inicial.</span>
+                        </div>
+                      )}
                     </form>
+                  );
+                })()}
                   </div>
 
                   {/* Footer Action */}
@@ -29240,6 +29948,468 @@ DB_NAME=aurum_gestor
               </motion.div>
             </div>
           )}
+        </AnimatePresence>
+
+        {/* Purchase Actions Quick Control Modal */}
+        <AnimatePresence>
+          {showPurchaseActionsModal && selectedPurchaseForActions && (() => {
+            const p = selectedPurchaseForActions;
+            const clientName = clients.find((c) => c.id === p.clientId)?.name || "Cliente No Identificado";
+            const operatorName = p.type === "cerrado" && p.closedAt
+              ? (systemUsers.find((u) => u.id === p.closedBy || u.username === p.closedBy || u.email === p.closedBy)?.name || p.closedBy || "Sistema")
+              : (systemUsers.find((u) => u.id === p.createdBy || u.username === p.createdBy || u.email === p.createdBy)?.name || p.createdBy || "Sistema");
+
+            // Calculate pending balance for Register Advance
+            const totalOriginalRounded = Math.floor(
+              p.total ||
+                p.items?.reduce(
+                  (acc: number, curr: any) => acc + (curr.total || 0),
+                  0,
+                ) || 0
+            );
+            const advancesRounded = Math.floor(
+              (p.advancePayment || 0) +
+                (p.advances?.reduce(
+                  (sum: number, a: any) => sum + a.amount,
+                  0,
+                ) || 0)
+            );
+            const saldoPendiente = totalOriginalRounded - advancesRounded;
+
+            return (
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => setShowPurchaseActionsModal(false)}
+                  className="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm"
+                />
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95, y: 15 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: 15 }}
+                  className="relative w-full max-w-2xl bg-zinc-900 border border-white/10 rounded-3xl overflow-hidden shadow-2xl flex flex-col max-h-[90vh]"
+                >
+                  {/* Modal Header */}
+                  <div className="p-6 bg-zinc-950 border-b border-white/5 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 shrink-0">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2 py-0.5 rounded-md font-mono font-bold uppercase tracking-wider">
+                          Recibo #{p.receiptNumber}
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider border ${
+                            p.type === "abierto"
+                              ? "bg-blue-500/10 text-blue-500 border-blue-500/20"
+                              : p.type === "cerrado"
+                                ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20"
+                                : "bg-red-500/10 text-red-500 border-red-500/20"
+                          }`}
+                        >
+                          {p.type === "abierto" ? "ABIERTO" : p.type === "cerrado" ? "CERRADO" : "ANULADO"}
+                        </span>
+                        {(p.isHistoric === 1 || p.isHistoric === true) && (
+                          <span className="px-2 py-0.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-md text-[10px] font-bold uppercase tracking-widest animate-pulse">
+                            Histórico
+                          </span>
+                        )}
+                      </div>
+                      <h3 className="text-lg font-black text-zinc-100 mt-1.5 uppercase tracking-tight">
+                        {clientName}
+                      </h3>
+                      <p className="text-[10px] text-zinc-400 font-mono mt-0.5 uppercase">
+                        Operador: <span className="text-zinc-200">{operatorName}</span> • Fecha: <span className="text-zinc-200">{new Date(p.closedAt || p.createdAt).toLocaleString()}</span>
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setShowPurchaseActionsModal(false)}
+                      className="p-1.5 hover:bg-zinc-850 rounded-lg text-zinc-400 hover:text-zinc-100 transition-colors self-start sm:self-center animate-none"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  {/* Tab bar */}
+                  <div className="flex bg-zinc-950 px-6 border-b border-white/5 shrink-0">
+                    <button
+                      onClick={() => setActiveActionsTab("comprobantes")}
+                      className={`py-3.5 px-4 text-xs font-bold uppercase tracking-widest border-b-2 transition-all flex items-center gap-2 ${
+                        activeActionsTab === "comprobantes"
+                          ? "border-amber-500 text-amber-500"
+                          : "border-transparent text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      <FileText className="w-4 h-4" />
+                      <span>Comprobantes</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveActionsTab("operaciones")}
+                      className={`py-3.5 px-4 text-xs font-bold uppercase tracking-widest border-b-2 transition-all flex items-center gap-2 ${
+                        activeActionsTab === "operaciones"
+                          ? "border-amber-500 text-amber-500"
+                          : "border-transparent text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      <Scale className="w-4 h-4" />
+                      <span>Operaciones</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveActionsTab("gestion")}
+                      className={`py-3.5 px-4 text-xs font-bold uppercase tracking-widest border-b-2 transition-all flex items-center gap-2 ${
+                        activeActionsTab === "gestion"
+                          ? "border-amber-500 text-amber-500"
+                          : "border-transparent text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      <Settings className="w-4 h-4" />
+                      <span>Control y Riesgo</span>
+                    </button>
+                  </div>
+
+                  {/* Actions Grid / List */}
+                  <div className="p-6 overflow-y-auto custom-scrollbar flex-1 space-y-4 bg-zinc-900/40">
+                    {activeActionsTab === "comprobantes" && (
+                      <div className="space-y-3">
+                        <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2">
+                          Documentación y Compartición
+                        </div>
+                        
+                        {/* Print Base Details (Origen / Cierre) */}
+                        <div
+                          onClick={() => {
+                            setShowPurchaseActionsModal(false);
+                            handlePrintPurchaseReceipt(p, p.type === "abierto" ? "abierto" : "cierre");
+                          }}
+                          className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-blue-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                        >
+                          <div className={`p-3 rounded-xl shrink-0 ${p.type === "abierto" ? "bg-blue-500/10 text-blue-400" : "bg-emerald-500/10 text-emerald-400"}`}>
+                            <Printer className="w-5 h-5" />
+                          </div>
+                          <div className="flex-1">
+                            <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                              Imprimir Comprobante de {p.type === "abierto" ? "Origen" : "Cierre"}
+                            </h4>
+                            <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                              Genera y descarga el documento oficial en formato PDF detallando las condiciones del lote, peso, ley, y precios calculados.
+                            </p>
+                          </div>
+                          <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                        </div>
+
+                        {/* Print Advance Receipt (If open with advance payment) */}
+                        {p.type === "abierto" && p.advancePayment > 0 && (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              handlePrintAdvanceReceipt(p);
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-amber-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                          >
+                            <div className="p-3 bg-amber-500/10 text-amber-400 rounded-xl shrink-0">
+                              <FileText className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                                Imprimir Recibo de Adelanto
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Descarga el PDF que respalda la entrega parcial de dinero del adelanto entregado ({formatNumber(p.advancePayment)} BS).
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        )}
+
+                        {/* Print Combined Receipt (Only for closed) */}
+                        {p.type === "cerrado" && (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              handlePrintPurchaseReceipt(p, "combined");
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-purple-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                          >
+                            <div className="p-3 bg-purple-500/10 text-purple-400 rounded-xl shrink-0">
+                              <Printer className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                                Imprimir Comprobantes Combinados
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Genera un único documento unificado que contiene el recibo original de apertura y el recibo de liquidación final de compra.
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        )}
+
+                        {/* WhatsApp Delivery */}
+                        <div
+                          onClick={() => {
+                            setShowPurchaseActionsModal(false);
+                            sendWhatsAppReceipt(p);
+                          }}
+                          className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-emerald-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                        >
+                          <div className="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl shrink-0">
+                            <MessageCircle className="w-5 h-5" />
+                          </div>
+                          <div className="flex-1">
+                            <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                              Enviar por WhatsApp
+                            </h4>
+                            <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                              Redirecciona a la API de WhatsApp para enviar un mensaje rápido estructurado con el resumen del recibo y enlaces de descarga al cliente.
+                            </p>
+                          </div>
+                          <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                        </div>
+                      </div>
+                    )}
+
+                    {activeActionsTab === "operaciones" && (
+                      <div className="space-y-3">
+                        <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2">
+                          Operaciones de Liquidación y Caja
+                        </div>
+
+                        {/* View Purchase Details */}
+                        <div
+                          onClick={() => {
+                            setShowPurchaseActionsModal(false);
+                            setViewingPurchase(p);
+                            setShowViewPurchaseModal(true);
+                          }}
+                          className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-amber-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                        >
+                          <div className="p-3 bg-zinc-800 text-zinc-300 rounded-xl shrink-0">
+                            <Eye className="w-5 h-5" />
+                          </div>
+                          <div className="flex-1">
+                            <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                              Ver Detalle de la Compra (Pantalla Completa)
+                            </h4>
+                            <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                              Explora el desglose completo del lote, pesos bruto y fino, precios de mercado aplicados, historial de adelantos, y firmas registradas.
+                            </p>
+                          </div>
+                          <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                        </div>
+
+                        {/* Register Extra Advance (Only for Abierto with positive balance) */}
+                        {p.type === "abierto" && (() => {
+                          return (
+                            saldoPendiente > 0 ? (
+                              <div
+                                onClick={() => {
+                                  setShowPurchaseActionsModal(false);
+                                  setCurrentPurchaseForAdvance(p);
+                                  setEditingAdvanceId(null);
+                                  setAdvanceFormData({
+                                    amount: 0,
+                                    concept: `Adelanto de la compra #${p.receiptNumber}`,
+                                    paymentType: "efectivo",
+                                    cashAmount: 0,
+                                    bankAmount: 0,
+                                    sourceBankAccountId: "",
+                                    clientBank: "",
+                                    clientAccountNumber: "",
+                                    date: getLocalCurrentDateString(companySettings?.timezone),
+                                  });
+                                  setShowAdvanceModal(true);
+                                }}
+                                className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-blue-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                              >
+                                <div className="p-3 bg-blue-500/10 text-blue-400 rounded-xl shrink-0">
+                                  <CornerDownRight className="w-5 h-5" />
+                                </div>
+                                <div className="flex-1">
+                                  <div className="flex items-center gap-2">
+                                    <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                                      Registrar Entrega de Adelanto
+                                    </h4>
+                                    <span className="text-[8px] bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-mono font-bold">
+                                      Saldo: {formatNumber(saldoPendiente)} BS
+                                    </span>
+                                  </div>
+                                  <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                    Registra un nuevo abono/adelanto parcial a cuenta de esta compra. El dinero saldrá de la caja de la sucursal o del banco seleccionado.
+                                  </p>
+                                </div>
+                                <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                              </div>
+                            ) : (
+                              <div className="p-4 bg-zinc-950/40 border border-white/5 rounded-2xl opacity-60">
+                                <p className="text-[10px] text-zinc-500 italic">
+                                  No es posible registrar más adelantos. El saldo pendiente de este recibo es de 0 BS.
+                                </p>
+                              </div>
+                            )
+                          );
+                        })()}
+
+                        {/* Close / Liquidate Purchase (Only for Abierto) */}
+                        {p.type === "abierto" && (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              setClosingPurchase(p);
+                              const firstItem = p.items?.[0];
+                              setCloseMarketPrice(firstItem?.marketPrice || 0);
+                              setCloseUsdToBs(firstItem?.usdToBs || 6.96);
+                              setCloseCustomPrices100({});
+                              setClosePaymentType("efectivo");
+                              setClosePayoutChoice("total");
+                              setClosePaidAmount(0);
+                              setCloseCashAmount(0);
+                              setCloseBankAmount(0);
+                              setCloseSourceBankAccountId("");
+                              setCloseClientBank("");
+                              setCloseClientAccountNumber("");
+                              setCloseSignature("");
+                              setCloseValidationError("");
+                              const today = new Date();
+                              const yyyy = today.getFullYear();
+                              const mm = String(today.getMonth() + 1).padStart(2, "0");
+                              const dd = String(today.getDate()).padStart(2, "0");
+                              setCloseAtDate(`${yyyy}-${mm}-${dd}`);
+                              setShowClosePurchaseModal(true);
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-amber-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                          >
+                            <div className="p-3 bg-amber-500/10 text-amber-400 rounded-xl shrink-0">
+                              <Scale className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-amber-500 transition-colors">
+                                Cerrar y Liquidar Compra Oro
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Cierra el plazo abierto. Calcula el valor final con el precio de mercado actual y realiza el desembolso final de caja para liquidar al cliente.
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {activeActionsTab === "gestion" && (
+                      <div className="space-y-3">
+                        <div className="text-[10px] uppercase font-bold text-red-550 tracking-wider mb-2 flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5" /> Zona de Seguridad y Ajustes
+                        </div>
+
+                        {/* Toggle Historic Status (Allowed when not voided and not already historic) */}
+                        {p.type !== "anulado" && !(p.isHistoric === 1 || p.isHistoric === true) ? (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              setHistoricTargetPurchase(p);
+                              setHistoricValidator(user?.name || user?.username || "");
+                              setValidatorInputMode("select");
+                              setHistoricReason("");
+                              setShowToggleHistoricModal(true);
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-indigo-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                          >
+                            <div className="p-3 bg-indigo-500/10 text-indigo-400 rounded-xl shrink-0">
+                              <Database className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-indigo-400 transition-colors">
+                                Convertir a Registro Histórico (Sin Afectar Caja)
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Desvincula este registro del saldo activo de Caja Chica. Se utiliza para migrar registros históricos o auditar movimientos sin alterar egresos.
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        ) : (
+                          p.type !== "anulado" && (
+                            <div className="p-4 bg-zinc-950/40 border border-white/5 rounded-2xl opacity-60">
+                              <p className="text-[10px] text-indigo-400 italic">
+                                Este registro ya está configurado como Histórico.
+                              </p>
+                            </div>
+                          )
+                        )}
+
+                        {/* Initiate Void (Anular Compra - Soft Delete) */}
+                        {p.type !== "anulado" ? (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              handleInitiateVoid(p);
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-white/5 hover:border-red-500/30 rounded-2xl cursor-pointer transition-all hover:bg-zinc-900 group"
+                          >
+                            <div className="p-3 bg-red-500/10 text-red-400 rounded-xl shrink-0">
+                              <Trash2 className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-zinc-100 uppercase group-hover:text-red-400 transition-colors">
+                                Anular Compra / Cancelar Pagos
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Declara el recibo como nulo. Esto liberará los materiales en stock y revertirá todos los egresos financieros asociados de caja y bancos.
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        ) : (
+                          <div className="p-4 bg-zinc-950/40 border border-white/5 rounded-2xl opacity-60 flex items-center gap-2">
+                            <span className="text-[10px] text-red-400 italic font-bold">
+                              Esta compra ya se encuentra ANULADA y sus movimientos de caja fueron revertidos.
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Superadmin Hard Delete */}
+                        {user?.role === "superadmin" && (
+                          <div
+                            onClick={() => {
+                              setShowPurchaseActionsModal(false);
+                              setDeletingPurchase(p);
+                              setDeletePasswordInput("");
+                              setShowDeletePurchaseModal(true);
+                            }}
+                            className="flex items-center gap-4 p-4 bg-zinc-950 border border-red-500/10 hover:border-red-500 rounded-2xl cursor-pointer transition-all hover:bg-red-950/20 group"
+                          >
+                            <div className="p-3 bg-red-500/15 text-red-500 rounded-xl shrink-0">
+                              <AlertCircle className="w-5 h-5" />
+                            </div>
+                            <div className="flex-1">
+                              <h4 className="text-xs font-bold text-red-400 uppercase group-hover:text-red-300 transition-colors">
+                                Eliminar Registro Físico permanentemente
+                              </h4>
+                              <p className="text-[10px] text-zinc-400 mt-0.5 leading-relaxed">
+                                Opción exclusiva de Súper Administrador. Elimina físicamente el registro de la base de datos de manera irreversible. Requiere contraseña de confirmación.
+                              </p>
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-zinc-600 group-hover:translate-x-1 transition-all shrink-0" />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Footer */}
+                  <div className="p-4 bg-zinc-950 border-t border-white/5 flex justify-end gap-2 shrink-0">
+                    <button
+                      onClick={() => setShowPurchaseActionsModal(false)}
+                      className="px-5 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white rounded-xl text-xs font-bold uppercase transition-all"
+                    >
+                      Cerrar
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            );
+          })()}
         </AnimatePresence>
 
         {/* View Purchase Modal */}
@@ -32573,6 +33743,121 @@ DB_NAME=aurum_gestor
           )}
         </AnimatePresence>
 
+        {/* Physical Delete Purchase Modal for Superadmin */}
+        <AnimatePresence>
+          {showDeletePurchaseModal && deletingPurchase && (
+            <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => {
+                  if (!isDeletingPurchase) {
+                    setShowDeletePurchaseModal(false);
+                    setDeletingPurchase(null);
+                    setDeletePasswordInput("");
+                  }
+                }}
+                className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+              />
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 20 }}
+                className="relative w-full max-w-lg bg-zinc-900 rounded-[32px] border border-red-500/20 shadow-2xl overflow-hidden flex flex-col max-h-[95vh] z-10"
+              >
+                {/* Header */}
+                <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-start">
+                  <div>
+                    <h3 className="text-xl font-bold text-red-500 flex items-center gap-3">
+                      <AlertCircle className="w-6 h-6 text-red-500 animate-pulse" />
+                      Eliminación Física de Compra
+                    </h3>
+                    <p className="text-zinc-500 text-xs mt-1 font-mono uppercase tracking-wider">
+                      Lote Nro: #{deletingPurchase.receiptNumber} — Tipo: {deletingPurchase.type}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (!isDeletingPurchase) {
+                        setShowDeletePurchaseModal(false);
+                        setDeletingPurchase(null);
+                        setDeletePasswordInput("");
+                      }
+                    }}
+                    disabled={isDeletingPurchase}
+                    className="text-zinc-500 hover:text-white transition-colors"
+                  >
+                    <X className="w-6 h-6" />
+                  </button>
+                </div>
+
+                {/* Body */}
+                <div className="p-8 space-y-6">
+                  <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-400 leading-relaxed space-y-2">
+                    <p className="font-bold flex items-center gap-1.5">
+                      ⚠️ ¡ATENCIÓN SUPERADMINISTRADOR!
+                    </p>
+                    <p>
+                      Esta es una operación <strong>altamente destructiva e irreversible</strong>. Al continuar se eliminarán de forma física y permanente los siguientes datos de la base de datos:
+                    </p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>El registro de la compra de oro (Lote #{deletingPurchase.receiptNumber})</li>
+                      <li>Todos los ítems de material de oro asociados</li>
+                      <li>Todos los registros de desembolsos/pagos y adelantos asociados en la sucursal</li>
+                      <li>Se revertirán y recalcularán los movimientos de caja de la sucursal relacionados</li>
+                    </ul>
+                  </div>
+
+                  {/* Password input */}
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase text-zinc-400 tracking-wider flex items-center gap-1.5">
+                      🔒 Contraseña de Configuración (Empresa)
+                    </label>
+                    <input
+                      type="password"
+                      value={deletePasswordInput}
+                      onChange={(e) => setDeletePasswordInput(e.target.value)}
+                      placeholder="Ingrese la contraseña de eliminación configurada"
+                      className="w-full p-4 bg-zinc-950 rounded-xl border border-white/10 text-xs font-mono text-zinc-100 focus:outline-none focus:ring-2 focus:ring-red-500/30"
+                    />
+                  </div>
+                </div>
+
+                {/* Actions Footer */}
+                <div className="p-8 bg-zinc-950 border-t border-white/5 flex gap-4 justify-end">
+                  <button
+                    type="button"
+                    disabled={isDeletingPurchase}
+                    onClick={() => {
+                      setShowDeletePurchaseModal(false);
+                      setDeletingPurchase(null);
+                      setDeletePasswordInput("");
+                    }}
+                    className="px-6 py-3 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-xl text-xs font-bold transition-all disabled:opacity-50"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      isDeletingPurchase ||
+                      !deletePasswordInput.trim()
+                    }
+                    onClick={handlePerformDelete}
+                    className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-red-600/10 disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {isDeletingPurchase && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    )}
+                    Eliminar Permanentemente
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
         {/* Modal para cambiar estado de Registro Histórico <=> Registro Normal */}
         <AnimatePresence>
           {showToggleHistoricModal && historicTargetPurchase && (
@@ -33677,10 +34962,10 @@ DB_NAME=aurum_gestor
                       <input
                         type="number"
                         step="0.01"
-                        defaultValue={selectedItemToVerify.initialWeight}
-                        onBlur={(e) => {
-                          const initial = parseFloat(e.target.value);
-                          const final = selectedItemToVerify.finalWeight;
+                        value={selectedItemToVerify.initialWeight || ""}
+                        onChange={(e) => {
+                          const initial = parseFloat(e.target.value) || 0;
+                          const final = selectedItemToVerify.finalWeight || 0;
                           const loss = initial - final;
                           const lossPct =
                             initial > 0 ? (loss / initial) * 100 : 0;
@@ -33691,7 +34976,11 @@ DB_NAME=aurum_gestor
                             lossPercentage: lossPct,
                           });
                         }}
-                        className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                        className={`w-full p-2.5 bg-zinc-950 rounded-xl border text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all ${
+                          isVerifyWeightInvalid
+                            ? "border-rose-500 focus:ring-rose-500/20"
+                            : "border-white/5"
+                        }`}
                       />
                     </div>
                     <div className="space-y-1">
@@ -33701,10 +34990,10 @@ DB_NAME=aurum_gestor
                       <input
                         type="number"
                         step="0.01"
-                        defaultValue={selectedItemToVerify.finalWeight}
-                        onBlur={(e) => {
-                          const final = parseFloat(e.target.value);
-                          const initial = selectedItemToVerify.initialWeight;
+                        value={selectedItemToVerify.finalWeight || ""}
+                        onChange={(e) => {
+                          const final = parseFloat(e.target.value) || 0;
+                          const initial = selectedItemToVerify.initialWeight || 0;
                           const loss = initial - final;
                           const lossPct =
                             initial > 0 ? (loss / initial) * 100 : 0;
@@ -33715,7 +35004,11 @@ DB_NAME=aurum_gestor
                             lossPercentage: lossPct,
                           });
                         }}
-                        className="w-full p-2.5 bg-zinc-950 rounded-xl border border-white/5 text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all"
+                        className={`w-full p-2.5 bg-zinc-950 rounded-xl border text-sm text-zinc-100 outline-none focus:ring-1 focus:ring-amber-500/50 transition-all ${
+                          isVerifyWeightInvalid
+                            ? "border-rose-500 focus:ring-rose-500/20"
+                            : "border-white/5"
+                        }`}
                       />
                     </div>
                     <div className="space-y-1">
@@ -33945,15 +35238,22 @@ DB_NAME=aurum_gestor
                     )}
                   </div>
 
+                  {isVerifyWeightInvalid && (
+                    <div className="text-xs text-rose-500 font-bold flex items-center gap-1.5 bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20 mb-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-500" />
+                      <span>Error: El peso final no puede ser superior al peso inicial.</span>
+                    </div>
+                  )}
+
                   <button
-                    disabled={isVerifyingItem}
+                    disabled={isVerifyingItem || isVerifyWeightInvalid}
                     onClick={() =>
                       handleVerifyItem(
                         selectedItemToVerify.id,
                         selectedItemToVerify,
                       )
                     }
-                    className="w-full py-4 bg-emerald-600 text-white rounded-2xl font-bold hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 shadow-xl shadow-emerald-900/20"
+                    className="w-full py-4 bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl font-bold hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 shadow-xl shadow-emerald-900/20"
                   >
                     {isVerifyingItem ? (
                       <RefreshCw className="w-5 h-5 animate-spin" />
@@ -35011,7 +36311,6 @@ DB_NAME=aurum_gestor
             </button>
           </div>
         </nav>
-      </div>
       {/* Advance Payment Modal */}
       <AnimatePresence>
         {showAdvanceModal && currentPurchaseForAdvance && (
@@ -38100,6 +39399,461 @@ DB_NAME=aurum_gestor
         )}
       </AnimatePresence>
 
+      {/* Modal Cierre Diario y Firma Electrónica */}
+      <AnimatePresence mode="wait">
+        {showEodReportModal && (
+          <div
+            key="eod-purchase-report-modal"
+            className="fixed inset-0 z-[200] flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowEodReportModal(false)}
+              className="absolute inset-0 bg-zinc-950/85 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-2xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              {/* Header */}
+              <div className="p-6 border-b border-white/5 bg-zinc-900/50 flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-amber-500/10 flex items-center justify-center border border-amber-500/20">
+                    <ShieldCheck className="w-5 h-5 text-amber-500" />
+                  </div>
+                  <div>
+                    <h3 className="text-zinc-100 font-bold text-lg">Cierre de Compras Diario</h3>
+                    <p className="text-zinc-500 text-xs font-medium">Firma electrónica &amp; Acta de Cumplimiento</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowEodReportModal(false)}
+                  className="w-8 h-8 rounded-full bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 flex items-center justify-center transition-all border border-white/5"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Tabs */}
+              <div className="px-6 border-b border-white/5 bg-zinc-900/20 flex gap-4 shrink-0">
+                <button
+                  onClick={() => setEodTab("new")}
+                  className={`py-3.5 text-xs font-bold uppercase tracking-wider border-b-2 transition-all ${
+                    eodTab === "new"
+                      ? "border-amber-500 text-amber-500"
+                      : "border-transparent text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  Nuevo Cierre
+                </button>
+                <button
+                  onClick={() => setEodTab("history")}
+                  className={`py-3.5 text-xs font-bold uppercase tracking-wider border-b-2 transition-all ${
+                    eodTab === "history"
+                      ? "border-amber-500 text-amber-500"
+                      : "border-transparent text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  Historial de Cierres ({eodHistory.length})
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="p-6 overflow-y-auto custom-scrollbar flex-1">
+                {eodTab === "new" ? (
+                  <div className="space-y-5">
+                    {/* Date select & branch mode info */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-zinc-400 text-[10px] font-bold uppercase tracking-widest block mb-2">
+                          Fecha de Cierre
+                        </label>
+                        <div className="relative">
+                          <Calendar className="absolute left-4 top-3 text-zinc-500 w-4 h-4" />
+                          <input
+                            type="date"
+                            value={eodReportDate}
+                            onChange={(e) => setEodReportDate(e.target.value)}
+                            className="w-full bg-zinc-950 text-zinc-200 border border-white/5 rounded-2xl pl-12 pr-4 py-2.5 text-sm focus:border-amber-500/50 outline-none transition-all font-mono"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-zinc-400 text-[10px] font-bold uppercase tracking-widest block mb-2">
+                          Sucursal Activa
+                        </label>
+                        <div className="w-full bg-zinc-950/50 text-zinc-400 border border-white/5 rounded-2xl px-4 py-2.5 text-sm font-semibold">
+                          {branches.find((b) => b.id === branchMode)?.name || "ADMINISTRACIÓN CENTRAL"}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Today's Transactions Summary Widget */}
+                    <div className="p-4 rounded-2xl bg-zinc-950 border border-white/5 space-y-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-zinc-400 text-[10px] font-bold uppercase tracking-widest">
+                          Resumen de Compras del Día
+                        </span>
+                        <span className="bg-amber-500/10 text-amber-500 text-[9px] font-bold px-2 py-0.5 rounded-full border border-amber-500/20">
+                          {eodFilteredPurchases.length} Compras Registradas
+                        </span>
+                      </div>
+
+                      {eodFilteredPurchases.length > 0 ? (
+                        <div className="grid grid-cols-3 gap-2 text-center divide-x divide-white/5">
+                          <div>
+                            <p className="text-zinc-500 text-[9px] font-bold uppercase">Peso Neto</p>
+                            <p className="text-zinc-200 text-sm font-black mt-1 font-mono">
+                              {formatNumber(
+                                eodFilteredPurchases.reduce(
+                                  (acc, curr) => acc + (curr.items?.reduce((s, i) => s + i.finalWeight, 0) || 0),
+                                  0
+                                )
+                              )} g
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-zinc-500 text-[9px] font-bold uppercase">Oro Fino (100%)</p>
+                            <p className="text-zinc-200 text-sm font-black mt-1 font-mono">
+                              {formatNumber(
+                                eodFilteredPurchases.reduce(
+                                  (acc, curr) => acc + (curr.items?.reduce((s, i) => s + i.finalWeight * (i.purity / 100), 0) || 0),
+                                  0
+                                ),
+                                3
+                              )} g
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-zinc-500 text-[9px] font-bold uppercase">Monto Total</p>
+                            <p className="text-emerald-400 text-sm font-black mt-1 font-mono">
+                              {formatNumber(
+                                eodFilteredPurchases.reduce(
+                                  (acc, curr) => acc + (curr.type === "cerrado" ? curr.closeTotal || curr.total : curr.total),
+                                  0
+                                )
+                              )} BS
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-zinc-500 text-xs italic py-2 text-center">
+                          No hay compras registradas para esta fecha y sucursal. Seleccione un día laborable.
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Operator Information Row */}
+                    <div className="flex items-center gap-3 p-3.5 rounded-2xl bg-zinc-850 border border-white/5">
+                      <div className="w-10 h-10 rounded-xl bg-zinc-800 text-zinc-300 flex items-center justify-center font-bold text-sm">
+                        {user?.name?.slice(0, 2).toUpperCase() || "OP"}
+                      </div>
+                      <div>
+                        <p className="text-zinc-300 text-xs font-bold">{user?.name || "Operador de Turno"}</p>
+                        <p className="text-zinc-500 text-[10px] font-medium">
+                          Identificado como: <span className="font-mono text-zinc-400">{user?.username}</span> • Rol: <span className="text-zinc-400 uppercase">{user?.role}</span>
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Notes Area */}
+                    <div>
+                      <label className="text-zinc-400 text-[10px] font-bold uppercase tracking-widest block mb-2">
+                        Notas u Observaciones del Cierre (Opcional)
+                      </label>
+                      <textarea
+                        value={eodNotes}
+                        onChange={(e) => setEodNotes(e.target.value)}
+                        placeholder="Ej. Básculas calibradas por la mañana, discrepancias justificadas en notas..."
+                        rows={2}
+                        className="w-full bg-zinc-950 text-zinc-200 border border-white/5 rounded-2xl p-4 text-sm focus:border-amber-500/50 outline-none transition-all placeholder:text-zinc-600 resize-none"
+                      />
+                    </div>
+
+                    {/* Signature Drawing Pad */}
+                    <div>
+                      <div className="flex justify-between items-center mb-2">
+                        <label className="text-zinc-400 text-[10px] font-bold uppercase tracking-widest">
+                          Firma Electrónica Digitalizada
+                        </label>
+                        <button
+                          type="button"
+                          onClick={clearEodCanvas}
+                          className="text-amber-500 hover:text-amber-400 text-[10px] font-bold uppercase tracking-wider transition-all"
+                        >
+                          Limpiar Lienzo
+                        </button>
+                      </div>
+                      <div className="relative bg-white rounded-2xl p-1 border border-white/10 shadow-lg overflow-hidden h-36 flex items-center justify-center">
+                        <canvas
+                          ref={eodCanvasRef}
+                          onMouseDown={startDrawingEod}
+                          onMouseMove={drawEod}
+                          onMouseUp={stopDrawingEod}
+                          onMouseLeave={stopDrawingEod}
+                          onTouchStart={startDrawingEod}
+                          onTouchMove={drawEod}
+                          onTouchEnd={stopDrawingEod}
+                          width={600}
+                          height={140}
+                          className="w-full h-full cursor-crosshair bg-white block rounded-xl"
+                        />
+                        <div className="absolute bottom-2 right-3 pointer-events-none text-[8px] bg-zinc-900/10 text-zinc-600 px-2 py-0.5 rounded font-bold uppercase">
+                          Lienzo de Firma Manuscrita
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Security Authentication Block */}
+                    <div className="p-4 rounded-2xl bg-amber-500/5 border border-amber-500/10 space-y-3">
+                      <div className="flex items-center gap-2">
+                        <Lock className="w-4 h-4 text-amber-500" />
+                        <span className="text-amber-500 text-[10px] font-bold uppercase tracking-wider">
+                          Autorización de Seguridad mediante PIN
+                        </span>
+                      </div>
+                      <p className="text-zinc-400 text-xs">
+                        Para validar legalmente este cierre y aplicar su firma electrónica certificada, ingrese su PIN de operador institucional.
+                      </p>
+                      <div className="flex gap-3 items-center">
+                        <input
+                          type="password"
+                          maxLength={8}
+                          value={eodOperatorPin}
+                          onChange={(e) => setEodOperatorPin(e.target.value)}
+                          placeholder="Ingrese su PIN de 4 u 8 dígitos"
+                          className="bg-zinc-950 text-zinc-200 border border-white/5 rounded-xl px-4 py-2 text-xs focus:border-amber-500/50 outline-none transition-all font-mono w-48 text-center tracking-widest"
+                        />
+                        <span className="text-zinc-500 text-[10px] font-bold">
+                          {eodOperatorPin.length > 0 ? "✓ PIN ingresado" : "• PIN requerido"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  /* History Tab */
+                  <div className="space-y-4">
+                    {eodHistory.length > 0 ? (
+                      <div className="space-y-3">
+                        {eodHistory.map((item) => (
+                          <div
+                            key={item.id}
+                            className="p-4 rounded-2xl bg-zinc-950 border border-white/5 hover:border-white/10 transition-all flex flex-col sm:flex-row justify-between gap-4 items-start sm:items-center"
+                          >
+                            <div className="space-y-1 max-w-[70%]">
+                              <div className="flex items-center gap-2">
+                                <span className="text-zinc-200 text-xs font-bold">{item.branchName}</span>
+                                <span className="text-zinc-500 text-xs">•</span>
+                                <span className="text-zinc-400 text-[10px] font-mono">{item.date}</span>
+                              </div>
+                              <p className="text-zinc-500 text-[10px]">
+                                Firmante: <span className="text-zinc-300 font-semibold">{item.operatorName}</span>
+                              </p>
+                              <div className="grid grid-cols-3 gap-3 text-[10px] bg-zinc-900/50 px-3 py-1.5 rounded-lg border border-white/5">
+                                <div>
+                                  <span className="text-zinc-500">Lotes: </span>
+                                  <span className="text-zinc-300 font-bold">{item.totalCount}</span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-500">Peso Fino: </span>
+                                  <span className="text-zinc-300 font-bold font-mono">{formatNumber(item.totalFino, 2)}g</span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-500">Total: </span>
+                                  <span className="text-emerald-400 font-bold font-mono">{formatNumber(item.totalAmount)} BS</span>
+                                </div>
+                              </div>
+                              <p className="text-[8px] text-zinc-600 font-mono select-all overflow-hidden text-ellipsis truncate">
+                                Hash: {item.hash}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => {
+                                // Dynamically regenerate the PDF using the stored history row details
+                                const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+                                const company = companySettings;
+                                const margin = 15;
+                                const pageWidth = 210;
+                                
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(16);
+                                doc.setTextColor(24, 24, 27);
+                                doc.text(company?.name?.toUpperCase() || "AURUM MANAGER", margin, 20);
+
+                                doc.setFont("helvetica", "normal");
+                                doc.setFontSize(8);
+                                doc.setTextColor(113, 113, 122);
+                                doc.text(`NIT: ${company?.taxId || ""}`, margin, 25);
+                                doc.text(`Dirección: ${company?.address || ""}`, margin, 29);
+                                doc.text(`Teléfono: ${company?.phone || ""}`, margin, 33);
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(11);
+                                doc.setTextColor(194, 65, 12);
+                                doc.text("ACTA DE CIERRE Y CONSOLIDADO DE COMPRAS (COPIA)", pageWidth - margin, 20, { align: "right" });
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(9);
+                                doc.setTextColor(39, 39, 42);
+                                doc.text(`SUCURSAL: ${item.branchName.toUpperCase()}`, pageWidth - margin, 25, { align: "right" });
+
+                                doc.setFont("helvetica", "normal");
+                                doc.setFontSize(8.5);
+                                doc.setTextColor(82, 82, 91);
+                                doc.text(`Fecha del Cierre: ${item.date}`, pageWidth - margin, 30, { align: "right" });
+                                doc.text(`Generado el (Reimpresión): ${new Date().toLocaleString()}`, pageWidth - margin, 34, { align: "right" });
+
+                                doc.setDrawColor(228, 228, 231);
+                                doc.setLineWidth(0.5);
+                                doc.line(margin, 38, pageWidth - margin, 38);
+
+                                // Summary
+                                doc.setFillColor(244, 244, 245);
+                                doc.rect(margin, 43, pageWidth - (margin * 2), 24, "F");
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(8);
+                                doc.setTextColor(113, 113, 122);
+                                doc.text("LOTES ADQUIRIDOS", margin + 5, 49);
+                                doc.text("PESO NETO TOTAL", margin + 42, 49);
+                                doc.text("PESO FINO TOTAL (100%)", margin + 82, 49);
+                                doc.text("MONTO VALORIZADO", margin + 130, 49);
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(13);
+                                doc.setTextColor(24, 24, 27);
+                                doc.text(`${item.totalCount}`, margin + 5, 55);
+                                doc.text(`${formatNumber(item.totalWeight)} g`, margin + 42, 55);
+                                doc.text(`${formatNumber(item.totalFino, 3)} g`, margin + 82, 55);
+                                doc.setTextColor(16, 185, 129);
+                                doc.text(`${formatNumber(item.totalAmount)} BS`, margin + 130, 55);
+
+                                // Legal Disclosure
+                                let finalY = 78;
+                                doc.setDrawColor(244, 244, 245);
+                                doc.setFillColor(250, 250, 250);
+                                doc.rect(margin, finalY, pageWidth - (margin * 2), 14, "F");
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(7.5);
+                                doc.setTextColor(120, 113, 108);
+                                doc.text("DECLARACIÓN JURADA DE CONCILIACIÓN DIARIA Y CUMPLIMIENTO REGULATORIO:", margin + 3, finalY + 4.5);
+                                doc.setFont("helvetica", "italic");
+                                doc.setFontSize(6.8);
+                                const statementText = "El operador de turno abajo firmante certifica la veracidad del presente informe de compras consolidadas. Se hace constar que los materiales han sido debidamente analizados en pureza, pesados en básculas calibradas y se han verificado los antecedentes del cliente conforme a los protocolos internos de prevención de lavado de activos y transparencia transaccional.";
+                                const splitStatement = doc.splitTextToSize(statementText, pageWidth - (margin * 2) - 6);
+                                doc.text(splitStatement, margin + 3, finalY + 8);
+                                finalY += 22;
+
+                                // Signature Box
+                                const colWidth = (pageWidth - (margin * 2) - 10) / 2;
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(8);
+                                doc.setTextColor(63, 63, 70);
+                                doc.text("OPERADOR DE TURNO (FIRMA REGISTRADA):", margin, finalY);
+
+                                // Add a beautiful digital ink symbol representing EOD signature
+                                doc.setFillColor(245, 245, 247);
+                                doc.rect(margin + 2, finalY + 3, colWidth - 4, 18, "F");
+                                doc.setFont("times", "italic");
+                                doc.setFontSize(16);
+                                doc.setTextColor(30, 58, 138); // ink blue
+                                doc.text(item.operatorName, margin + 12, finalY + 14);
+
+                                doc.setDrawColor(161, 161, 170);
+                                doc.setLineWidth(0.3);
+                                doc.line(margin, finalY + 24, margin + colWidth, finalY + 24);
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(8);
+                                doc.setTextColor(24, 24, 27);
+                                doc.text(item.operatorName.toUpperCase(), margin, finalY + 28);
+                                doc.setFont("helvetica", "normal");
+                                doc.setFontSize(7);
+                                doc.setTextColor(113, 113, 122);
+                                doc.text(`Reimpresión de Cierre Archivo`, margin, finalY + 31);
+
+                                // Right column
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(8);
+                                doc.setTextColor(63, 63, 70);
+                                doc.text("CERTIFICADO DE FIRMA ELECTRÓNICA REGISTRADA:", margin + colWidth + 10, finalY);
+
+                                doc.setFillColor(240, 253, 244);
+                                doc.rect(margin + colWidth + 10, finalY + 3, colWidth, 26, "F");
+                                doc.setDrawColor(187, 247, 208);
+                                doc.rect(margin + colWidth + 10, finalY + 3, colWidth, 26, "D");
+
+                                doc.setFont("helvetica", "bold");
+                                doc.setFontSize(7.5);
+                                doc.setTextColor(22, 101, 52);
+                                doc.text("✓ CIERRE FIRMADO Y SELLADO", margin + colWidth + 14, finalY + 8);
+
+                                doc.setFont("helvetica", "normal");
+                                doc.setFontSize(6.8);
+                                doc.setTextColor(21, 128, 61);
+                                doc.text(`Operador: ${item.operatorName}`, margin + colWidth + 14, finalY + 13);
+                                doc.text(`Fecha del Cierre: ${item.date}`, margin + colWidth + 14, finalY + 17);
+                                doc.setFont("helvetica", "bold");
+                                doc.text(`INTEGRITY HASH:`, margin + colWidth + 14, finalY + 21);
+                                doc.setFont("helvetica", "normal");
+                                doc.setFontSize(5.5);
+                                doc.text(item.hash, margin + colWidth + 14, finalY + 24);
+
+                                doc.save(`COPIA_CIERRE_DIARIO_COMPRAS_${item.branchName.toUpperCase().replace(/\s+/g, "_")}_${item.date}.pdf`);
+                              }}
+                              className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-amber-500 font-bold rounded-xl text-xs flex items-center gap-1.5 border border-white/5 shrink-0 transition-all"
+                            >
+                              <Download className="w-3.5 h-3.5" /> PDF
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-12">
+                        <ShieldCheck className="w-12 h-12 text-zinc-700 mx-auto mb-3 stroke-[1.2]" />
+                        <p className="text-zinc-400 text-sm font-bold">Sin Historial de Cierres</p>
+                        <p className="text-zinc-600 text-xs mt-1">
+                          Los cierres firmados en este navegador se guardarán de forma local para su consulta.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              {eodTab === "new" && (
+                <div className="p-6 border-t border-white/5 bg-zinc-950 flex justify-between items-center shrink-0">
+                  <button
+                    onClick={() => setShowEodReportModal(false)}
+                    className="px-6 py-3 bg-zinc-850 hover:bg-zinc-800 text-zinc-400 font-bold rounded-2xl text-xs uppercase tracking-wider transition-all"
+                  >
+                    Cerrar Ventana
+                  </button>
+                  <button
+                    onClick={handleExportEodPurchaseReportPDF}
+                    disabled={eodFilteredPurchases.length === 0 || !eodOperatorPin}
+                    className={`px-6 py-3 font-bold rounded-2xl text-xs uppercase tracking-wider transition-all flex items-center gap-2 shadow-lg ${
+                      eodFilteredPurchases.length > 0 && eodOperatorPin
+                        ? "bg-amber-500 hover:bg-amber-400 text-zinc-950 shadow-amber-950/20 cursor-pointer"
+                        : "bg-zinc-800 text-zinc-600 cursor-not-allowed border border-white/5"
+                    }`}
+                  >
+                    <PenTool className="w-4 h-4" /> Firmar y Generar Acta
+                  </button>
+                </div>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* WhatsApp Broadcast Modal */}
       <AnimatePresence mode="wait">
         {showWhatsAppBroadcastModal && (
@@ -38359,11 +40113,10 @@ DB_NAME=aurum_gestor
                             const fullPhone = rawPhone.startsWith("+")
                               ? rawPhone.slice(1)
                               : `${code}${rawPhone}`;
-                            const companyName =
-                              companySettings?.name || "Nuestra Joyería";
+                            const companyName = "Aurum Manager - Almacén";
                             const personalized = broadcastMessage
                               .replace(/\{nombre\}/g, cl.name)
-                              .replace(/\{empresa\}/g, companyName);
+                              .replace(/\{empresa\}/g, `*${companyName}*`);
                             return `https://api.whatsapp.com/send?phone=${fullPhone}&text=${encodeURIComponent(personalized)}`;
                           };
 
@@ -39027,7 +40780,7 @@ DB_NAME=aurum_gestor
                         />
                         <label
                           htmlFor="isMineCooperative"
-                          className="text-xs text-zinc-400 font-bold uppercase cursor-pointer select-none"
+                          className="text-zinc-400 font-bold uppercase cursor-pointer select-none"
                         >
                           ¿Es Coop. de Mina?
                         </label>
@@ -39110,21 +40863,14 @@ DB_NAME=aurum_gestor
                         />
                       </div>
                     </div>
-                  </div>
-
-                  {/* Right Column: References and Complementary Data */}
-                  <div className="space-y-4">
-                    <h3 className="text-xs font-bold text-amber-500 uppercase tracking-widest border-b border-white/5 pb-2">
-                      Información de Referencia y Laboral
-                    </h3>
 
                     <div className="space-y-2">
                       <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        Email (Opcional)
+                        Correo Electrónico
                       </label>
                       <input
                         type="email"
-                        placeholder="correo@ejemplo.com"
+                        placeholder="cliente@ejemplo.com"
                         value={clientFormData.email}
                         onChange={(e) =>
                           setClientFormData({
@@ -39135,14 +40881,21 @@ DB_NAME=aurum_gestor
                         className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
                       />
                     </div>
+                  </div>
+
+                  {/* Right Column: Other Details & Photos */}
+                  <div className="space-y-4">
+                    <h3 className="text-xs font-bold text-blue-500 uppercase tracking-widest border-b border-white/5 pb-2">
+                      Lugar de Trabajo, Recomendado y Fotos
+                    </h3>
 
                     <div className="space-y-2">
                       <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        Lugar de Trabajo
+                        Lugar de Trabajo / Cooperativa
                       </label>
                       <input
                         type="text"
-                        placeholder="Empresa o ubicación"
+                        placeholder="Ej. Cooperativa Minera"
                         value={clientFormData.workplace}
                         onChange={(e) =>
                           setClientFormData({
@@ -39154,622 +40907,90 @@ DB_NAME=aurum_gestor
                       />
                     </div>
 
-                    <div className="space-y-2 relative">
-                      <div className="flex justify-between items-center">
-                        <label className="text-[10px] font-bold uppercase text-zinc-500">
-                          Recomendado por (Referente o Socio)
-                        </label>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEditingReferrer(null);
-                            setReferrerFormData({
-                              name: clientFormData.recommendedBy || "",
-                              phone1: "",
-                              phone1CountryCode: "591",
-                              phone2: "",
-                              phone2CountryCode: "591",
-                              ci: "",
-                              photo: "",
-                              documentPhoto: "",
-                            });
-                            setShowAddReferrerModal(true);
-                          }}
-                          className="text-[9px] text-amber-500 hover:text-amber-400 font-bold uppercase tracking-wider flex items-center gap-1 active:scale-95 transition-all"
-                        >
-                          + Nuevo Referido
-                        </button>
-                      </div>
-                      <div className="relative">
-                        <input
-                          type="text"
-                          placeholder="Buscar por Nombre / CI..."
-                          value={clientFormData.recommendedBy}
-                          onFocus={() => setReferrerSearchFocused(true)}
-                          onBlur={() => {
-                            // Delay slightly to allow click/select event to trigger first
-                            setTimeout(
-                              () => setReferrerSearchFocused(false),
-                              250,
-                            );
-                          }}
-                          onChange={(e) =>
-                            setClientFormData({
-                              ...clientFormData,
-                              recommendedBy: e.target.value,
-                            })
-                          }
-                          className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm pr-10"
-                        />
-                        <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-500">
-                          <Users className="w-4 h-4" />
-                        </div>
-                      </div>
-
-                      {/* Dropdown suggestions */}
-                      {referrerSearchFocused && (
-                        <div className="absolute z-[100] left-0 right-0 mt-1 max-h-52 overflow-y-auto bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden divide-y divide-white/5">
-                          {(() => {
-                            const query = (clientFormData.recommendedBy || "")
-                              .trim()
-                              .toLowerCase();
-                            // Filter matching registered referrers
-                            const matches = referrers.filter(
-                              (r) =>
-                                r.name.toLowerCase().includes(query) ||
-                                r.ci.toLowerCase().includes(query),
-                            );
-
-                            if (matches.length === 0) {
-                              return (
-                                <div className="p-3 text-xs text-zinc-500 text-center bg-zinc-905">
-                                  <p className="mb-2">
-                                    No se encontró ningún referente con "
-                                    {clientFormData.recommendedBy}"
-                                  </p>
-                                  <button
-                                    type="button"
-                                    onMouseDown={(e) => {
-                                      // Must use onMouseDown to prevent focus loss before trigger
-                                      e.preventDefault();
-                                      setEditingReferrer(null);
-                                      setReferrerFormData({
-                                        name:
-                                          clientFormData.recommendedBy || "",
-                                        phone1: "",
-                                        phone1CountryCode: "591",
-                                        phone2: "",
-                                        phone2CountryCode: "591",
-                                        ci: "",
-                                        photo: "",
-                                        documentPhoto: "",
-                                      });
-                                      setShowAddReferrerModal(true);
-                                      setReferrerSearchFocused(false);
-                                    }}
-                                    className="px-3 py-1.5 bg-amber-500/10 text-amber-500 border border-amber-500/20 hover:bg-amber-500 hover:text-zinc-950 font-bold rounded-lg text-[10px] uppercase transition-all duration-150 inline-block pointer-events-auto"
-                                  >
-                                    + Crear "
-                                    {clientFormData.recommendedBy || "Nuevo"}"
-                                  </button>
-                                </div>
-                              );
-                            }
-
-                            return (
-                              <>
-                                <div className="px-3 py-1.5 bg-zinc-950 text-[9px] font-bold text-zinc-400 uppercase tracking-widest flex justify-between items-center">
-                                  <span>
-                                    Elegir un Referido ({matches.length})
-                                  </span>
-                                  <span>Clic para seleccionar</span>
-                                </div>
-                                {matches.map((r) => (
-                                  <button
-                                    key={r.id}
-                                    type="button"
-                                    onMouseDown={(e) => {
-                                      // Must use onMouseDown to select before onBlur collapses the panel
-                                      e.preventDefault();
-                                      setClientFormData({
-                                        ...clientFormData,
-                                        recommendedBy: r.name,
-                                      });
-                                      setReferrerSearchFocused(false);
-                                    }}
-                                    className="w-full text-left px-4 py-2.5 hover:bg-zinc-850 transition-colors flex items-center justify-between text-xs"
-                                  >
-                                    <div>
-                                      <p className="font-bold text-zinc-100">
-                                        {r.name}
-                                      </p>
-                                      <p className="text-[10px] text-zinc-400 font-mono">
-                                        CI: {r.ci || "Sin CI"}
-                                      </p>
-                                    </div>
-                                    <div className="text-right">
-                                      <span className="text-[8px] bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1.5 py-0.5 rounded font-mono font-bold uppercase tracking-wider">
-                                        Elegir
-                                      </span>
-                                    </div>
-                                  </button>
-                                ))}
-                              </>
-                            );
-                          })()}
-                        </div>
-                      )}
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold uppercase text-zinc-500">
+                        Recomendado Por
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Ej. Juan Pérez"
+                        value={clientFormData.recommendedBy}
+                        onChange={(e) =>
+                          setClientFormData({
+                            ...clientFormData,
+                            recommendedBy: e.target.value,
+                          })
+                        }
+                        className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
+                      />
                     </div>
 
-                    {/* Photos Section */}
-                    <h3 className="text-xs font-bold text-emerald-500 uppercase tracking-widest border-b border-white/5 pb-2 pt-2">
-                      Fotografías e Identificación
-                    </h3>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      {/* Foto de Perfil */}
-                      <div className="space-y-1">
+                    <div className="grid grid-cols-3 gap-4">
+                      <div className="space-y-2">
                         <label className="text-[10px] font-bold uppercase text-zinc-500">
-                          Foto de Perfil
+                          Foto Cliente
                         </label>
-                        <div className="relative h-28 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                          {activeCameraTarget === "clientPhoto" ? (
-                            <div className="w-full h-full relative">
-                              <video
-                                ref={genericVideoRef}
-                                className="w-full h-full object-cover scale-x-[-1]"
-                                playsInline
-                                muted
-                              />
-                              <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                <button
-                                  type="button"
-                                  onClick={captureGenericPhoto}
-                                  className="px-2 py-1 bg-emerald-600 text-[9px] hover:bg-emerald-500 font-bold uppercase text-white rounded-lg transition-colors shadow-lg"
-                                >
-                                  Capturar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={stopGenericCamera}
-                                  className="px-2 py-1 bg-zinc-800 text-[9px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded-lg transition-colors"
-                                >
-                                  X
-                                </button>
-                              </div>
-                            </div>
-                          ) : clientFormData.photo ? (
-                            <div className="w-full h-full relative group">
-                              <img
-                                src={clientFormData.photo}
-                                alt="Perfil"
-                                className="w-full h-full object-cover"
-                                referrerPolicy="no-referrer"
-                              />
-                              <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setClientFormData((prev) => ({
-                                      ...prev,
-                                      photo: "",
-                                    }))
-                                  }
-                                  className="p-1.5 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded-lg transition-colors border border-red-500/20"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                              <User className="w-6 h-6 stroke-[1.2] mb-1 text-zinc-500" />
-                              <div className="flex gap-1.5 mt-1">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const input =
-                                      document.createElement("input");
-                                    input.type = "file";
-                                    input.accept = "image/*";
-                                    input.onchange = (e) => {
-                                      const file = (
-                                        e.target as HTMLInputElement
-                                      ).files?.[0];
-                                      if (file) {
-                                        const reader = new FileReader();
-                                        reader.onload = () => {
-                                          setClientFormData((prev) => ({
-                                            ...prev,
-                                            photo: reader.result as string,
-                                          }));
-                                        };
-                                        reader.readAsDataURL(file);
-                                      }
-                                    };
-                                    input.click();
-                                  }}
-                                  className="text-[9px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-2 py-1 rounded"
-                                >
-                                  Subir
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    startGenericCamera("clientPhoto")
-                                  }
-                                  className="text-[9px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-2 py-1 rounded border border-teal-500/10"
-                                >
-                                  Cámara
-                                </button>
-                              </div>
-                            </div>
+                        <div className="flex flex-col gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDedicatedPhotoTarget("photo");
+                              setShowDedicatedPhotoModal(true);
+                            }}
+                            className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-xs text-zinc-400 hover:text-white hover:border-white/20 transition-all text-center flex items-center justify-center gap-1.5"
+                          >
+                            <Camera className="w-4 h-4" />
+                            <span>{clientFormData.photo ? "Cambiar" : "Capturar"}</span>
+                          </button>
+                          {clientFormData.photo && (
+                            <img src={clientFormData.photo} alt="Cliente" className="w-full h-20 object-cover rounded-xl" referrerPolicy="no-referrer" />
                           )}
                         </div>
                       </div>
 
-                      {/* Formato del Documento / CI Selector */}
-                      <div className="space-y-2 col-span-2">
+                      <div className="space-y-2">
                         <label className="text-[10px] font-bold uppercase text-zinc-500">
-                          Formato de Foto de Documento
+                          Documento (Frente)
                         </label>
-                        <div className="flex bg-zinc-950 p-1 rounded-xl border border-white/5 gap-1 shadow-inner">
+                        <div className="flex flex-col gap-2">
                           <button
                             type="button"
-                            onClick={() =>
-                              setClientFormData((prev) => ({
-                                ...prev,
-                                documentTypeOption: "single",
-                              }))
-                            }
-                            className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${clientFormData.documentTypeOption === "single" ? "bg-amber-500 text-zinc-950 shadow-md font-extrabold" : "text-zinc-400 hover:text-white hover:bg-zinc-900"}`}
+                            onClick={() => {
+                              setDedicatedPhotoTarget("documentPhoto");
+                              setShowDedicatedPhotoModal(true);
+                            }}
+                            className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-xs text-zinc-400 hover:text-white hover:border-white/20 transition-all text-center flex items-center justify-center gap-1.5"
                           >
-                            Foto Documento / Única
+                            <Camera className="w-4 h-4" />
+                            <span>{clientFormData.documentPhoto ? "Cambiar" : "Capturar"}</span>
                           </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setClientFormData((prev) => ({
-                                ...prev,
-                                documentTypeOption: "ci_both",
-                              }))
-                            }
-                            className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${clientFormData.documentTypeOption === "ci_both" ? "bg-amber-500 text-zinc-950 shadow-md font-extrabold shadow-amber-500/10" : "text-zinc-400 hover:text-white hover:bg-zinc-900"}`}
-                          >
-                            CI Anverso y Reverso
-                          </button>
+                          {clientFormData.documentPhoto && (
+                            <img src={clientFormData.documentPhoto} alt="CI Frente" className="w-full h-20 object-cover rounded-xl" referrerPolicy="no-referrer" />
+                          )}
                         </div>
                       </div>
 
-                      {clientFormData.documentTypeOption === "single" ? (
-                        <div className="space-y-1 col-span-2">
-                          <div className="flex justify-between items-center">
-                            <label className="text-[10px] font-bold uppercase text-zinc-500">
-                              Foto Documento / CI (Única)
-                            </label>
-                            {clientFormData.documentPhoto && (
-                              <span className="text-[9px] text-emerald-500 font-bold uppercase tracking-wide">
-                                ✓ Cargado
-                              </span>
-                            )}
-                          </div>
-                          <div className="relative h-28 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                            {activeCameraTarget === "clientDoc" ? (
-                              <div className="w-full h-full relative">
-                                <video
-                                  ref={genericVideoRef}
-                                  className="w-full h-full object-contain"
-                                  playsInline
-                                  muted
-                                />
-                                <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                  <button
-                                    type="button"
-                                    onClick={captureGenericPhoto}
-                                    className="px-2 py-1 bg-emerald-600 text-[9px] hover:bg-emerald-500 font-bold uppercase text-white rounded-lg transition-colors shadow-lg"
-                                  >
-                                    Capturar
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={stopGenericCamera}
-                                    className="px-2 py-1 bg-zinc-800 text-[9px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded-lg transition-colors"
-                                  >
-                                    X
-                                  </button>
-                                </div>
-                              </div>
-                            ) : clientFormData.documentPhoto ? (
-                              <div className="w-full h-full relative group">
-                                <img
-                                  src={clientFormData.documentPhoto}
-                                  alt="Documento"
-                                  className="w-full h-full object-contain"
-                                  referrerPolicy="no-referrer"
-                                />
-                                <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setClientFormData((prev) => ({
-                                        ...prev,
-                                        documentPhoto: "",
-                                      }))
-                                    }
-                                    className="p-1.5 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded-lg transition-colors border border-red-500/20"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (
-                              <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                                <ImageIcon className="w-6 h-6 stroke-[1.2] mb-1 text-zinc-500" />
-                                <div className="flex gap-1.5 mt-1">
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      const input =
-                                        document.createElement("input");
-                                      input.type = "file";
-                                      input.accept = "image/*";
-                                      input.onchange = (e) => {
-                                        const file = (
-                                          e.target as HTMLInputElement
-                                        ).files?.[0];
-                                        if (file) {
-                                          const reader = new FileReader();
-                                          reader.onload = () => {
-                                            setClientFormData((prev) => ({
-                                              ...prev,
-                                              documentPhoto:
-                                                reader.result as string,
-                                            }));
-                                          };
-                                          reader.readAsDataURL(file);
-                                        }
-                                      };
-                                      input.click();
-                                    }}
-                                    className="text-[9px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-2 py-1 rounded"
-                                  >
-                                    Subir
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      startGenericCamera("clientDoc")
-                                    }
-                                    className="text-[9px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-2 py-1 rounded border border-teal-500/10"
-                                  >
-                                    Cámara
-                                  </button>
-                                </div>
-                              </div>
-                            )}
-                          </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold uppercase text-zinc-500">
+                          Documento (Atrás)
+                        </label>
+                        <div className="flex flex-col gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDedicatedPhotoTarget("documentPhotoBack");
+                              setShowDedicatedPhotoModal(true);
+                            }}
+                            className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-xs text-zinc-400 hover:text-white hover:border-white/20 transition-all text-center flex items-center justify-center gap-1.5"
+                          >
+                            <Camera className="w-4 h-4" />
+                            <span>{clientFormData.documentPhotoBack ? "Cambiar" : "Capturar"}</span>
+                          </button>
+                          {clientFormData.documentPhotoBack && (
+                            <img src={clientFormData.documentPhotoBack} alt="CI Atrás" className="w-full h-20 object-cover rounded-xl" referrerPolicy="no-referrer" />
+                          )}
                         </div>
-                      ) : (
-                        <div className="grid grid-cols-2 gap-4 col-span-2">
-                          {/* Front side */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between items-center">
-                              <label className="text-[10px] font-bold uppercase text-zinc-500">
-                                C.I. Anverso (Frente)
-                              </label>
-                              {clientFormData.documentPhoto && (
-                                <span className="text-[9px] text-emerald-500 font-bold uppercase">
-                                  ✓ Listo
-                                </span>
-                              )}
-                            </div>
-                            <div className="relative h-28 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                              {activeCameraTarget === "clientDoc" ? (
-                                <div className="w-full h-full relative">
-                                  <video
-                                    ref={genericVideoRef}
-                                    className="w-full h-full object-contain"
-                                    playsInline
-                                    muted
-                                  />
-                                  <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                    <button
-                                      type="button"
-                                      onClick={captureGenericPhoto}
-                                      className="px-2 py-1 bg-emerald-600 text-[9px] hover:bg-emerald-500 font-bold uppercase text-white rounded-lg transition-colors shadow-lg"
-                                    >
-                                      Capturar
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={stopGenericCamera}
-                                      className="px-2 py-1 bg-zinc-800 text-[9px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded-lg transition-colors"
-                                    >
-                                      X
-                                    </button>
-                                  </div>
-                                </div>
-                              ) : clientFormData.documentPhoto ? (
-                                <div className="w-full h-full relative group">
-                                  <img
-                                    src={clientFormData.documentPhoto}
-                                    alt="C.I. Anverso"
-                                    className="w-full h-full object-contain"
-                                    referrerPolicy="no-referrer"
-                                  />
-                                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setClientFormData((prev) => ({
-                                          ...prev,
-                                          documentPhoto: "",
-                                        }))
-                                      }
-                                      className="p-1.5 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded-lg transition-colors border border-red-500/20"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                                  <ImageIcon className="w-6 h-6 stroke-[1.2] mb-1 text-zinc-500" />
-                                  <div className="flex gap-1.5 mt-1">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        const input =
-                                          document.createElement("input");
-                                        input.type = "file";
-                                        input.accept = "image/*";
-                                        input.onchange = (e) => {
-                                          const file = (
-                                            e.target as HTMLInputElement
-                                          ).files?.[0];
-                                          if (file) {
-                                            const reader = new FileReader();
-                                            reader.onload = () => {
-                                              setClientFormData((prev) => ({
-                                                ...prev,
-                                                documentPhoto:
-                                                  reader.result as string,
-                                              }));
-                                            };
-                                            reader.readAsDataURL(file);
-                                          }
-                                        };
-                                        input.click();
-                                      }}
-                                      className="text-[9px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-2 py-1 rounded"
-                                    >
-                                      Subir
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        startGenericCamera("clientDoc")
-                                      }
-                                      className="text-[9px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-2 py-1 rounded border border-teal-500/10"
-                                    >
-                                      Cam
-                                    </button>
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-
-                          {/* Back side */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between items-center">
-                              <label className="text-[10px] font-bold uppercase text-zinc-500">
-                                C.I. Reverso (Atrás)
-                              </label>
-                              {clientFormData.documentPhotoBack && (
-                                <span className="text-[9px] text-purple-400 font-bold uppercase">
-                                  ✓ Listo
-                                </span>
-                              )}
-                            </div>
-                            <div className="relative h-28 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                              {activeCameraTarget === "clientDocBack" ? (
-                                <div className="w-full h-full relative">
-                                  <video
-                                    ref={genericVideoRef}
-                                    className="w-full h-full object-contain"
-                                    playsInline
-                                    muted
-                                  />
-                                  <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                    <button
-                                      type="button"
-                                      onClick={captureGenericPhoto}
-                                      className="px-2 py-1 bg-emerald-600 text-[9px] hover:bg-emerald-500 font-bold uppercase text-white rounded-lg transition-colors shadow-lg"
-                                    >
-                                      Capturar
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={stopGenericCamera}
-                                      className="px-2 py-1 bg-zinc-800 text-[9px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded-lg transition-colors"
-                                    >
-                                      X
-                                    </button>
-                                  </div>
-                                </div>
-                              ) : clientFormData.documentPhotoBack ? (
-                                <div className="w-full h-full relative group">
-                                  <img
-                                    src={clientFormData.documentPhotoBack}
-                                    alt="C.I. Reverso"
-                                    className="w-full h-full object-contain"
-                                    referrerPolicy="no-referrer"
-                                  />
-                                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setClientFormData((prev) => ({
-                                          ...prev,
-                                          documentPhotoBack: "",
-                                        }))
-                                      }
-                                      className="p-1.5 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded-lg transition-colors border border-red-500/20"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                                  <ImageIcon className="w-6 h-6 stroke-[1.2] mb-1 text-zinc-500" />
-                                  <div className="flex gap-1.5 mt-1">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        const input =
-                                          document.createElement("input");
-                                        input.type = "file";
-                                        input.accept = "image/*";
-                                        input.onchange = (e) => {
-                                          const file = (
-                                            e.target as HTMLInputElement
-                                          ).files?.[0];
-                                          if (file) {
-                                            const reader = new FileReader();
-                                            reader.onload = () => {
-                                              setClientFormData((prev) => ({
-                                                ...prev,
-                                                documentPhotoBack:
-                                                  reader.result as string,
-                                              }));
-                                            };
-                                            reader.readAsDataURL(file);
-                                          }
-                                        };
-                                        input.click();
-                                      }}
-                                      className="text-[9px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-2 py-1 rounded"
-                                    >
-                                      Subir
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        startGenericCamera("clientDocBack")
-                                      }
-                                      className="text-[9px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-2 py-1 rounded border border-teal-500/10"
-                                    >
-                                      Cam
-                                    </button>
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -39798,16 +41019,16 @@ DB_NAME=aurum_gestor
                         documentTypeOption: "single",
                       });
                     }}
-                    className="flex-1 py-4 bg-zinc-850 text-zinc-300 rounded-2xl font-bold hover:bg-zinc-800 transition-all border border-white/10"
+                    className="flex-1 py-3 bg-zinc-800 text-zinc-300 rounded-xl text-xs font-bold hover:bg-zinc-700 transition-all cursor-pointer"
                   >
                     Cancelar
                   </button>
                   <button
                     type="submit"
-                    disabled={isCiAlreadyUsed}
-                    className="flex-[2] py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed text-sm transform active:scale-95"
+                    className="flex-1 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    {editingClient ? "Guardar Cambios" : "Registrar Cliente"}
+                    <Save className="w-4 h-4" />
+                    <span>{editingClient ? "Guardar Cambios" : "Registrar Cliente"}</span>
                   </button>
                 </div>
               </form>
@@ -39815,1275 +41036,7 @@ DB_NAME=aurum_gestor
           </div>
         )}
       </AnimatePresence>
-
-      {/* Add/Edit Referrer Modal */}
-      <AnimatePresence>
-        {showAddReferrerModal && (
-          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => {
-                stopGenericCamera();
-                setShowAddReferrerModal(false);
-                setEditingReferrer(null);
-                setReferrerFormData({
-                  name: "",
-                  phone1: "",
-                  phone1CountryCode: "591",
-                  phone2: "",
-                  phone2CountryCode: "591",
-                  ci: "",
-                  photo: "",
-                  documentPhoto: "",
-                });
-              }}
-              className="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm"
-            />
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-3xl bg-zinc-900 rounded-[32px] border border-white/10 shadow-2xl overflow-hidden"
-            >
-              <div className="p-8 border-b border-white/5 bg-zinc-950 flex justify-between items-center">
-                <div>
-                  <h2 className="text-2xl font-bold text-zinc-100">
-                    {editingReferrer ? "Editar Referido" : "Nuevo Referido"}
-                  </h2>
-                  <p className="text-sm text-zinc-400">
-                    Ingrese los datos básicos del referido
-                  </p>
-                </div>
-                <button
-                  onClick={() => {
-                    stopGenericCamera();
-                    setShowAddReferrerModal(false);
-                    setEditingReferrer(null);
-                    setReferrerFormData({
-                      name: "",
-                      phone1: "",
-                      phone1CountryCode: "591",
-                      phone2: "",
-                      phone2CountryCode: "591",
-                      ci: "",
-                      photo: "",
-                      documentPhoto: "",
-                    });
-                  }}
-                  className="text-zinc-500 hover:text-white transition-colors"
-                >
-                  <X className="w-6 h-6 hover:rotate-90 transition-all" />
-                </button>
-              </div>
-
-              <form
-                onSubmit={handleSaveReferrer}
-                className="p-8 space-y-4 max-h-[85vh] overflow-y-auto custom-scrollbar"
-              >
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                  <div className="space-y-4">
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        Nombre Completo
-                      </label>
-                      <input
-                        required
-                        type="text"
-                        value={referrerFormData.name}
-                        onChange={(e) =>
-                          setReferrerFormData({
-                            ...referrerFormData,
-                            name: e.target.value,
-                          })
-                        }
-                        className="w-full p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        CI / Identificación
-                      </label>
-                      <div className="relative">
-                        <input
-                          required
-                          type="text"
-                          value={referrerFormData.ci}
-                          onChange={(e) =>
-                            setReferrerFormData({
-                              ...referrerFormData,
-                              ci: e.target.value,
-                            })
-                          }
-                          className={`w-full p-3 bg-zinc-950 rounded-xl border ${isReferrerCiAlreadyUsed ? "border-red-500/50 focus:ring-red-500/20" : "border-white/5 focus:ring-indigo-500/20"} text-zinc-100 focus:outline-none focus:ring-2 font-mono`}
-                        />
-                        {isReferrerCiAlreadyUsed && (
-                          <div className="absolute -bottom-5 left-0 flex items-center gap-1 text-[9px] text-red-500 font-bold animate-pulse">
-                            <AlertCircle className="w-2.5 h-2.5" /> Este CI ya
-                            está registrado
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        Teléfono 1 (Principal)
-                      </label>
-                      <div className="flex gap-2">
-                        <select
-                          value={referrerFormData.phone1CountryCode || "591"}
-                          onChange={(e) =>
-                            setReferrerFormData({
-                              ...referrerFormData,
-                              phone1CountryCode: e.target.value,
-                            })
-                          }
-                          className="w-24 p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-xs"
-                        >
-                          <option value="591">+591 (BO)</option>
-                          <option value="1">+1 (US/CA)</option>
-                          <option value="34">+34 (ES)</option>
-                          <option value="51">+51 (PE)</option>
-                          <option value="54">+54 (AR)</option>
-                          <option value="55">+55 (BR)</option>
-                          <option value="56">+56 (CL)</option>
-                          <option value="57">+57 (CO)</option>
-                          <option value="58">+58 (VE)</option>
-                          <option value="593">+593 (EC)</option>
-                          <option value="595">+595 (PY)</option>
-                          <option value="598">+598 (UY)</option>
-                        </select>
-                        <input
-                          required
-                          type="tel"
-                          value={referrerFormData.phone1}
-                          onChange={(e) =>
-                            setReferrerFormData({
-                              ...referrerFormData,
-                              phone1: e.target.value,
-                            })
-                          }
-                          className="flex-1 p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
-                        />
-                      </div>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-bold uppercase text-zinc-500">
-                        Teléfono 2 (Opcional)
-                      </label>
-                      <div className="flex gap-2">
-                        <select
-                          value={referrerFormData.phone2CountryCode || "591"}
-                          onChange={(e) =>
-                            setReferrerFormData({
-                              ...referrerFormData,
-                              phone2CountryCode: e.target.value,
-                            })
-                          }
-                          className="w-24 p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-xs"
-                        >
-                          <option value="591">+591 (BO)</option>
-                          <option value="1">+1 (US/CA)</option>
-                          <option value="34">+34 (ES)</option>
-                          <option value="51">+51 (PE)</option>
-                          <option value="54">+54 (AR)</option>
-                          <option value="55">+55 (BR)</option>
-                          <option value="56">+56 (CL)</option>
-                          <option value="57">+57 (CO)</option>
-                          <option value="58">+58 (VE)</option>
-                          <option value="593">+593 (EC)</option>
-                          <option value="595">+595 (PY)</option>
-                          <option value="598">+598 (UY)</option>
-                        </select>
-                        <input
-                          type="tel"
-                          value={referrerFormData.phone2}
-                          onChange={(e) =>
-                            setReferrerFormData({
-                              ...referrerFormData,
-                              phone2: e.target.value,
-                            })
-                          }
-                          className="flex-1 p-3 bg-zinc-950 rounded-xl border border-white/5 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    {/* Photos Section */}
-                    <div className="p-4 bg-zinc-950/40 rounded-2xl border border-white/5 space-y-4">
-                      <h3 className="text-[10px] font-bold uppercase text-emerald-500 tracking-wider">
-                        Fotografías e Identificación
-                      </h3>
-
-                      {/* Foto de Perfil */}
-                      <div className="space-y-1">
-                        <label className="text-[9px] font-bold uppercase text-zinc-500">
-                          Foto de Perfil
-                        </label>
-                        <div className="relative h-24 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                          {activeCameraTarget === "referrerPhoto" ? (
-                            <div className="w-full h-full relative">
-                              <video
-                                ref={genericVideoRef}
-                                className="w-full h-full object-cover scale-x-[-1]"
-                                playsInline
-                                muted
-                              />
-                              <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                <button
-                                  type="button"
-                                  onClick={captureGenericPhoto}
-                                  className="px-2 py-0.5 bg-emerald-600 text-[8px] hover:bg-emerald-500 font-bold uppercase text-white rounded transition-colors shadow-lg"
-                                >
-                                  Capturar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={stopGenericCamera}
-                                  className="px-2 py-0.5 bg-zinc-800 text-[8px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded transition-colors"
-                                >
-                                  X
-                                </button>
-                              </div>
-                            </div>
-                          ) : referrerFormData.photo ? (
-                            <div className="w-full h-full relative group">
-                              <img
-                                src={referrerFormData.photo}
-                                alt="Perfil"
-                                className="w-full h-full object-cover"
-                                referrerPolicy="no-referrer"
-                              />
-                              <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setReferrerFormData((prev) => ({
-                                      ...prev,
-                                      photo: "",
-                                    }))
-                                  }
-                                  className="p-1 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded transition-colors border border-red-500/20"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                              <User className="w-5 h-5 stroke-[1.2] mb-0.5 text-zinc-500" />
-                              <div className="flex gap-1">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const input =
-                                      document.createElement("input");
-                                    input.type = "file";
-                                    input.accept = "image/*";
-                                    input.onchange = (e) => {
-                                      const file = (
-                                        e.target as HTMLInputElement
-                                      ).files?.[0];
-                                      if (file) {
-                                        const reader = new FileReader();
-                                        reader.onload = () => {
-                                          setReferrerFormData((prev) => ({
-                                            ...prev,
-                                            photo: reader.result as string,
-                                          }));
-                                        };
-                                        reader.readAsDataURL(file);
-                                      }
-                                    };
-                                    input.click();
-                                  }}
-                                  className="text-[8px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-1.5 py-0.5 rounded"
-                                >
-                                  Subir
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    startGenericCamera("referrerPhoto")
-                                  }
-                                  className="text-[8px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-1.5 py-0.5 rounded border border-teal-500/10"
-                                >
-                                  Cámara
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Foto de Documento / CI */}
-                      <div className="space-y-1">
-                        <label className="text-[9px] font-bold uppercase text-zinc-500">
-                          Foto Documento / CI
-                        </label>
-                        <div className="relative h-24 rounded-2xl border border-white/5 bg-zinc-950 flex flex-col items-center justify-center overflow-hidden group shadow-inner">
-                          {activeCameraTarget === "referrerDoc" ? (
-                            <div className="w-full h-full relative">
-                              <video
-                                ref={genericVideoRef}
-                                className="w-full h-full object-cover scale-x-[-1]"
-                                playsInline
-                                muted
-                              />
-                              <div className="absolute bottom-2 inset-x-2 flex gap-1 justify-center">
-                                <button
-                                  type="button"
-                                  onClick={captureGenericPhoto}
-                                  className="px-2 py-0.5 bg-emerald-600 text-[8px] hover:bg-emerald-500 font-bold uppercase text-white rounded transition-colors shadow-lg"
-                                >
-                                  Capturar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={stopGenericCamera}
-                                  className="px-2 py-0.5 bg-zinc-800 text-[8px] hover:bg-zinc-700 font-bold uppercase text-zinc-300 rounded transition-colors"
-                                >
-                                  X
-                                </button>
-                              </div>
-                            </div>
-                          ) : referrerFormData.documentPhoto ? (
-                            <div className="w-full h-full relative group">
-                              <img
-                                src={referrerFormData.documentPhoto}
-                                alt="Documento"
-                                className="w-full h-full object-cover"
-                                referrerPolicy="no-referrer"
-                              />
-                              <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2 transition-opacity duration-200">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setReferrerFormData((prev) => ({
-                                      ...prev,
-                                      documentPhoto: "",
-                                    }))
-                                  }
-                                  className="p-1 bg-red-500/20 text-red-400 hover:bg-red-500/40 rounded transition-colors border border-red-500/20"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col items-center justify-center text-zinc-650 p-2 text-center h-full">
-                              <ImageIcon className="w-5 h-5 stroke-[1.2] mb-0.5 text-zinc-500" />
-                              <div className="flex gap-1">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const input =
-                                      document.createElement("input");
-                                    input.type = "file";
-                                    input.accept = "image/*";
-                                    input.onchange = (e) => {
-                                      const file = (
-                                        e.target as HTMLInputElement
-                                      ).files?.[0];
-                                      if (file) {
-                                        const reader = new FileReader();
-                                        reader.onload = () => {
-                                          setReferrerFormData((prev) => ({
-                                            ...prev,
-                                            documentPhoto:
-                                              reader.result as string,
-                                          }));
-                                        };
-                                        reader.readAsDataURL(file);
-                                      }
-                                    };
-                                    input.click();
-                                  }}
-                                  className="text-[8px] font-bold text-zinc-400 hover:text-zinc-200 uppercase bg-zinc-900 border border-white/5 px-1.5 py-0.5 rounded"
-                                >
-                                  Subir
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    startGenericCamera("referrerDoc")
-                                  }
-                                  className="text-[8px] font-bold text-teal-400 hover:text-teal-200 uppercase bg-teal-950/40 px-1.5 py-0.5 rounded border border-teal-500/10"
-                                >
-                                  Cámara
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 pt-4">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      stopGenericCamera();
-                      setShowAddReferrerModal(false);
-                      setEditingReferrer(null);
-                      setReferrerFormData({
-                        name: "",
-                        phone1: "",
-                        phone1CountryCode: "591",
-                        phone2: "",
-                        phone2CountryCode: "591",
-                        ci: "",
-                        photo: "",
-                        documentPhoto: "",
-                      });
-                    }}
-                    className="flex-1 py-4 bg-zinc-850 text-zinc-300 rounded-2xl font-bold hover:bg-zinc-850 transition-all border border-white/10 text-sm"
-                  >
-                    Cancelar
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={isReferrerCiAlreadyUsed}
-                    className="flex-[2] py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-xl shadow-indigo-600/20 hover:bg-indigo-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                  >
-                    {editingReferrer ? "Guardar Cambios" : "Registrar Referido"}
-                  </button>
-                </div>
-              </form>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Lightbox Image Preview Modal & Biometric Comparator */}
-      <AnimatePresence>
-        {viewingImageSrc && (
-          <div className="fixed inset-0 z-[1000] flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => {
-                setViewingImageSrc(null);
-                setViewingCompareSrc(null);
-                setIsCompareMode(false);
-                setCompareMetric(null);
-                stopCompareCamera();
-              }}
-              className="absolute inset-0 bg-zinc-950/95 backdrop-blur-md"
-            />
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className={`relative ${isCompareMode ? "max-w-5xl md:w-[90vw]" : "max-w-2xl"} w-full max-h-[90vh] bg-zinc-900 rounded-[24px] border border-white/10 shadow-2xl overflow-hidden flex flex-col z-10 transition-all duration-300`}
-            >
-              {/* Modal Header block */}
-              <div className="p-4 border-b border-white/5 bg-zinc-950 flex flex-wrap justify-between items-center gap-3 shrink-0">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center shrink-0">
-                    <Camera className="w-4 h-4 text-amber-500" />
-                  </div>
-                  <div>
-                    <span className="text-xs text-zinc-500 font-mono block uppercase tracking-wider">
-                      Visualizador Seguro
-                    </span>
-                    <span className="text-xs font-bold text-zinc-200 tracking-wide">
-                      {viewingImageTitle}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Visualizer Mode Switch tabs */}
-                <div className="flex items-center gap-1.5 bg-zinc-900 p-1 rounded-xl border border-white/5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsCompareMode(false);
-                      stopCompareCamera();
-                    }}
-                    className={`px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all ${!isCompareMode ? "bg-amber-500 text-zinc-950" : "text-zinc-400 hover:text-zinc-200"}`}
-                  >
-                    Estándar
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsCompareMode(true);
-                      setCompareMetric(null);
-                    }}
-                    className={`px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all flex items-center gap-1 ${isCompareMode ? "bg-amber-500 text-zinc-950" : "text-zinc-400 hover:text-zinc-200"}`}
-                  >
-                    Comparador Biométrico 🧪
-                  </button>
-                </div>
-
-                <button
-                  onClick={() => {
-                    setViewingImageSrc(null);
-                    setViewingCompareSrc(null);
-                    setIsCompareMode(false);
-                    setCompareMetric(null);
-                    stopCompareCamera();
-                  }}
-                  className="p-1.5 text-zinc-400 hover:text-white hover:bg-white/5 rounded-lg transition-all ml-auto"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="p-6 overflow-auto flex-1 bg-zinc-950/20">
-                {!isCompareMode ? (
-                  /* Standard single image preview lightbox */
-                  <div className="flex flex-col items-center justify-center space-y-4 py-6">
-                    <img
-                      src={viewingImageSrc}
-                      alt="Previsualización"
-                      className="max-w-full max-h-[62vh] object-contain rounded-2xl border border-white/5 shadow-lg bg-zinc-950"
-                      referrerPolicy="no-referrer"
-                    />
-                    <p className="text-[10px] font-mono text-zinc-500 bg-zinc-950/40 px-3 py-1.5 rounded-full border border-white/5">
-                      Controles: Haz click en /Comparador Biométrico/ para
-                      cotejar esta foto con la cámara o CI.
-                    </p>
-                  </div>
-                ) : (
-                  /* Advanced comparative biometrics suite */
-                  <div className="space-y-6">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      {/* Photo A (Source / Stored) */}
-                      <div className="space-y-2 text-center bg-zinc-900/40 p-4 rounded-2xl border border-white/5 flex flex-col items-center">
-                        <div className="flex justify-between items-center w-full px-1">
-                          <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 font-bold">
-                            Foto Origen (Archivo A)
-                          </span>
-                          <span className="text-[9px] bg-zinc-950 text-indigo-400 font-mono px-2 py-0.5 rounded border border-indigo-500/20">
-                            Base de Datos
-                          </span>
-                        </div>
-
-                        <div className="relative w-full aspect-square max-w-[280px] bg-zinc-950 rounded-xl overflow-hidden border border-white/10 shadow-lg flex items-center justify-center">
-                          <img
-                            src={viewingImageSrc}
-                            alt="Origen A"
-                            className="w-full h-full object-cover"
-                            referrerPolicy="no-referrer"
-                          />
-                        </div>
-                        <p className="text-[10px] text-zinc-400 font-sans mt-1">
-                          Foto registrada del usuario/cliente.
-                        </p>
-                      </div>
-
-                      {/* Photo B (Comparison candidate / Live Camera / Custom document) */}
-                      <div className="space-y-2 text-center bg-zinc-900/40 p-4 rounded-2xl border border-white/5 flex flex-col items-center justify-between">
-                        <div className="flex justify-between items-center w-full px-1">
-                          <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 font-bold">
-                            Foto Candidata (Archivo B)
-                          </span>
-                          {viewingCompareSrc && !isLiveCompareActive && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setViewingCompareSrc(null);
-                                setCompareMetric(null);
-                              }}
-                              className="text-[9px] text-red-400 hover:text-red-300 font-mono flex items-center gap-1"
-                            >
-                              ✕ Quitar candidato
-                            </button>
-                          )}
-                        </div>
-
-                        {/* Rendering core video or snapshot */}
-                        <div className="relative w-full aspect-square max-w-[280px] bg-zinc-950 rounded-xl overflow-hidden border border-white/10 shadow-lg flex flex-col items-center justify-center">
-                          {isLiveCompareActive ? (
-                            <div className="w-full h-full relative">
-                              <video
-                                ref={compareVideoRef}
-                                className="w-full h-full object-cover scale-x-[-1]"
-                                playsInline
-                                muted
-                              />
-                              <div className="absolute bottom-2.5 left-0 right-0 z-20 flex justify-center gap-2">
-                                <button
-                                  type="button"
-                                  onClick={captureCompareSnapshot}
-                                  className="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-[10px] font-black uppercase tracking-widest rounded-lg shadow-lg flex items-center gap-1"
-                                >
-                                  📸 Capturar Snapshot
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={stopCompareCamera}
-                                  className="px-2.5 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 text-[10px] font-black uppercase tracking-widest rounded-lg shadow-lg border border-white/5"
-                                >
-                                  Cancelar
-                                </button>
-                              </div>
-                            </div>
-                          ) : viewingCompareSrc ? (
-                            <img
-                              src={viewingCompareSrc}
-                              alt="Cotejo B"
-                              className="w-full h-full object-cover"
-                              referrerPolicy="no-referrer"
-                            />
-                          ) : (
-                            <div className="p-4 flex flex-col items-center justify-center space-y-3 text-zinc-600">
-                              <Camera className="w-10 h-10 opacity-30 shrink-0" />
-                              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
-                                Sin Foto Seleccionada
-                              </span>
-                              <p className="text-[9px] text-zinc-500 leading-normal max-w-xs mx-auto text-center">
-                                Selecciona un archivo local, usa la cámara en
-                                vivo para cotejar el rostro actual del cliente,
-                                o carga la foto contraparte registrada.
-                              </p>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Candidate Source Selector Buttons */}
-                        {!isLiveCompareActive && !viewingCompareSrc && (
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 w-full max-w-[280px]">
-                            <button
-                              type="button"
-                              onClick={startCompareCamera}
-                              className="py-2 bg-zinc-800 hover:bg-zinc-750 text-white text-[9px] font-black uppercase tracking-wider rounded-xl border border-white/5 flex items-center justify-center gap-1"
-                            >
-                              🎥 Cámara en Vivo
-                            </button>
-
-                            <label className="py-2 bg-zinc-800 hover:bg-zinc-750 text-white text-[9px] font-black uppercase tracking-wider rounded-xl border border-white/5 flex items-center justify-center gap-1 cursor-pointer">
-                              <Upload className="w-3 h-3 text-zinc-400" /> Subir
-                              Archivo
-                              <input
-                                type="file"
-                                accept="image/*"
-                                className="hidden"
-                                onChange={(e) => {
-                                  const file = e.target.files?.[0];
-                                  if (file) {
-                                    const reader = new FileReader();
-                                    reader.onload = () => {
-                                      const base64 = reader.result as string;
-                                      setViewingCompareSrc(base64);
-                                      setTimeout(() => {
-                                        // Auto Math after manual upload
-                                        const imgA = new Image();
-                                        const imgB = new Image();
-                                        let count = 0;
-                                        const run = () => {
-                                          count++;
-                                          if (count < 2) return;
-                                          runBiometricMath();
-                                        };
-                                        imgA.onload = run;
-                                        imgB.onload = run;
-                                        imgA.src = viewingImageSrc || "";
-                                        imgB.src = base64;
-                                      }, 300);
-                                    };
-                                    reader.readAsDataURL(file);
-                                  }
-                                }}
-                              />
-                            </label>
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                // Try local load from clients or referrers
-                                const cleanedName = viewingImageTitle
-                                  .replace("Foto de Perfil - ", "")
-                                  .replace("Documento CI - ", "")
-                                  .trim()
-                                  .toLowerCase();
-
-                                if (!cleanedName) return;
-
-                                const matchedClient = clients.find(
-                                  (c) =>
-                                    c.name.toLowerCase().trim() === cleanedName,
-                                );
-                                if (matchedClient) {
-                                  const target = viewingImageTitle.includes(
-                                    "Foto de Perfil",
-                                  )
-                                    ? matchedClient.documentPhoto
-                                    : matchedClient.photo;
-                                  if (target) {
-                                    setViewingCompareSrc(target);
-                                    setTimeout(() => runBiometricMath(), 300);
-                                  }
-                                  return;
-                                }
-
-                                const matchedRef = referrers.find(
-                                  (r) =>
-                                    r.name.toLowerCase().trim() === cleanedName,
-                                );
-                                if (matchedRef) {
-                                  const target = viewingImageTitle.includes(
-                                    "Foto de Perfil",
-                                  )
-                                    ? matchedRef.documentPhoto
-                                    : matchedRef.photo;
-                                  if (target) {
-                                    setViewingCompareSrc(target);
-                                    setTimeout(() => runBiometricMath(), 300);
-                                  }
-                                }
-                              }}
-                              className="py-2 md:col-span-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 text-[10px] font-black uppercase tracking-wider rounded-xl border border-amber-500/15"
-                            >
-                              🔄 Autocargar Contraparte (Rostro vs C.I.)
-                            </button>
-                          </div>
-                        )}
-
-                        {viewingCompareSrc && !isLiveCompareActive && (
-                          <button
-                            type="button"
-                            onClick={runBiometricMath}
-                            className="w-full max-w-[280px] py-2 bg-white text-zinc-950 text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-zinc-100 shadow transition-all flex items-center justify-center gap-1.5"
-                          >
-                            🧪 Recalcular Cotejo Algorítmico
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Compare Display Types (Cross-fade overlay vs Side-by-side) */}
-                    {viewingCompareSrc && !isLiveCompareActive && (
-                      <div className="bg-zinc-950 p-4 rounded-3xl border border-white/5 space-y-4">
-                        <div className="flex flex-wrap items-center justify-between gap-3 bg-zinc-900/60 p-2 rounded-2xl border border-white/5">
-                          <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400 px-2">
-                            Modo visual de inspección:
-                          </span>
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => setCompareType("side-by-side")}
-                              className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-widest rounded-lg transition-all ${compareType === "side-by-side" ? "bg-zinc-850 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
-                            >
-                              Lado a Lado
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setCompareType("crossfade")}
-                              className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-widest rounded-lg transition-all ${compareType === "crossfade" ? "bg-zinc-850 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
-                            >
-                              Superimposición (Cross-fade)
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Crossfade viewer panel */}
-                        {compareType === "crossfade" && (
-                          <div className="py-2 flex flex-col items-center">
-                            <div className="relative w-72 h-72 mx-auto rounded-2xl overflow-hidden bg-zinc-900 shadow-xl border border-white/10">
-                              {/* Background Image (Base Image A) */}
-                              <img
-                                src={viewingImageSrc}
-                                alt="Fondo"
-                                className="absolute inset-0 w-full h-full object-cover select-none"
-                              />
-                              {/* Foreground Image with opacity slider (Candidate Image B) */}
-                              <img
-                                src={viewingCompareSrc}
-                                alt="Superpuesto"
-                                className="absolute inset-0 w-full h-full object-cover select-none mix-blend-normal"
-                                style={{ opacity: compareOpacity }}
-                              />
-                            </div>
-
-                            {/* Opacity Slider Control */}
-                            <div className="w-full max-w-sm space-y-1.5 mt-4">
-                              <div className="flex justify-between items-center text-[10px] font-mono text-zinc-400 px-1">
-                                <span>Foto Origen BBDD</span>
-                                <span className="text-amber-500 font-bold">
-                                  Opacidad Candidato:{" "}
-                                  {Math.round(compareOpacity * 100)}%
-                                </span>
-                                <span>Candidato (Rostro/CI)</span>
-                              </div>
-                              <input
-                                type="range"
-                                min="0"
-                                max="1"
-                                step="0.01"
-                                value={compareOpacity}
-                                onChange={(e) =>
-                                  setCompareOpacity(Number(e.target.value))
-                                }
-                                className="w-full h-1 bg-zinc-850 rounded-lg appearance-none cursor-pointer accent-amber-500 focus:outline-none"
-                              />
-                              <p className="text-[9px] text-zinc-500 leading-normal text-center">
-                                💡 Arrastra el deslizador de izquierda a
-                                derecha. Así puedes verificar si coinciden los
-                                rasgos exactos de los ojos, nariz y orejas sobre
-                                la misma escala!
-                              </p>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Algorithmic biometrics math reporting */}
-                        <div className="pt-2 border-t border-white/5">
-                          <div className="flex flex-col items-center justify-center p-4 bg-zinc-900 rounded-2xl text-center space-y-2">
-                            <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">
-                              Resultado del Cotejo Algorítmico (ZNCC Aligned):
-                            </span>
-                            {compareMetric !== null ? (
-                              <>
-                                <div className="text-3xl font-black font-mono tracking-tight text-white flex items-baseline gap-1">
-                                  <span
-                                    className={
-                                      compareMetric >= 60
-                                        ? "text-emerald-400"
-                                        : compareMetric >= 40
-                                          ? "text-amber-500"
-                                          : "text-red-400"
-                                    }
-                                  >
-                                    {compareMetric}%
-                                  </span>
-                                  <span className="text-xs text-zinc-600">
-                                    Similitud
-                                  </span>
-                                </div>
-                                <div
-                                  className={`text-[10px] font-bold uppercase tracking-wider px-3 py-1 rounded-full ${
-                                    compareMetric >= 60
-                                      ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"
-                                      : compareMetric >= 40
-                                        ? "bg-amber-500/10 border border-amber-500/20 text-amber-500"
-                                        : "bg-red-500/10 border border-red-500/20 text-red-400"
-                                  }`}
-                                >
-                                  {compareMetric >= 60
-                                    ? "✓ Identidad Confirmada (Similitud Biométrica Alta)"
-                                    : compareMetric >= 40
-                                      ? "⚠️ Cotejo Moderado (Verifica manualmente rasgos específicos)"
-                                      : "❌ Discordancia Biométrica (Fotografías no corresponden o difieren demasiado)"}
-                                </div>
-                                <p className="text-[9px] text-zinc-500 px-6 max-w-lg leading-relaxed pt-1">
-                                  Este motor realiza una alineación traslacional
-                                  espacial de dos patrones de intensidad de
-                                  borde para corregir desfases de rotación o
-                                  encuadre de la foto. Admite variaciones
-                                  normales, permitiendo un login seguro sin
-                                  falsos negativos.
-                                </p>
-                              </>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={runBiometricMath}
-                                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-750 text-zinc-300 text-xs font-bold uppercase tracking-wider rounded-xl transition-all"
-                              >
-                                Calcular Similitud Algorítmica 🧪
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Modal de Limpieza de Caché y Diagnóstico */}
-      <AnimatePresence>
-        {showCacheCleanupModal && (
-          <div
-            key="cache-cleanup-modal"
-            className="fixed inset-0 z-[240] flex items-center justify-center p-4"
-          >
-            <motion.div
-              id="cache-modal-backdrop"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setShowCacheCleanupModal(false)}
-              className="absolute inset-0 bg-zinc-950/85 backdrop-blur-md"
-            />
-            <motion.div
-              id="cache-modal-container"
-              initial={{ opacity: 0, scale: 0.95, y: 15 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 15 }}
-              className="relative w-full max-w-xl bg-zinc-900 border border-white/5 rounded-3xl overflow-hidden shadow-2xl flex flex-col max-h-[90vh] z-[250]"
-            >
-              {/* Modal Header */}
-              <div
-                id="cache-modal-header"
-                className="p-6 border-b border-white/5 flex justify-between items-center bg-zinc-950"
-              >
-                <div className="flex items-center gap-3">
-                  <span className="p-2.5 rounded-xl bg-amber-500/10 text-amber-500 border border-amber-500/10">
-                    <Database className="w-5 h-5" />
-                  </span>
-                  <div>
-                    <h3 className="text-lg font-black text-white uppercase italic tracking-tight flex items-center gap-2">
-                      Diagnóstico y Limpieza de Caché
-                    </h3>
-                    <p className="text-zinc-500 text-[10px] uppercase font-bold tracking-wider font-mono">
-                      Herramientas de Sincronización Aurum Manager
-                    </p>
-                  </div>
-                </div>
-                <button
-                  id="cache-modal-close-btn"
-                  onClick={() => setShowCacheCleanupModal(false)}
-                  className="text-zinc-500 hover:text-white p-2 rounded-full hover:bg-white/[0.03] transition-all cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              {/* Modal Content */}
-              <div
-                id="cache-modal-content"
-                className="p-6 overflow-y-auto space-y-6 bg-zinc-900/50 custom-scrollbar flex-1"
-              >
-                <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-start gap-3">
-                  <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-0.5">
-                      SOPORTE TÉCNICO Y CONECTIVIDAD
-                    </p>
-                    <p className="text-[11px] text-zinc-400 leading-normal">
-                      Estas herramientas permiten depurar problemas de
-                      sincronización, actualizar datos rezagados del servidor en
-                      su navegador, y realizar re-conexiones forzadas sin perder
-                      su información de trabajo.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  {/* Opción 1: Limpiar Caché de Datos Local */}
-                  <div
-                    id="cache-opt-api"
-                    className="p-4 bg-zinc-950 rounded-2xl border border-white/5 hover:border-white/10 transition-all space-y-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <h4 className="text-sm font-bold text-zinc-200">
-                          Limpiar caché de respuestas de API
-                        </h4>
-                        <p className="text-[11px] text-zinc-500 leading-normal">
-                          Elimina las respuestas recopiladas de consultas a la
-                          base de datos (sessionCache) y fuerza una re-conexión
-                          de fondo con el servidor para obtener los datos
-                          modificados más recientes de todas las sucursales.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        id="btn-action-clear-api-cache"
-                        onClick={async () => {
-                          invalidateApiCache();
-                          await fetchData(true);
-                          setToastAlerts((prev) => [
-                            {
-                              id: String(Date.now()),
-                              title: "Sincronización Exitosa",
-                              message:
-                                "Se ha liberado la caché de datos de API y se han recargado todos los registros en vivo.",
-                              date: new Date().toLocaleTimeString(),
-                            },
-                            ...prev,
-                          ]);
-                          setShowCacheCleanupModal(false);
-                        }}
-                        className="px-4 py-2 bg-amber-500/10 hover:bg-amber-500 hover:text-zinc-950 text-amber-400 rounded-xl transition-all font-bold text-xs uppercase tracking-wider border border-amber-500/20 cursor-pointer"
-                      >
-                        Limpiar y Forzar Sincronización
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Opción 2: Forzar Recarga Completa (Hard Reload) */}
-                  <div
-                    id="cache-opt-reload"
-                    className="p-4 bg-zinc-950 rounded-2xl border border-white/5 hover:border-white/10 transition-all space-y-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <h4 className="text-sm font-bold text-zinc-200">
-                          Fuerza de Recarga de la Aplicación
-                        </h4>
-                        <p className="text-[11px] text-zinc-500 leading-normal">
-                          Limpia los scripts temporales cargados en memoria por
-                          el navegador y recarga la pestaña actual. Muy útil
-                          para asegurarse de que todos los componentes visuales
-                          estén cargados sin usar copias locales antiguas.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        id="btn-action-hard-reload"
-                        onClick={() => {
-                          invalidateApiCache();
-                          window.location.reload();
-                        }}
-                        className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-150 rounded-xl transition-all font-bold text-xs uppercase tracking-wider border border-white/5 cursor-pointer"
-                      >
-                        Recargar Aplicación
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Opción 3: Restablecer Parámetros (Hard Reset) */}
-                  <div
-                    id="cache-opt-reset"
-                    className="p-4 border border-red-500/10 bg-red-500/[0.02] rounded-2xl space-y-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <h4 className="text-sm font-bold text-red-400">
-                          Cerrar Sesión y Limpieza Total (Hard Reset)
-                        </h4>
-                        <p className="text-[11px] text-zinc-500 leading-normal">
-                          Vacía por completo el almacenamiento local persistente
-                          del navegador (`localStorage` y `sessionStorage`).
-                          Esto cerrará su sesión de usuario activa y
-                          restablecerá todas las variables de pantalla
-                          personalizadas a su valor por defecto.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        id="btn-action-hard-reset"
-                        onClick={() => {
-                          localStorage.clear();
-                          sessionStorage.clear();
-                          window.location.href = "/";
-                        }}
-                        className="px-4 py-2 bg-red-500/10 hover:bg-red-500 hover:text-zinc-950 text-red-400 rounded-xl transition-all font-bold text-xs uppercase tracking-wider border border-red-500/20 cursor-pointer"
-                      >
-                        Limpiar Todo y Cerrar Sesión
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Modal Footer */}
-              <div
-                id="cache-modal-footer"
-                className="p-6 border-t border-white/5 bg-zinc-950 flex justify-end"
-              >
-                <button
-                  id="cache-modal-footer-close-btn"
-                  onClick={() => setShowCacheCleanupModal(false)}
-                  className="px-6 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 rounded-xl text-xs font-bold uppercase transition-all cursor-pointer"
-                >
-                  Cerrar Ventana
-                </button>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Real-time Floating Toast Notifications */}
-      <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-3 max-w-sm w-full pointer-events-none">
-        <AnimatePresence>
-          {toastAlerts.map((toast) => (
-            <motion.div
-              key={toast.id}
-              initial={{ opacity: 0, y: 50, scale: 0.9 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{
-                opacity: 0,
-                y: -20,
-                scale: 0.9,
-                transition: { duration: 0.2 },
-              }}
-              className="pointer-events-auto bg-zinc-900/95 border border-amber-500/30 text-zinc-100 p-4 rounded-2xl shadow-2xl flex flex-col gap-1 backdrop-blur-xl relative overflow-hidden"
-              style={{
-                boxShadow:
-                  "0 20px 25px -5px rgb(0 0 0 / 0.5), 0 8px 10px -6px rgb(0 0 0 / 0.5)",
-              }}
-            >
-              {/* Highlight bar */}
-              <div className="absolute top-0 left-0 right-0 h-1 bg-amber-500" />
-
-              <div className="flex justify-between items-start mt-1">
-                <span className="text-xs font-extrabold uppercase tracking-wider text-amber-500 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
-                  {toast.title}
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setToastAlerts((prev) =>
-                      prev.filter((t) => t.id !== toast.id),
-                    )
-                  }
-                  className="text-zinc-500 hover:text-zinc-350 transition-colors p-0.5 rounded-full hover:bg-white/5 cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-              <p className="text-xs text-zinc-300 font-medium leading-relaxed mt-1">
-                {toast.message}
-              </p>
-              <div className="flex justify-between items-center mt-2 pt-2 border-t border-white/5">
-                <span className="text-[9px] text-zinc-500 font-mono font-medium">
-                  {toast.date}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const materialToFind = materials.find(
-                      (m) => m.id === toast.id,
-                    );
-                    if (materialToFind) {
-                      setSelectedForSmelting([toast.id]);
-                      setView("smelt");
-                      setBranchMode(null);
-                    }
-                    setToastAlerts((prev) =>
-                      prev.filter((t) => t.id !== toast.id),
-                    );
-                  }}
-                  className="text-[10px] font-extrabold text-amber-400 hover:text-amber-300 tracking-wider uppercase transition-colors cursor-pointer"
-                >
-                  Fundir Ahora 🛠️
-                </button>
-              </div>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-
-        {/* QR Badge Modal for easy login badge generation */}
-        <AnimatePresence>
-          {qrBadgeUser && (
-            <div 
-              onClick={() => setQrBadgeUser(null)}
-              className="fixed inset-0 z-50 overflow-y-auto bg-zinc-950/85 backdrop-blur-md flex items-center justify-center p-4 cursor-pointer"
-            >
-              <motion.div
-                onClick={(e) => e.stopPropagation()}
-                initial={{ opacity: 0, scale: 0.95, y: 15 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.95, y: 15 }}
-                className="relative bg-zinc-950 border border-white/5 rounded-[40px] p-8 max-w-sm w-full shadow-2xl overflow-hidden group text-center cursor-default"
-              >
-                {/* Decorative corner lines */}
-                <div className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-amber-500/30 rounded-tl-3xl pointer-events-none" />
-                <div className="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-amber-500/30 rounded-tr-3xl pointer-events-none" />
-                <div className="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-amber-500/30 rounded-bl-3xl pointer-events-none" />
-                <div className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-amber-500/30 rounded-br-3xl pointer-events-none" />
-
-                <div className="flex justify-between items-center mb-6">
-                  <span className="text-[9px] font-black uppercase text-zinc-500 tracking-[0.2em]">Credencial de Seguridad</span>
-                  <button
-                    onClick={() => setQrBadgeUser(null)}
-                    className="p-2 bg-zinc-900 rounded-xl border border-white/5 text-zinc-400 hover:text-rose-450 transition-colors cursor-pointer"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-
-                {/* Printable Card Container */}
-                <div id="printable-qr-badge" className="bg-zinc-900 border border-white/5 p-6 rounded-3xl relative overflow-hidden flex flex-col items-center">
-                  {/* Subtle logo/branding background */}
-                  <div className="absolute inset-0 bg-gradient-to-b from-amber-500/[0.02] to-transparent pointer-events-none" />
-                  
-                  <h2 className="text-xl font-serif italic text-zinc-100 tracking-tight mb-0.5">
-                    {companySettings?.name || "Aurum Manager"}
-                  </h2>
-                  <p className="text-[8px] font-black uppercase tracking-[0.3em] text-amber-500/70 border-b border-white/5 pb-3 mb-4 w-full text-center">
-                    Credencial de Acceso Rápido
-                  </p>
-
-                  {/* QR Code Container */}
-                  <div className="bg-white p-4 rounded-2xl shadow-xl flex items-center justify-center mb-4 border border-zinc-200">
-                    <img
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=AURUM_QR_AUTH:${qrBadgeUser.username}:${qrBadgeUser.pin}`}
-                      alt={`Código QR para ${qrBadgeUser.name}`}
-                      className="w-40 h-40 object-contain selection:bg-transparent"
-                      referrerPolicy="no-referrer"
-                    />
-                  </div>
-
-                  <h3 className="text-base font-black text-zinc-100 tracking-tight leading-none mb-1.5">{qrBadgeUser.name}</h3>
-                  <p className="text-xs text-zinc-400 font-bold uppercase tracking-wider mb-0.5">@{qrBadgeUser.username}</p>
-                  <p className="text-[10px] bg-blue-500/10 border border-blue-500/20 text-blue-400 px-3 py-1 rounded-full font-black uppercase tracking-widest mt-2 scale-90">
-                    {qrBadgeUser.role}
-                  </p>
-
-                  {qrBadgeUser.branchId && (
-                    <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-widest mt-2 text-center">
-                      Sucursal: {branches.find(b => b.id === qrBadgeUser.branchId)?.name || "Sede Central"}
-                    </p>
-                  )}
-
-                  <div className="mt-4 pt-3 w-full border-t border-white/5 flex justify-center">
-                     <span className="text-[8px] font-mono text-zinc-600 tracking-wider">PIN de Respaldo: {qrBadgeUser.pin}</span>
-                  </div>
-                </div>
-
-                {/* Action buttons */}
-                <div className="grid grid-cols-2 gap-3 mt-6">
-                  <button
-                    onClick={() => {
-                      window.print();
-                    }}
-                    className="py-3 bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-xs uppercase tracking-wider rounded-2xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg active:scale-95 border border-blue-500"
-                  >
-                    <Printer className="w-4 h-4" />
-                    <span>Imprimir</span>
-                  </button>
-                  
-                  <button
-                    onClick={() => {
-                      const link = document.createElement("a");
-                      link.href = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=AURUM_QR_AUTH:${qrBadgeUser.username}:${qrBadgeUser.pin}`;
-                      link.download = `credencial_${qrBadgeUser.username}.png`;
-                      link.target = "_blank";
-                      link.click();
-                    }}
-                    className="py-3 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 font-extrabold text-xs uppercase tracking-wider rounded-2xl flex items-center justify-center gap-2 transition-all border border-white/5 active:scale-95 cursor-pointer"
-                  >
-                    <Download className="w-4 h-4" />
-                    <span>Descargar</span>
-                  </button>
-                </div>
-
-                <div className="mt-4">
-                  <button
-                    type="button"
-                    onClick={() => setQrBadgeUser(null)}
-                    className="w-full py-3 bg-zinc-900 hover:bg-zinc-850 text-zinc-400 hover:text-zinc-200 rounded-2xl text-xs font-black uppercase tracking-widest transition-all border border-white/5 active:scale-95 cursor-pointer"
-                  >
-                    Cerrar Guardado
-                  </button>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-      </div>
+    </div>
     </ErrorBoundary>
   );
 }

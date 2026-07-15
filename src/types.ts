@@ -14,6 +14,7 @@ export interface User {
   createdAt: string;
   anonymousUid?: string;
   photo?: string;
+  activeSessionId?: string;
 }
 
 export interface Branch {
@@ -130,8 +131,17 @@ export interface CompanySettings {
   cashDenominations?: string;
   lowPurityThreshold_pieza?: number;
   lowPurityThreshold_barra?: number;
+  minWeight_pieza?: number;
+  maxWeight_pieza?: number;
+  minWeight_barra?: number;
+  maxWeight_barra?: number;
+  minWeight_puro?: number;
+  maxWeight_puro?: number;
+  minWeight_cerrado?: number;
+  maxWeight_cerrado?: number;
   notifyEmailOnClosureDifference?: boolean | number;
   serverIp?: string;
+  deletePurchasePassword?: string;
   updatedAt: string;
 }
 

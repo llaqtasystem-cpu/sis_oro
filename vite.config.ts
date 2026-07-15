@@ -13,6 +13,8 @@ export default defineConfig(({mode}) => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+        'react': path.resolve(__dirname, 'node_modules/react'),
+        'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
       },
     },
     server: {
@@ -21,6 +23,12 @@ export default defineConfig(({mode}) => {
       host: '0.0.0.0',
       port: 3000,
       hmr: process.env.DISABLE_HMR !== 'true',
+      allowedHosts: [
+        'www.aurum.local',
+        'aurum.local',
+        'localhost',
+        '127.0.0.1'
+      ],
     },
   };
 });
